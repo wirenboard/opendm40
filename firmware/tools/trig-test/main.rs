@@ -1,10 +1,34 @@
 //! Host test of src/trigsoft.rs (UF-13 software pulse-width / runt
-//! triggers) on synthetic 10-bit records. Needs no hardware.
+//! triggers) on synthetic 10-bit records, and of the comparator record
+//! layout (src/hwtrig.rs pre_for / post_for / post_rec). Needs no hardware.
 //!   tools/trig-test/run.sh
 #[allow(dead_code)]
 #[path = "../../src/trigsoft.rs"]
 mod trigsoft;
 use trigsoft::*;
+#[allow(dead_code)]
+#[path = "../../src/hwtrig.rs"]
+mod hwtrig;
+/// Stubs for what hwtrig.rs uses from the firmware crate (register access is
+/// never reached by the layout functions under test).
+#[allow(dead_code)]
+mod mmio {
+    pub unsafe fn r32(_: u32) -> u32 {
+        0
+    }
+    pub unsafe fn w32(_: u32, _: u32) {}
+    pub unsafe fn modify32(_: u32, _: u32, _: u32) {}
+}
+#[allow(dead_code)]
+mod clock {
+    pub fn delay_us(_: u32) {}
+}
+#[allow(dead_code)]
+mod scope {
+    pub fn rec_f32(_: u32) -> f32 {
+        0.0
+    }
+}
 
 static mut BAD: u32 = 0;
 static mut N: u32 = 0;
@@ -110,6 +134,38 @@ fn main() {
     t("pulse window LT 0.5 -> ..0", pulse_window(LT, 0.5) == (0, 0));
     t("pulse window EQ 50 -> 48..52", pulse_window(EQ, 50.0) == (48, 52));
     t("pulse window EQ 10 -> 9..11", pulse_window(EQ, 10.0) == (9, 11));
+    // Comparator record (scope.rs hw_poll): armed after pre_for, stopped
+    // post_rec samples after the edge -> exactly `rec` samples, the edge
+    // estimate at pre_for, and every crossing of the refinement window
+    // [max(est - win/2, pre), min(est + win/2, rec - post)) has a full
+    // screen around it. Screens: every scope.rs TB row (2 .. 25 000), hpos
+    // 0 .. 400 columns; records: lin_len (26 K, CAP 44 K and the debug
+    // builds' 43 K / 42 K).
+    let win = 800;
+    let mut bad_layout = 0;
+    for rec in [26 * 1024, 42 * 1024, 43 * 1024, 44 * 1024] {
+        for screen in [2usize, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 12_500, 25_000] {
+            for hpos in 0..=400usize {
+                let pre = screen * hpos / 400;
+                let post = screen - pre;
+                let pn = hwtrig::post_rec(rec, pre, post, win) as usize;
+                let est = rec - pn;
+                let (lo, hi) = (est.saturating_sub(win / 2).max(pre), (est + win / 2).min(rec - post));
+                let ok = hwtrig::pre_for(pre, win) + pn == rec
+                    && pn >= hwtrig::post_for(post, win) as usize
+                    && est == hwtrig::pre_for(pre, win)
+                    && lo < hi
+                    && lo >= pre
+                    && hi + post <= rec;
+                if !ok {
+                    bad_layout += 1;
+                }
+            }
+        }
+    }
+    t("comparator record: rec samples, edge at pre_for, window inside", bad_layout == 0);
+    // A record shorter than the screen + slack falls back to post_for.
+    t("comparator record: post_for floor", hwtrig::post_rec(1000, 500, 500, win) == hwtrig::post_for(500, win));
     let (n, bad) = unsafe { (N, BAD) };
     println!("cases {n}, failures {bad}");
     std::process::exit(if bad == 0 { 0 } else { 1 });

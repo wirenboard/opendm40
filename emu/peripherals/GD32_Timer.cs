@@ -353,7 +353,11 @@ namespace Antmicro.Renode.Peripherals.Timers
         private ulong EventsBetween(ulong a0, ulong a1, ulong offset)
         {
             var p = Period;
-            if(offset >= p || a1 <= a0) return 0;
+            // a1 < offset: no event yet (kHi = 0 below would count k = 0;
+            // a CCR compare flagged CCxIF before the counter reached it: the
+            // comparator trigger's TIM2 CC2IF at once, a "done" record of a
+            // few samples after the edge).
+            if(offset >= p || a1 <= a0 || a1 < offset) return 0;
             // k such that a0 < k*p + offset <= a1
             ulong kLo = a0 < offset ? 0 : (a0 - offset) / p + 1;
             ulong kHi = a1 < offset ? 0 : (a1 - offset) / p;

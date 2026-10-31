@@ -572,3 +572,12 @@ pub fn post_for(post_screen: usize, win: usize) -> u32 {
 pub fn pre_for(pre_screen: usize, win: usize) -> usize {
     pre_screen + win / 2 + 16
 }
+
+/// Post-trigger samples for a triggered record of `rec` samples: armed once
+/// `pre_for` samples are written, the stop `rec - pre_for` samples after the
+/// edge leaves exactly `rec` samples with the edge `pre_for` from the start
+/// (the stock post count `len - pre - trig_delay`); never less than
+/// `post_for` (the screen right of the trigger and the search slack).
+pub fn post_rec(rec: usize, pre_screen: usize, post_screen: usize, win: usize) -> u32 {
+    (rec.saturating_sub(pre_for(pre_screen, win)) as u32).max(post_for(post_screen, win))
+}

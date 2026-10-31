@@ -243,6 +243,7 @@ recorded.
 | Test | What it checks | Runtime | Port |
 |---|---|---|---|
 | [`wavtest.py`](wavtest.py) | waveform readout (WAV:DATA?, DIGitize, preamble) against the input sine, over USBTMC and Bluetooth | ~5 min | 24140, BT 24141 |
+| [`hwtrigrectest.py`](hwtrigrectest.py) | comparator trigger (on, Normal): DIGitize / SINGle records at 1 us .. 200 ms/div are the linear record's length, the edge at the stock position, the input sine; `--sw` prints the software trigger's lengths | | 24170 |
 | [`hy3131/wavetest.py`](hy3131/wavetest.py) | the DMM Wave view (scope page, source DMM); build with `--features ad2-isr` | | 3591 |
 | [`railstest.py`](railstest.py) | analog rails (PE2 / PC4, `run.py --rail-log`) after a boot with Both always and a switch to Auto on the Scope page: the scope rail comes on, never both rails off | | free (50000-50999) |
 | [`wavedroptest.py`](wavedroptest.py) | the Wave view's ring drops no samples (`--ch2`: the scope page with CH2 (DMM) on) | | free |
@@ -375,8 +376,12 @@ Models are C# files compiled by Renode at start-up; the platform is
   [emu/hy3131/README.md](hy3131/README.md#open-points).
 - **Boot timing.** The ROM's and FS-loader's PA2 (debug header TX) poll
   timing is set empirically: a release at 0.55 s gives the three-stage chain.
-- **Scope trigger.** opendm40's comparator path sometimes never completes a
-  frame after a restart; [`wavtest.py`](wavtest.py) turns it off.
+- **Scope trigger.** [`wavtest.py`](wavtest.py) turns the comparator path
+  off: it sometimes never completed a frame after a restart. One cause, fixed
+  in `GD32_Timer.EventsBetween`: a CCR compare was flagged before the counter
+  reached it, so TIM2 reported the post-trigger count done right after the
+  edge and the too-short record was dropped (in Normal at 1 ms/div and
+  slower nearly every frame). Whether that was the only cause is unknown.
 - **Gestures.** Horizontal swipes from the touch model were not recognised
   by opendm40's gesture engine; not investigated. The tests swipe with
   `DBG:SWIPE` over USB.

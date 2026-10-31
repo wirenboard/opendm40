@@ -1338,7 +1338,8 @@ impl Scope {
             // until this acquisition completes (or is snapshotted in stop()).
             self.stored_valid = false;
             // Comparator trigger: circular record over CAP, frozen in hardware
-            // `post` samples after the edge (hwtrig.rs). Roll never triggers.
+            // `hw_post` samples after the edge (hwtrig.rs), trimmed to `rec`.
+            // Roll never triggers.
             // Pulse / runt (software, trigsoft.rs): one complete linear
             // record per frame.
             // GEN: the trigger is computed (edge only); the GEN trace needs
@@ -1360,9 +1361,8 @@ impl Scope {
             w32(S4 + 0x04, len);
             w32(S4, (6 << 25) | (3 << 16) | (1 << 13) | (1 << 11) | (1 << 10) | circ | 1);
             if hw {
-                let (pre, _) = self.hw_split();
                 let code = self.trig_code() as f32;
-                self.hw.prepare(psc, arr, hwtrig::post_for(self.screen - pre, WIN), code, self.s.rising);
+                self.hw.prepare(psc, arr, self.hw_post() as u32, code, self.s.rising);
             }
             self.hw_mode = hw;
             self.rec_base = 0;
@@ -1503,6 +1503,32 @@ impl Scope {
         (pre, self.screen - pre)
     }
 
+    /// Comparator record: post-trigger samples, counted in hardware from the
+    /// PA15 edge (TIM2 CCR2). As the stock (post = len - pre - trig_delay,
+    /// `scope_gen_ui_v2_6.h` "Pre-trigger part"): arming waits for the
+    /// pre-trigger part (`pre_for`), so a post count of `rec - pre_for` makes
+    /// every triggered record `rec` samples long (the software linear
+    /// record's length, `lin_len`) with the edge `pre_for` samples from its
+    /// start. Before, the post count was only the screen part right of the
+    /// trigger plus the search slack (`post_for`), and the record was what
+    /// had been written by the stop: 25.8 K at slow rates, 26..37 K at
+    /// 1 ms/div (device 2026-10-31).
+    fn hw_post(&self) -> usize {
+        let (pre, post) = self.hw_split();
+        hwtrig::post_rec(self.rec, pre, post, WIN) as usize
+    }
+
+    /// Keep the newest `rec` samples of a linearised comparator record of
+    /// `len` (> rec: the ring is CAP, a late edge wraps it); returns the
+    /// new length.
+    fn hw_trim(&mut self, len: usize) -> usize {
+        let n = self.rec.min(len);
+        if len > n {
+            unsafe { (&mut *core::ptr::addr_of_mut!(BUF)).copy_within(len - n..len, 0) };
+        }
+        n
+    }
+
     /// Linearise the circular record after a hardware stop: with the ring
     /// wrapped (TCIF4) every sample is valid, rotate so it runs oldest ->
     /// newest; otherwise samples 0..wr are the record. Returns its length.
@@ -1547,7 +1573,7 @@ impl Scope {
                 // comparator stayed quiet is a miss (no comparator on this
                 // board, or the level map is off); three in a row hand the
                 // scope back to the software trigger (hwtrig::note_miss).
-                if st != Status::Armed || now < self.deadline || !(wrapped || wr >= self.screen) {
+                if st != Status::Armed || now < self.deadline || !(wrapped || wr >= self.rec) {
                     return None;
                 }
                 self.halt();
@@ -1555,6 +1581,7 @@ impl Scope {
                 let wr = CAP - (unsafe { r32(S4 + 0x04) } as usize).min(CAP);
                 let wrapped = unsafe { r32(DMA1 + 0x04) } & (1 << 5) != 0;
                 let len = self.hw_linearise(wr, wrapped);
+                let len = self.hw_trim(len);
                 if len < self.screen {
                     self.stored_valid = false;
                     return None;
@@ -1588,7 +1615,8 @@ impl Scope {
             Status::Done => {
                 self.halt();
                 let len = self.hw_linearise(wr, wrapped);
-                let post_n = hwtrig::post_for(post, WIN) as usize;
+                let len = self.hw_trim(len);
+                let post_n = self.hw_post();
                 if len < self.screen + WIN || len < post_n + pre {
                     // Cannot happen after `arm` (pre + post samples written),
                     // kept as a guard against a stale TCIF.

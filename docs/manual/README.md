@@ -1486,8 +1486,10 @@ over the trace; tap the button again while its popup is open to turn it off.
 
 ### Stop, zoom and pan
 
-Press **RUN** (or tap the run state) to stop. The last capture (up to
-45 056 samples) stays in memory:
+Press **RUN** (or tap the run state) to stop. A triggered capture holds
+45 056 samples up to 5 ms/div and 26 624 from 10 ms/div (one triggered in
+software, with CH2 on or the generator as the source, can be shorter). The
+last capture stays in memory:
 
 - change the timebase to zoom in or out of the stored capture;
 - change the V/div to scale it;
