@@ -1565,7 +1565,7 @@ or Modbus RTU, drawn under the trace: a box per byte, Modbus frames above
 them, errors in red. Each capture is decoded once: running, one that
 triggered (not the Auto sweep's untriggered ones, not roll); and on STOP.
 Zoom and pan show the decoded capture. This build has UART only: Modbus
-RTU and **Mode Log** are left out (flash).
+RTU, DALI and **Mode Log** are left out (flash).
 
 ![The Decode tab](img/scope-decode-tab.png)
 
@@ -1584,7 +1584,9 @@ RTU and **Mode Log** are left out (flash).
   |---|---|
   | The frame log | A frame tapped: its waveform |
 
-- Settings: protocol (**Off**, **UART**, **Modbus**), baud (**Auto** or 300
+- **DALI** (lighting bus, 1200 bit/s, no Format / Baud): a box per frame,
+  `FF16:FE 80` forward (address, data), `BF8:FF` backward, `FF24:…` 24-bit, **ERR** in red.
+- Settings: protocol (**Off**, **UART**, **DALI**, **Modbus**), baud (**Auto** or 300
 
   to 115200), format, polarity (**Inverted** for RS-232 levels), threshold
   (**Auto** or a level).

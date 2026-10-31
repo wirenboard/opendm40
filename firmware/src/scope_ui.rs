@@ -3391,7 +3391,7 @@ pub fn mf_hit(tab: u8, v: &PopVals, x: i16, y: i16) -> MfHit {
                 MfHit::Inside
             }
         }
-        _ => MfHit::Dec(dec::page_hit(x, y)),
+        _ => MfHit::Dec(dec::page_hit(v.dec.proto == crate::decode::P_DALI, x, y)),
     }
 }
 

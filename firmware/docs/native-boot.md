@@ -946,6 +946,11 @@ Left out (cargo features, not default here):
 - `dec-modbus`: Modbus RTU in the decoder (decode.rs `MODBUS`; UART
   only, DECode:PROTocol MODBus refused): B 1 176 B. The host tests build
   it always.
+- `dec-dali` (added later, for the next release): DALI in the decoder
+  (decode.rs `DALI`, `dali_step`; DECode:PROTocol DALI refused without
+  it): B 2 904 B (`dali_step` 692, the frame text, the FRAMes? line, the
+  band, the Decode tab's DALI layout), stack headroom -24 B
+  (`app_decode::DL`); the default image is not larger. All of it region B, as the rest of the decoder.
 
 SRAM: `scope::CAP` 42 K -> 34 K u16 (-16 384 B): the raw ring of the fast
 timebases 43 008 -> 34 816 samples, the packed ring (`PCAP`, white

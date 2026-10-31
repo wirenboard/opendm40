@@ -397,5 +397,6 @@ pub fn setup_hit(x: i16, y: i16) -> Option<dec::SetupHit> {
     if !SU_BOX.has(x, y) {
         return if y >= SU_BOX.y + SU_BOX.h && x < 414 { None } else { Some(dec::SetupHit::Inside) };
     }
-    Some(dec::page_hit(x, y))
+    // The log has no DALI (app_log.rs log_open).
+    Some(dec::page_hit(false, x, y))
 }

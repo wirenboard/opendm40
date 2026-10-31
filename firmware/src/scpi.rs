@@ -339,7 +339,7 @@ pub enum Out {
 ///   DECode:CLEar                     Log: the list and counters start again
 #[derive(Clone, Copy, PartialEq)]
 pub enum Dcd {
-    /// decode::P_OFF / P_UART / P_MODBUS.
+    /// decode::P_OFF / P_UART / P_MODBUS / P_DALI.
     Proto(Option<u8>),
     /// Some(0) = AUTO.
     Baud(Option<u32>),
@@ -2723,6 +2723,8 @@ impl Scpi {
                             Some(Dcd::Proto(Some(crate::decode::P_UART)))
                         } else if kw(a, "MODBus") {
                             Some(Dcd::Proto(Some(crate::decode::P_MODBUS)))
+                        } else if crate::decode::DALI && kw(a, "DALI") {
+                            Some(Dcd::Proto(Some(crate::decode::P_DALI)))
                         } else {
                             None
                         }

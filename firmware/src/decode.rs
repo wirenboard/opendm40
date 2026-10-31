@@ -1,4 +1,4 @@
-//! Protocol decoder (TODO "Protocol decoders"): UART and Modbus RTU decoded
+//! Protocol decoder (TODO "Protocol decoders"): UART, Modbus RTU and DALI decoded
 //! from the scope's record, drawn as a bus band over the graph (scope_ui
 //! `dec`, app_decode.rs) and read with DECode:FRAMes?.
 //!
@@ -22,7 +22,22 @@
 //!    times (1.75 ms above 19200 baud), CRC-16 (computed as the bytes come:
 //!    no frame buffer), request / reply / exception from the function and
 //!    the length; a frame that may have begun before the window or go on
-//!    after it is partial (no CRC).
+//!    after it is partial (no CRC);
+//!  * DALI (`dali_step`, feature `dec-dali`): bi-phase at a fixed 1200
+//!    bit/s (a half bit Te = 416.67 us, the rate +-10 %), idle high. On the
+//!    bus a 1 is low for the first half bit and high for the second (a
+//!    rising edge in the bit's centre), a 0 the reverse: Microchip AN1465
+//!    (DS01465A, "Manchester Encoding": a 1 is a falling edge as the PIC
+//!    sees it behind the opto-coupler, which inverts the bus) and
+//!    [Wikipedia](https://en.wikipedia.org/wiki/Digital_Addressable_Lighting_Interface)
+//!    ("Technical overview"). A frame: a start bit (a 1), 8 (backward), 16
+//!    (forward: address, data) or 24 data bits MSB first, two stop bits
+//!    (idle). The runs between edges are one half bit (0.7 .. 1.3 Te) or
+//!    two (1.6 .. 2.4 Te; these windows are this decoder's, not IEC
+//!    62386-101's receiver limits, which are not checked here); anything
+//!    else, or a bit with no transition in its centre, makes the frame an
+//!    error. High for more than 2.5 Te ends a frame, and a frame starts only
+//!    after that much idle; a first low run under 0.5 Te is a glitch.
 
 // `min_max`, `crc16`, `W::as_str`: the host tests.
 #![cfg_attr(target_os = "none", allow(dead_code))]
@@ -38,6 +53,7 @@ pub const MIN_BAUD: u32 = 300;
 pub const P_OFF: u8 = 0;
 pub const P_UART: u8 = 1;
 pub const P_MODBUS: u8 = 2;
+pub const P_DALI: u8 = 3;
 /// Modbus RTU is built in (firmware: feature `dec-modbus`; the host tests
 /// always); without it only UART.
 pub const MODBUS: bool = cfg!(any(feature = "dec-modbus", not(target_os = "none")));
@@ -46,6 +62,16 @@ pub const MODBUS: bool = cfg!(any(feature = "dec-modbus", not(target_os = "none"
 pub fn is_mb(proto: u8) -> bool {
     MODBUS && proto == P_MODBUS
 }
+
+/// DALI is built in (firmware: feature `dec-dali`; the host tests always).
+pub const DALI: bool = cfg!(any(feature = "dec-dali", not(target_os = "none")));
+/// `proto` is DALI (always false without `dec-dali`).
+#[inline(always)]
+pub fn is_dali(proto: u8) -> bool {
+    DALI && proto == P_DALI
+}
+/// DALI's fixed bit rate (1200 bit/s, a half bit Te = 416.67 us).
+pub const DALI_BAUD: u32 = 1200;
 
 /// Frame formats: data bits, parity (0 none, 1 even, 2 odd).
 pub const FMT_NAMES: [&str; 4] = ["8N1", "8E1", "8O1", "7E1"];
@@ -76,6 +102,9 @@ pub const K_RSP: u8 = 2;
 pub const K_EXC: u8 = 3;
 /// Modbus frame that is no request / reply (bad CRC, partial, too short).
 pub const K_MB: u8 = 4;
+/// A DALI frame (`len` bytes: 1 backward, 2 forward, 3 a 24-bit forward
+/// frame; F_FE with len 0: bad Manchester or timing).
+pub const K_DALI: u8 = 5;
 
 /// Decoder settings (DECode:..., the scope menu's Decode popup).
 #[derive(Clone, Copy, PartialEq)]
@@ -382,6 +411,184 @@ pub fn chars_step(s: &dyn Src, a: usize, b: usize, lim: usize, l: &Line, c: &mut
     c.n = n;
     c.mark = mark;
     c.done = true;
+}
+
+// ---- DALI ----
+
+/// Where a DALI scan stands (`dali_step`): the next sample, the line level
+/// (true = high, idle) and its last edge, the frame being collected.
+#[derive(Clone, Copy)]
+pub struct Dali {
+    pub n: usize,
+    pub done: bool,
+    high: bool,
+    edge: usize,
+    /// High for more than 2.5 Te: a falling edge starts a frame.
+    idle: bool,
+    inf: bool,
+    start: usize,
+    /// Half bits so far (the start bit's two included), the pending bit's
+    /// first half.
+    halves: u8,
+    first: bool,
+    acc: u32,
+    nb: u8,
+    err: bool,
+}
+
+impl Dali {
+    /// A scan from sample `a` (the line counts as low until it is high).
+    pub const fn at(a: usize) -> Dali {
+        Dali { n: a, done: false, high: false, edge: a, idle: false, inf: false, start: a, halves: 0, first: false, acc: 0, nb: 0, err: false }
+    }
+
+    /// `k` half bits at the level `h`.
+    fn half(&mut self, k: u32, h: bool) {
+        for _ in 0..k {
+            if self.halves & 1 == 0 {
+                self.first = h;
+            } else if self.first == h || self.nb >= 32 {
+                // No transition in the bit's centre (or too long).
+                self.err = true;
+            } else if self.halves > 1 {
+                // A 1: low, then high. (The start bit, the first pair, is
+                // a 1: the frame begins with a falling edge.)
+                self.acc = self.acc << 1 | h as u32;
+                self.nb += 1;
+            }
+            self.halves = self.halves.wrapping_add(1);
+        }
+    }
+}
+
+/// DALI frames of `s[..b]` from `d.n` (`Dali::at`), as `chars_step` scans:
+/// until the line between frames passes `lim` (a frame begun before it is
+/// finished, up to `b`); `f` returns false to stop (`d.done`). A frame that
+/// runs past `b` is not reported. `l.spb`: the bit time (samples, Q8);
+/// 1200 bit/s, every sample read.
+#[inline(never)]
+pub fn dali_step(s: &dyn Src, b: usize, lim: usize, l: &Line, d: &mut Dali, f: &mut dyn FnMut(&Fr) -> bool) {
+    let te = l.spb / 2;
+    if d.done || te < MIN_SPB << 8 {
+        d.done = true;
+        return;
+    }
+    // Run lengths (samples, Q8) with a sample of slack: a half bit 0.7 ..
+    // 1.3 Te, two 1.6 .. 2.4 Te; high longer than 2.5 Te ends a frame.
+    let (h0, h1, d0, d1, long) = (te * 7 / 10 - 256, te * 13 / 10 + 256, te * 16 / 10 - 256, te * 24 / 10 + 256, te * 5 / 2);
+    let mut i = d.n;
+    while i < b {
+        if !d.inf && i >= lim {
+            d.n = i;
+            return;
+        }
+        let h = l.level(s.at(i) & 0x3FF, d.high);
+        let r = ((i - d.edge) as u32).min(0xFF_FFFF) << 8;
+        i += 1;
+        if h == d.high {
+            if r > long {
+                if !d.high {
+                    d.err |= d.inf;
+                } else if d.inf {
+                    // The stop bits: a pending first half is completed by
+                    // the line going high.
+                    d.inf = false;
+                    let odd = d.halves & 1;
+                    d.half(odd as u32, true);
+                    let n = d.nb;
+                    let ok = !d.err && matches!(n, 8 | 16 | 24);
+                    let len = if ok { n / 8 } else { 0 };
+                    let mut head = [0u8; 8];
+                    for k in 0..len {
+                        head[k as usize] = (d.acc >> (8 * (len - 1 - k))) as u8;
+                    }
+                    let end = d.edge as u32 + if ok { (te * (4 + odd as u32)) >> 8 } else { 0 };
+                    let fr = Fr { start: d.start as u32, end, len: len as u16, head, flags: if ok { 0 } else { F_FE }, kind: K_DALI };
+                    if !f(&fr) {
+                        d.done = true;
+                        d.n = i;
+                        return;
+                    }
+                }
+                d.idle = d.high;
+            }
+            continue;
+        }
+        let e = i - 1;
+        if d.inf {
+            if d.halves == 0 && r < te / 2 {
+                // A glitch, no start bit.
+                d.inf = false;
+                d.idle = true;
+            } else if (h0..=h1).contains(&r) {
+                d.half(1, d.high);
+            } else if (d0..=d1).contains(&r) {
+                d.half(2, d.high);
+            } else {
+                d.err = true;
+            }
+        } else if !h && d.idle {
+            *d = Dali { inf: true, start: e, halves: 0, acc: 0, nb: 0, err: false, idle: false, ..*d };
+        }
+        d.high = h;
+        d.edge = e;
+    }
+    d.n = i;
+    d.done = true;
+}
+
+/// A DALI frame's text: "FF16:FE 80 BC DAPC" (forward: the address and
+/// data bytes, the address byte's target S<n> / G<n> / BC / BCU / SPC
+/// (special command) / ?, the selector bit: arc power or a command;
+/// `short`: the bytes only), "BF8:FF" (backward), "FF24:A1 B2 C3", "ERR".
+pub fn dali_text(w: &mut W, f: &Fr, short: bool) {
+    if !DALI {
+        return;
+    }
+    let n = f.len as usize;
+    w.s(match n {
+        1 => "BF8:",
+        2 => "FF16:",
+        3 => "FF24:",
+        _ => {
+            w.s("ERR");
+            return;
+        }
+    });
+    for (k, &v) in f.head[..n].iter().enumerate() {
+        if k > 0 {
+            w.c(b' ');
+        }
+        w.hex(v);
+    }
+    if n != 2 || short {
+        return;
+    }
+    let a = f.head[0];
+    w.c(b' ');
+    match a {
+        0..=0x7F => {
+            w.c(b'S').u(a as u32 >> 1);
+        }
+        0x80..=0x9F => {
+            w.c(b'G').u(a as u32 >> 1 & 15);
+        }
+        0xA0..=0xCB => {
+            w.s("SPC");
+            return;
+        }
+        0xFC | 0xFD => {
+            w.s("BCU");
+        }
+        0xFE | 0xFF => {
+            w.s("BC");
+        }
+        _ => {
+            w.c(b'?');
+            return;
+        }
+    }
+    w.s(if a & 1 == 0 { " DAPC" } else { " CMD" });
 }
 
 /// Modbus CRC-16 (poly 0xA001, init 0xFFFF), one byte.

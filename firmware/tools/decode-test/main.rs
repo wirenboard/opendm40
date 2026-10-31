@@ -77,6 +77,23 @@ impl Sig {
         self.seg.push((b, stop));
         self
     }
+    /// A DALI frame: start bit, `n` bits of `v` MSB first (a 1 low then
+    /// high), each half bit `te` s; `bad`: bit `bad` without its centre
+    /// transition (both halves low).
+    fn dali(&mut self, te: f64, v: u32, n: u8, bad: Option<u8>) -> &mut Sig {
+        self.seg.push((te, false));
+        self.seg.push((te, true));
+        for i in (0..n).rev() {
+            let bit = v >> i & 1 == 1;
+            if bad == Some(n - 1 - i) {
+                self.seg.push((2.0 * te, false));
+            } else {
+                self.seg.push((te, !bit));
+                self.seg.push((te, bit));
+            }
+        }
+        self
+    }
     fn bytes(&mut self, baud: f64, d: &[u8], fmt: u8) -> &mut Sig {
         let (bits, par) = [(8, 0), (8, 1), (8, 2), (7, 1)][fmt as usize];
         for &v in d {
@@ -167,6 +184,37 @@ fn decode(c: &[u16], a: usize, b: usize, fs: u32, cfg: Cfg, manual: Option<u16>)
     });
     fr.finish(&mut |f, r| frames.push((*f, r)));
     Res { chars, frames, baud }
+}
+
+/// DALI frames of `c[a..b]` (levels from the window; the scan in slices
+/// of `slice` samples).
+fn dali(c: &[u16], a: usize, b: usize, fs: u32, inv: bool, slice: usize) -> Vec<Fr> {
+    let (mn, mx) = min_max(c, a, b);
+    let Some((lo, mid, hi)) = levels(mn, mx, None) else { return vec![] };
+    let l = Line { lo, mid, hi, inv, spb: (fs as u64 * 256 / DALI_BAUD as u64) as u32, bits: 8, parity: 0 };
+    let mut d = Dali::at(a);
+    let mut v = vec![];
+    let mut guard = 0;
+    while !d.done && guard < 1_000_000 {
+        let lim = d.n.saturating_add(slice);
+        dali_step(&c, b, lim, &l, &mut d, &mut |f| {
+            v.push(*f);
+            true
+        });
+        guard += 1;
+    }
+    v
+}
+
+fn dtext(f: &Fr) -> String {
+    let mut b = [0u8; 40];
+    let mut w = W { b: &mut b, n: 0 };
+    dali_text(&mut w, f, false);
+    w.as_str().to_string()
+}
+
+fn dtexts(v: &[Fr]) -> Vec<String> {
+    v.iter().map(dtext).collect()
 }
 
 fn uart(baud: u32) -> Cfg {
@@ -473,6 +521,134 @@ fn main() {
         let lens: Vec<u16> = r.frames.iter().map(|f| f.0.len).collect();
         t(&format!("UART lines: abcdef | 16 + 16 + 8 ({lens:?})"), lens == vec![6, 16, 16, 8]);
     }
+    // ---- DALI: forward 16, backward 8, 24-bit; timing; glitches ----
+    {
+        let te = 1.0 / 2400.0;
+        let want = ["FF16:FE 80 BC DAPC", "BF8:FF", "FF16:A3 12 SPC", "FF24:C1 A2 B3", "FF16:05 00 S2 CMD", "FF16:9B 21 G13 CMD", "FF16:FD 05 BCU CMD"];
+        let frames = |s: &mut Sig, k: f64| {
+            s.idle(10.0 * te).dali(te * k, 0xFE80, 16, None).idle(10.0 * te);
+            s.dali(te * k, 0xFF, 8, None).idle(30.0 * te);
+            s.dali(te * k, 0xA312, 16, None).idle(22.0 * te);
+            s.dali(te * k, 0xC1A2B3, 24, None).idle(22.0 * te);
+            s.dali(te * k, 0x0500, 16, None).idle(22.0 * te);
+            s.dali(te * k, 0x9B21, 16, None).idle(22.0 * te);
+            s.dali(te * k, 0xFD05, 16, None).idle(12.0 * te);
+        };
+        // Samples per Te 4 .. 40 (the scope's 10 .. 100 kS/s), phases,
+        // the rate -10 % / +10 %, inverted (the probe on the opto side).
+        for &fs in &[9_600u32, 25_000, 50_000, 96_000] {
+            for &k in &[1.0, 0.9, 1.1] {
+                for (ph, inv) in [(0.0, false), (0.6, false), (0.3, true)] {
+                    let mut s = Sig::new();
+                    frames(&mut s, k);
+                    let c = s.codes(fs as f64, 100.0, 800.0, inv, 6.0, ph, 0, 0, &mut rng);
+                    let v = dali(&c, 0, c.len(), fs, inv, 777);
+                    let got = dtexts(&v);
+                    t(&format!("DALI at {fs} S/s, Te x{k} ph {ph} inv {inv}: {got:?}"), got == want && v.iter().all(|f| f.flags == 0 && f.kind == K_DALI));
+                }
+            }
+        }
+        // Positions: the forward frame from its start edge to its stop bits' end.
+        {
+            let fs = 50_000u32;
+            let mut s = Sig::new();
+            s.idle(10.0 * te).dali(te, 0xFE80, 16, None).idle(10.0 * te);
+            let c = s.codes(fs as f64, 100.0, 800.0, false, 0.0, 0.0, 0, 0, &mut rng);
+            let v = dali(&c, 0, c.len(), fs, false, usize::MAX / 4);
+            let (s0, s1) = (10.0 * te * fs as f64, (10.0 + 38.0) * te * fs as f64);
+            t(&format!("DALI frame span {:?} ~ {s0:.0}..{s1:.0}", v.first().map(|f| (f.start, f.end))), v.len() == 1 && (v[0].start as f64 - s0).abs() <= 2.0 && (v[0].end as f64 - s1).abs() <= 3.0);
+        }
+        // Off timing: Te x0.75 / x1.35 / x0.6 (outside the windows) is
+        // ERR (x1.35: its 2.7 Te high runs also end the frame: several),
+        // never bytes.
+        for &k in &[0.75, 1.35, 0.6] {
+            let mut s = Sig::new();
+            s.idle(10.0 * te).dali(te * k, 0xFE80, 16, None).idle(12.0 * te);
+            let c = s.codes(50_000.0, 100.0, 800.0, false, 2.0, 0.0, 0, 0, &mut rng);
+            let got = dtexts(&dali(&c, 0, c.len(), 50_000, false, 500));
+            t(&format!("DALI Te x{k}: ERR ({got:?})"), !got.is_empty() && got.iter().all(|g| g == "ERR"));
+        }
+        // Bad Manchester (no centre transition), a glitch inside a frame,
+        // a 12-bit frame: ERR; the next frame decodes.
+        for case in 0..3 {
+            let fs = 50_000.0;
+            let mut s = Sig::new();
+            s.idle(10.0 * te);
+            match case {
+                0 => {
+                    s.dali(te, 0xFE80, 16, Some(5));
+                }
+                1 => {
+                    s.dali(te, 0xFE80, 16, None);
+                }
+                _ => {
+                    s.dali(te, 0xABC, 12, None);
+                }
+            }
+            s.idle(22.0 * te).dali(te, 0xFF, 8, None).idle(12.0 * te);
+            let mut c = s.codes(fs, 100.0, 800.0, false, 2.0, 0.0, 0, 0, &mut rng);
+            if case == 1 {
+                // A 60 us spike low in the 9th bit's high half.
+                let i0 = ((10.0 + 2.0 + 16.0 + 1.4) * te * fs) as usize;
+                let mut first = c[i0] > 450;
+                if !first {
+                    // Not a high half there: the next one.
+                    let i1 = i0 + (te * fs) as usize;
+                    first = c[i1] > 450;
+                    for x in &mut c[i1..i1 + 3] {
+                        *x = 100;
+                    }
+                } else {
+                    for x in &mut c[i0..i0 + 3] {
+                        *x = 100;
+                    }
+                }
+                t("DALI glitch case: a high half found", first);
+            }
+            let got = dtexts(&dali(&c, 0, c.len(), 50_000, false, 300));
+            t(&format!("DALI error case {case}: {got:?}"), got == ["ERR", "BF8:FF"]);
+        }
+        // A glitch on the idle line (a 60 us low spike): ignored; a long
+        // idle gap between frames; a frame cut by the window's end is not
+        // reported, one begun before the window not decoded as data.
+        {
+            let fs = 50_000.0;
+            let mut s = Sig::new();
+            s.idle(10.0 * te).dali(te, 0xFE80, 16, None).idle(0.5);
+            s.dali(te, 0x0121, 16, None).idle(22.0 * te).dali(te, 0xFF00, 16, None).idle(12.0 * te);
+            let mut c = s.codes(fs, 100.0, 800.0, false, 2.0, 0.0, 0, 0, &mut rng);
+            let g = ((10.0 + 38.0 + 30.0) * te * fs) as usize;
+            for x in &mut c[g..g + 3] {
+                *x = 100;
+            }
+            let got = dtexts(&dali(&c, 0, c.len(), 50_000, false, 4096));
+            t(&format!("DALI idle glitch, 0.5 s gap: {got:?}"), got == ["FF16:FE 80 BC DAPC", "FF16:01 21 S0 CMD", "FF16:FF 00 BC CMD"]);
+            // The window from the first frame's middle to the last one's.
+            let (a, b) = (((10.0 + 15.0) * te * fs) as usize, c.len() - (20.0 * te * fs) as usize);
+            let got = dtexts(&dali(&c, a, b, 50_000, false, 4096));
+            t(&format!("DALI window cut: {got:?}"), got == ["FF16:01 21 S0 CMD"]);
+        }
+        // The line stuck low inside a frame: ERR once it goes high again.
+        {
+            let mut s = Sig::new();
+            s.idle(10.0 * te).dali(te, 0xFE, 8, None).space(20.0 * te).idle(12.0 * te).dali(te, 0x42, 8, None).idle(12.0 * te);
+            let c = s.codes(50_000.0, 100.0, 800.0, false, 2.0, 0.0, 0, 0, &mut rng);
+            let got = dtexts(&dali(&c, 0, c.len(), 50_000, false, 4096));
+            t(&format!("DALI stuck low: {got:?}"), got == ["ERR", "BF8:42"]);
+        }
+        // Too few samples per half bit (5 kS/s: 2): nothing.
+        {
+            let mut s = Sig::new();
+            frames(&mut s, 1.0);
+            let c = s.codes(5_000.0, 100.0, 800.0, false, 2.0, 0.0, 0, 0, &mut rng);
+            t("DALI at 5 kS/s: nothing", dali(&c, 0, c.len(), 5_000, false, 4096).is_empty());
+        }
+        let mut b = [0u8; 40];
+        let mut w = W { b: &mut b, n: 0 };
+        dali_text(&mut w, &Fr { start: 0, end: 0, len: 2, head: [0xFE, 0x80, 0, 0, 0, 0, 0, 0], flags: 0, kind: K_DALI }, true);
+        t(&format!("DALI short text {:?}", w.as_str()), w.as_str() == "FF16:FE 80");
+    }
+
     t("crc16 of 01 03 00 00 00 0A = 0xCDC5", crc16(&[1, 3, 0, 0, 0, 0x0A]) == 0xCDC5);
     {
         let mut b = [0u8; 32];

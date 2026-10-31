@@ -472,6 +472,9 @@ impl App {
             Some("Decode log: scope record in use")
         } else if self.view == View::Inrush {
             Some("Decode log: inrush page open")
+        } else if crate::decode::is_dali(ds().cfg.proto) {
+            // The log decodes UART / Modbus only.
+            Some("Decode log: no DALI")
         } else if crate::hy3131::streaming() {
             // An AD2 stream (LOG:STAT ON, a fast-log session): the view's
             // page / touch code is in region C (link-native.x).

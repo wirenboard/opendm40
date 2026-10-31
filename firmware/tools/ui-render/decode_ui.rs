@@ -234,6 +234,108 @@ fn scene(ck: &mut Checker, name: &str, b: &[bool], spb: f64, cfg: dc::Cfg, chars
     ck.check_replica(name);
 }
 
+/// DALI half bits (true = high): a start bit, `n` bits of `v` MSB first;
+/// `bad`: a bit without its centre transition.
+fn dali_halves(v: &mut Vec<bool>, x: u32, n: u8, bad: Option<u8>) {
+    v.extend([false, true]);
+    for i in (0..n).rev() {
+        let b = x >> i & 1 == 1;
+        if bad == Some(n - 1 - i) {
+            v.extend([false, false]);
+        } else {
+            v.extend([!b, b]);
+        }
+    }
+}
+
+/// A DALI bus: forward / backward pairs, a 24-bit frame, an error.
+fn dali_bits() -> Vec<bool> {
+    let mut v = vec![true; 30];
+    for k in 0..4u32 {
+        dali_halves(&mut v, 0xFE80 + k, 16, None);
+        v.extend([true; 14]);
+        dali_halves(&mut v, 0x05A1, 16, None);
+        v.extend([true; 12]);
+        dali_halves(&mut v, 0xFF, 8, None);
+        v.extend([true; 30]);
+        dali_halves(&mut v, 0x9B21, 16, if k == 1 { Some(9) } else { None });
+        v.extend([true; 24]);
+        dali_halves(&mut v, 0xC1A2B3, 24, None);
+        v.extend([true; 24]);
+    }
+    v.extend([true; 60]);
+    v
+}
+
+/// The host copy of app_decode.rs for DALI (the box / bar choice of
+/// `dec_view`, frames from `dali_step`).
+fn dali_fill(c: &[u16], off: usize, n: usize, fs: u32, tr: &stock::Trace) {
+    let a = ud::ann();
+    a.reset(1, ud::C_DONE);
+    a.mode = ud::M_NONE;
+    a.bar = [0; 50];
+    a.off = off as u32;
+    a.n = n as u32;
+    a.fs = fs;
+    a.baud = dc::DALI_BAUD;
+    let (mn, mx) = dc::min_max(c, 0, c.len());
+    let Some((lo, mid, hi)) = dc::levels(mn, mx, None) else { return };
+    a.mid = mid;
+    let l = dc::Line { lo, mid, hi, inv: false, spb: (fs as u64 * 256 / dc::DALI_BAUD as u64) as u32, bits: 8, parity: 0 };
+    let cs = (fs as u64 * 10 / dc::DALI_BAUD as u64) as i64;
+    if cs * 399 / (n as i64) < ud::MIN_BOX as i64 {
+        a.mode = ud::M_BAR;
+        let (mut glo, mut ghi) = (i32::MAX, i32::MIN);
+        for i in 0..399 {
+            glo = glo.min(tr.a[i]);
+            ghi = ghi.max(tr.b[i]);
+        }
+        for i in 0..399 {
+            if tr.b[i] - tr.a[i] >= ((ghi - glo) / 2).max(3) {
+                a.bar[i / 8] |= 1 << (i % 8);
+            }
+        }
+        return;
+    }
+    a.mode = ud::M_BOXES;
+    let (v0, v1) = (off as i64, (off + n) as i64);
+    let mut d = dc::Dali::at(0);
+    dc::dali_step(&c, c.len(), c.len(), &l, &mut d, &mut |f| {
+        let a = ud::ann();
+        if (f.end as i64) >= v0 && (f.start as i64) < v1 && (a.nf as usize) < ud::NF {
+            a.f[a.nf as usize] = ud::FAnn { s0: f.start, s1: f.end, kind: f.kind, fl: f.flags, len: f.len, head: f.head, req: 0xFF };
+            a.nf += 1;
+        }
+        true
+    });
+}
+
+/// A DALI scene: `bits` (forward frames' worth, 19 bits each) on the
+/// screen from `pos`, `sph` samples a half bit.
+fn dali_scene(ck: &mut Checker, name: &str, b: &[bool], sph: f64, frames: f64, pos: f64, combined: bool, stop: bool) {
+    let c = codes(b, sph);
+    let n = ((frames * 38.0 * sph) as usize).clamp(40, c.len());
+    let off = ((c.len() - n) as f64 * pos) as usize;
+    let fs = (sph * 2400.0) as u32;
+    let tr = trace(&c, off, n);
+    dali_fill(&c, off, n, fs, &tr);
+    let base = &stock::scenes()[0];
+    let mut m = base.m;
+    m.combined = combined;
+    m.dec = 3;
+    m.dec_gen = 1;
+    m.pos = 0;
+    m.trig_row = 110;
+    m.vdiv = 10;
+    if stop {
+        m.status = scope_ui::ST_STOP;
+        m.record = (pos as f32 * 0.8, pos as f32 * 0.8 + 0.2);
+    }
+    let sc = stock::Scene { name: "decode", m, popup: scope_ui::Popup::None, trace: Some(tr), persist: None, cols: 400, cells: base.cells.clone() };
+    stock::draw(&sc);
+    ck.check_replica(name);
+}
+
 pub fn run(ck: &mut Checker, out: &str) {
     let ub = bits(&uart_frames(), 0, 3, None);
     let mb = bits(&modbus_frames(true), 1, 50, None);
@@ -250,6 +352,21 @@ pub fn run(ck: &mut Checker, out: &str) {
             }
         }
     }
+    // DALI: 16 zoom levels (a quarter of a frame to 20 frames) x 3 pans
+    // x both views.
+    let db = dali_bits();
+    for z in 0..16 {
+        let frames = 0.25 * 1.34f64.powi(z);
+        for (k, pos) in [0.0, 0.41, 1.0].iter().enumerate() {
+            for combined in [false, true] {
+                dali_scene(ck, &format!("decode/dali/z{z}/p{k}/{}", combined as u8), &db, 10.0, frames, *pos, combined, k == 1);
+            }
+        }
+    }
+    dali_scene(ck, "decode/pic/dali", &db, 10.0, 3.2, 0.0, false, true);
+    save(out, "d13-decode-dali");
+    dali_scene(ck, "decode/pic/dali-err", &db, 10.0, 3.2, 0.33, false, true);
+    save(out, "d13-decode-dali-err");
     // Pictures (and the manual's, manual.rs).
     scene(ck, "decode/pic/uart-near", &ub, 20.0, uart, 6.0, 0.30, false, false, false);
     save(out, "d01-decode-uart-near");
@@ -285,6 +402,8 @@ pub fn run(ck: &mut Checker, out: &str) {
         ud::SetupVals { proto: 2, mode: 1, fmt: 1, inv: true, baud: 115_200, thr: -99.99, level: f32::NAN },
         ud::SetupVals { proto: 0, mode: 0, fmt: 3, inv: false, baud: 300, thr: f32::NAN, level: f32::NAN },
         ud::SetupVals { proto: 2, mode: 1, fmt: 2, inv: true, baud: 76_800, thr: 12.34, level: 1.0 },
+        ud::SetupVals { proto: 3, mode: 0, fmt: 0, inv: false, baud: 0, thr: f32::NAN, level: 8.0 },
+        ud::SetupVals { proto: 3, mode: 0, fmt: 2, inv: true, baud: 9600, thr: -12.34, level: f32::NAN },
     ]
     .iter()
     .enumerate()
@@ -298,9 +417,18 @@ pub fn run(ck: &mut Checker, out: &str) {
             let name = format!("decode/setup/{k}/{}", combined as u8);
             ck.check_replica(&name);
             let page = Bx::new(14, 61, 399, ud::PAGE_H as i32 - 1);
-            let mut add: Vec<Bx> = ud::SU_LABELS.iter().map(|r| rb(*r)).collect();
-            for r in [ud::SU_BMINUS, ud::SU_BVAL, ud::SU_BPLUS, ud::SU_TMINUS, ud::SU_TVAL, ud::SU_TPLUS] {
-                add.push(rb(r));
+            let dali = v.proto == dc::P_DALI;
+            let mut add: Vec<Bx> = ud::SU_LABELS[..if dali { 5 } else { 6 }].iter().map(|r| rb(*r)).collect();
+            let thr = ud::thr_rects(dali);
+            for r in thr[1..].iter() {
+                add.push(rb(*r));
+            }
+            if dali {
+                add.push(rb(ud::DL_RATE));
+            } else {
+                for r in [ud::SU_BMINUS, ud::SU_BVAL, ud::SU_BPLUS] {
+                    add.push(rb(r));
+                }
             }
             ck.check_add(&name, &[("page", page)], &add, Bx::new(13, 20, 401, 40 + ud::PAGE_H as i32));
             if k == 0 && !combined {
@@ -311,6 +439,9 @@ pub fn run(ck: &mut Checker, out: &str) {
             }
             if k == 0 && combined {
                 save(out, "d07-decode-tab-combined");
+            }
+            if k == 4 && !combined {
+                save(out, "d07-decode-tab-dali");
             }
 
         }

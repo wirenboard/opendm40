@@ -86,6 +86,14 @@ struct Job {
     passes: u16,
 }
 
+/// The job's DALI scan (`Job::cur` follows its sample). Not in `Job`: no
+/// bytes without `dec-dali` (every use is under `dc::is_dali`).
+static mut DL: dc::Dali = dc::Dali::at(0);
+
+fn dl() -> &'static mut dc::Dali {
+    unsafe { &mut *core::ptr::addr_of_mut!(DL) }
+}
+
 // Zero bytes until `init` writes None (Option<Job>'s None is not all-zero:
 // a `.data` image in region B otherwise).
 static mut JOB: core::mem::MaybeUninit<Option<Job>> = core::mem::MaybeUninit::zeroed();
@@ -122,12 +130,37 @@ impl Out<'_> {
     }
 }
 
+/// A DALI frame's line "seq,time_s,DALI,hex,OK|ERR,info\n" (`ns` from
+/// the trigger point) and its counts (frames, bytes, errors); the reply
+/// ends before a line that does not fit.
+fn dali_line(o: &mut Out, seq: u32, ns: i64, f: &dc::Fr, cnt: &mut [u32; 5]) {
+    cnt[0] += 1;
+    cnt[1] += f.len as u32;
+    cnt[2] += (f.flags != 0) as u32;
+    if seq < o.first || o.full {
+        return;
+    }
+    let n0 = o.n;
+    if !o.w(|w| {
+        w.u(seq).c(b',').secs_ns(ns).s(",DALI,");
+        for &v in &f.head[..f.len as usize] {
+            w.hex(v);
+        }
+        w.s(if f.flags != 0 { ",ERR," } else { ",OK," });
+        dc::dali_text(w, f, false);
+        w.c(b'\n');
+    }) {
+        o.n = n0;
+    }
+}
+
 impl App {
-    /// The band shown: 0 none, 1 UART, 2 Modbus.
+    /// The band shown: 0 none, 1 UART, 2 Modbus, 3 DALI.
     pub(super) fn dec_band(&self) -> u8 {
         match ds().cfg.proto {
             dc::P_UART => 1,
             dc::P_MODBUS if dc::MODBUS => 2,
+            dc::P_DALI if dc::DALI => 3,
             _ => 0,
         }
     }
@@ -307,15 +340,21 @@ impl App {
             a.mid = 0;
             return;
         };
-        let baud = if s.cfg.baud != 0 { s.cfg.baud } else { baud0 };
+        let baud = if dc::is_dali(s.cfg.proto) {
+            dc::DALI_BAUD
+        } else if s.cfg.baud != 0 {
+            s.cfg.baud
+        } else {
+            baud0
+        };
+        let line = dc::Line { lo: lvl.0, mid: lvl.1, hi: lvl.2, inv: s.cfg.inverted, spb: 0, bits: 8, parity: 0 };
         let mut j = Job {
             a: 0,
             b: rec.len(),
             win,
             auto: None,
             auto0: 0,
-            line:
- dc::Line { lo: lvl.0, mid: lvl.1, hi: lvl.2, inv: s.cfg.inverted, spb: 0, bits: 8, parity: 0 },
+            line,
             cur: dc::Cursor::at(0),
             fr: dc::Framer::new(false, 1, fs, 9600, 0, 1),
             fno: [u32::MAX; ud::NF],
@@ -351,7 +390,8 @@ impl App {
     fn dec_margin(&self, x: usize, up: bool, baud: u32, fs: u32) -> usize {
         let cb = ds().cfg.char_bits() as u64;
         let cs = (fs as u64 * cb / baud.max(1) as u64) as usize;
-        let m = cs * if ds().cfg.proto == dc::P_MODBUS && dc::MODBUS { 6 } else { 2 } + (fs as u64 * 2 / baud.max(1) as u64) as usize;
+        let p = ds().cfg.proto;
+        let m = cs * if dc::is_mb(p) || dc::is_dali(p) { 6 } else { 2 } + (fs as u64 * 2 / baud.max(1) as u64) as usize;
         if up { x.saturating_add(m) } else { x.saturating_sub(m) }
     }
 
@@ -366,7 +406,9 @@ impl App {
         j.line.parity = parity;
         j.auto = None;
         a.baud = baud;
-        if j.line.spb < dc::MIN_SPB << 8 {
+        // DALI: MIN_SPB samples a half bit.
+        let dali = dc::is_dali(s.cfg.proto);
+        if j.line.spb < dc::MIN_SPB << (8 + dali as u32) {
             a.note_baud = baud;
             self.dec_end(ud::C_SLOW);
             return;
@@ -374,6 +416,9 @@ impl App {
         let cs = j.line.char_samples();
         j.fr = dc::Framer::new(s.cfg.proto == dc::P_MODBUS && dc::MODBUS, cs, a.fs, baud, j.a as u32, j.b as u32);
         j.cur = dc::Cursor::at(j.a);
+        if dali {
+            *dl() = dc::Dali::at(j.a);
+        }
     }
 
     /// The decode ends (`state`): the band follows.
@@ -504,6 +549,15 @@ impl App {
             a.nf += 1;
         };
         let start = j.a;
+        if dc::is_dali(ds().cfg.proto) {
+            let d = dl();
+            dc::dali_step(&rec, b, lim, &line, d, &mut |f| {
+                keep_frame(f, u32::MAX, 0);
+                !ud::ann().full
+            });
+            j.cur.n = d.n;
+            j.cur.done = d.done;
+        } else {
         dc::chars_step(&rec, start, b, lim, &line, &mut j.cur, &mut |c| {
             let a = ud::ann();
             if a.nb as usize >= ud::NB {
@@ -521,6 +575,7 @@ impl App {
             }
             true
         });
+        }
         if !j.cur.done {
             return;
         }
@@ -553,7 +608,9 @@ impl App {
         let old = s.cfg;
         let old_thr = s.thr_v;
         match h {
-            ud::SetupHit::Proto(p) => s.cfg.proto = p.min(if dc::MODBUS { 2 } else { 1 }),
+            // The frame log decodes UART / Modbus only.
+            ud::SetupHit::Proto(p) if dc::is_dali(p) && self.scope.log_on() => return,
+            ud::SetupHit::Proto(p) => s.cfg.proto = p,
             ud::SetupHit::Mode(m) => {
                 if m != s.mode {
                     self.dec_mode(clk, m);
@@ -644,9 +701,14 @@ impl App {
             D::Proto(None) => out.put_bytes(match s.cfg.proto {
                 dc::P_UART => b"UART",
                 dc::P_MODBUS if dc::MODBUS => b"MODB",
+                dc::P_DALI if dc::DALI => b"DALI",
                 _ => b"OFF",
             }),
-            D::Proto(Some(p)) if p != dc::P_MODBUS || dc::MODBUS => s.cfg.proto = p,
+            D::Proto(Some(p)) if dc::is_dali(p) && self.scope.log_on() => {
+                out.set_err("Settings conflict");
+                return false;
+            }
+            D::Proto(Some(p)) if (p != dc::P_MODBUS || dc::MODBUS) && (p != dc::P_DALI || dc::DALI) => s.cfg.proto = p,
             D::Proto(Some(_)) => {
                 out.set_err("Parameter not allowed");
                 return false;
@@ -777,6 +839,16 @@ impl App {
         let (bits, parity) = s.cfg.bits();
         let l = dc::Line { lo: a.lo, mid: a.mid, hi: a.hi, inv: s.cfg.inverted, spb: (a.fs as u64 * 256 / a.baud.max(1) as u64) as u32, bits, parity };
         let (fs, t0) = (a.fs.max(1) as i64, a.t0 as i64);
+        if dc::is_dali(s.cfg.proto) {
+            let mut d = dc::Dali::at(0);
+            let mut seq = 0;
+            dc::dali_step(&rec, len, len, &l, &mut d, &mut |f| {
+                dali_line(o, seq, (f.start as i64 - t0) * 1_000_000_000 / fs, f, cnt);
+                seq += 1;
+                true
+            });
+            return;
+        }
         let mut fr = dc::Framer::new(modbus, l.char_samples(), a.fs, a.baud, 0, len as u32);
         // The line being written starts here (None: none / skipped).
         let mut open: Option<usize> = None;
@@ -893,6 +965,13 @@ impl App {
             cnt[1] += 1;
             cnt[2] += (b.fl & dc::F_FE != 0) as u32;
             cnt[3] += (b.fl & dc::F_PE != 0) as u32;
+        }
+        if dc::is_dali(s.cfg.proto) {
+            for (k, f) in a.f[..a.nf as usize].iter().enumerate() {
+                let fr = dc::Fr { start: 0, end: 0, len: f.len, head: f.head, flags: f.fl, kind: f.kind };
+                dali_line(&mut o, k as u32, (f.s0 as i64 - t0) * 1_000_000_000 / fs, &fr, cnt);
+            }
+            return o.n;
         }
         if modbus {
             for (k, f) in a.f[..a.nf as usize].iter().enumerate() {

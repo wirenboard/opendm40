@@ -20,6 +20,9 @@ each starts, red boxes for errors):
   * a framing error (a byte with a low stop bit) drawn red;
   * MCX Modbus RTU 19200 8E1: request / reply / exception / bad CRC, the
     pairing, at 2 and 5 ms/div, stopped;
+  * MCX DALI (DECode:PROTocol DALI, feature dec-dali; skipped without
+    it): forward, backward, 24-bit and a bad-Manchester frame at 10 ms/div,
+    stopped; FRAMes? texts, DECode:RATE? 1200, the band's boxes at 2 ms/div;
   * the Wave view (DC V, 5 V TTL on V-COM): UART at 2400 and 4800 baud,
     Modbus at 2400 8E1, at 2 ms/div (38.4 kS/s), decoded on STOP;
     19200 baud there: the note;
@@ -50,7 +53,7 @@ ap.add_argument('--mips', default='110')
 ap.add_argument('--shots', help='save screenshots here')
 ap.add_argument('--no-region-c', action='store_true', help='without the region C hooks')
 ap.add_argument('--no-wave', action='store_true', help='skip the Wave view cases')
-ap.add_argument('--only', default='mcx,cost,modbus,wave,log', help='the sections to run (default: all)')
+ap.add_argument('--only', default='mcx,cost,modbus,dali,wave,log', help='the sections to run (default: all)')
 A = ap.parse_args()
 if not A.port:
     A.port = emurun.free_port()
@@ -106,6 +109,17 @@ def uart_bits(data, fmt='8N1', err=None):
         elif fmt[1] == 'O':
             s += str(1 - (ones & 1))
         s += '0' if err == 'all' or k == err else '1'
+    return s
+
+
+def dali_bits(v, n, bad=None):
+    """A DALI frame as half bits (send at 2400 'baud': Te = 416.67 us): a
+    start bit, n bits of v MSB first, a 1 low then high; `bad`: that bit
+    without its centre transition."""
+    s = '01'
+    for i in range(n):
+        b = v >> (n - 1 - i) & 1
+        s += '00' if i == bad else ('01' if b else '10')
     return s
 
 
@@ -524,6 +538,37 @@ try:
                     # 19200 at 5 ms/div: a character is 4.6 px, the bar.
                     bar = sum(1 for x in range(14, 413) if near(img(x, FRAME_Y + 8), C_EDGE))
                     check(bar > 60, '5 ms/div: the bar (%d px)' % bar)
+
+    if want('dali'):
+        q('*CLS')
+        q('DEC:PROT DALI')
+        if not q('SYST:ERR?').split(',')[0].strip() in ('0', '+0'):
+            print('decodetest: DALI NOT in this build (skipped)', flush=True)
+        else:
+            # ---- MCX DALI: 1200 bit/s bi-phase, idle high ----
+            gap = '1' * 24
+            cyc = (gap + dali_bits(0xFE80, 16) + '1' * 14 + dali_bits(0xFF, 8) + gap + dali_bits(0xC1A2B3, 24) + gap
+                   + dali_bits(0x9B21, 16, bad=9) + gap + dali_bits(0x0521, 16) + gap)
+            put(BITS, cyc, 2400, 0.0, 3.3, 0.01)
+            want_t = {'FF16:FE 80 BC DAPC', 'BF8:FF', 'FF24:C1 A2 B3', 'ERR', 'FF16:05 21 S2 CMD'}
+            q('CHAN1:SCAL 1;CHAN1:COUP DC;TRIG:SWE AUTO;TRIG:SLOP NEG;TRIG:LEV 1.6;TIM:SCAL 10E-3')
+            run()
+            check(stop(), 'DALI: STOP at 10 ms/div')
+            wait_ms(800)
+            fr = frames()
+            for f in fr[:8]:
+                print('    ' + ','.join(f), flush=True)
+            got = {f[5] for f in fr}
+            check(q('DEC:PROT?') == 'DALI' and q('DEC:RATE?') == '1200', 'DALI: DEC:PROT? DALI, DEC:RATE? 1200')
+            check(got == want_t and all(f[2] == 'DALI' for f in fr), 'DALI, 10 ms/div: every frame of the cycle, nothing else (%s)' % sorted(got))
+            check(all((f[4] == 'ERR') == (f[5] == 'ERR') for f in fr) and any(f[3] == 'FE80' for f in fr), 'DALI: status ERR only on the bad frame, hex FE80')
+            q('TIM:SCAL 2E-3')
+            wait_ms(1500)
+            img = shot('m09-dali-2ms')
+            fe = edges(img, BYTE_Y + 8, C_FEDGE)
+            check(len(fe) + red(img, BYTE_Y + 8) >= 2, 'DALI, 2 ms/div: frame boxes in the band (%d edge runs)' % len(fe))
+            check({f[5] for f in frames()} == got, 'DALI: FRAMes? does not depend on the zoom')
+        q('DEC:PROT OFF')
 
     if want('wave'):
         # ---- the Wave view (DC V, 5 V TTL on V-COM) ----

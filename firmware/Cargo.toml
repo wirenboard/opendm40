@@ -65,6 +65,11 @@ dec-log = []
 # test/scope-chain-0.4 for the same reason; without it the decoder is UART
 # only (DECode:PROTocol MODBus is refused).
 dec-modbus = []
+# DALI (IEC 62386, 1200 bit/s bi-phase) in the protocol decoder (src/decode.rs
+# `DALI`, `dali_step`). Not default on test/scope-chain-0.4 (the next
+# release's optional protocol, like dec-modbus); without it
+# DECode:PROTocol DALI is refused.
+dec-dali = []
 # DBG:HYSPI:SELF? / WR?, the HY3131 bus self-test and write experiment
 # (src/hyspi.rs; emu/hy3131/ad2streamtest.py). Off by default: ~2.3 KB of
 # region C (docs/native-boot.md "Region B audit #9"); without it the two
