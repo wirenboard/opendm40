@@ -808,6 +808,29 @@ for i in (0, 1, 13311, 13312, 20000, 26623):
     assert abs(v - (-5.0 + code * 10.0 / 1023.0)) < 1e-3, (i, v)
 print("ok: SCOP000.CSV parses, time_s / volts exact to the printed digits")
 PY
+# The longest record (65 520 samples, the stock's; packed 4 in 5 bytes as
+# the scope keeps it, src/pack10.rs): every row back.
+cp $IMG7 $W/scopl.img
+"$W/t" $W/scopl.img scopecsv 65520 | grep -q "csv=Saved(2) " || { echo "FAIL at line $LINENO"; exit 1; }
+fsckok $W/scopl.img
+mcopy -n -i $W/scopl.img ::SCOPE/SCOP002.DLG $W/sl.dlg
+python3 -I ../dlog.py $W/sl.dlg -o $W/sl.csv
+python3 -I - $W/sl.csv <<'PY' || { echo "FAIL: 65520-sample SCOP002.CSV content"; exit 1; }
+import math, sys
+rows = [l for l in open(sys.argv[1], 'rb').read().split(b'\r\n')[2:] if l]
+assert len(rows) == 65520, len(rows)
+# (the record's sine is f32: past ~2^12 samples its code can differ from
+# the f64 one by 1)
+off = 0
+for i in range(65520):
+    v = float(rows[i].split(b',')[1])
+    code = int(512.0 + 400.0 * math.sin(i * 0.01))
+    d = abs(v - (-5.0 + code * 10.0 / 1023.0))
+    assert d < 10.0 / 1023.0 + 1e-3, (i, v)
+    off += d >= 1e-3
+assert off < 65520 // 100, off
+print("ok: a 65520-sample packed record as SCOP002.DLG: every row its code (%d off by the f32 sine's 1 code)" % off)
+PY
 # A current record (the Wave view in A): the column says amperes.
 cp $IMG7 $W/scopa.img
 "$W/t" $W/scopa.img scopecsv 300 amps | grep -q "csv=Saved(2) " || { echo "FAIL at line $LINENO"; exit 1; }

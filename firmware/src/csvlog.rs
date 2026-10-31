@@ -445,6 +445,16 @@ fn set_flags(session: bool, flushing: bool) {
 
 // ------------------------------------------------------------- recording API
 
+/// `JOB0` as a region C template (`.rodata.cold_tpl`, link-native.x):
+/// its readers (`start`, from App::rec_start) are region C code; a const copied there was an
+/// anonymous Job image in region B.
+#[repr(transparent)]
+struct JobTpl(Job);
+// SAFETY: read-only plain data.
+unsafe impl Sync for JobTpl {}
+#[cfg_attr(target_os = "none", link_section = ".rodata.cold_tpl")]
+static JOB0_C: JobTpl = JobTpl(JOB0);
+
 /// Start a recording: `func` / `range` go into the header (e.g. "DC V",
 /// "AUTO"), `unit` into every row (e.g. "V"; non-ASCII is transliterated:
 /// "\u{3a9}" -> "Ohm", "\u{b0}" -> "deg", "\u{b5}" -> "u"). `now_ms` = uptime,
@@ -457,7 +467,8 @@ pub fn start(func: &str, unit: &str, range: &str, now_ms: u64) -> bool {
     if active() || crate::fastlog::holds_disk() {
         return false;
     }
-    *j = JOB0;
+    // SAFETY: plain data, no Drop.
+    unsafe { core::ptr::copy_nonoverlapping(&JOB0_C.0, j, 1) };
     j.state = State::Recording;
     j.t0_ms = now_ms;
     j.last_commit = now_ms;

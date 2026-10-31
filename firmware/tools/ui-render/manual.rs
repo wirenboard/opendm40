@@ -566,6 +566,12 @@ pub fn run(out: &str) -> usize {
         add("scope-measure", &|s, _| s.popup = scope_ui::Popup::Mf(0));
         add("scope-display", &|s, _| s.popup = scope_ui::Popup::Mf(1));
         add("scope-settings", &|s, _| s.popup = scope_ui::Popup::Mf(3));
+        add("scope-decode-tab", &|s, p| {
+            s.popup = scope_ui::Popup::Mf(4);
+            p.dec.proto = 1;
+            p.dec.level = 1.65;
+        });
+
         // Math popup over the FFT: Other (window, unit).
         add("scope-math", &|s, p| {
             s.m.math_open = true;
@@ -633,6 +639,9 @@ pub fn run(out: &str) -> usize {
         ck.check_replica("manual/screenshot");
         save1(out, "screenshot");
     }
+
+    // The protocol decoder's band: UART, Modbus RTU (stopped, a CRC error).
+    decode_ui::manual(&mut ck, out, &save1);
 
     // Combined view with the function band open (AC V on the mains).
     {

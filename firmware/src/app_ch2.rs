@@ -250,8 +250,8 @@ impl App {
         let n = f.data.len();
         let Some((t0, step)) = self.scope.rec_time() else { return };
         let rec = self.scope.record();
-        let off = (f.data.as_ptr() as usize).wrapping_sub(rec.as_ptr() as usize) / 2;
-        if n < 2 || off + n > rec.len() {
+        let Some(off) = rec.offset_of(&f.data) else { return };
+        if n < 2 {
             return;
         }
         // The frame's first sample; the columns' offsets from it in f32

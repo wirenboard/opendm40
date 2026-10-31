@@ -489,11 +489,14 @@ fn disk_busy() -> bool {
     HOST_BUSY.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The AD2 stream ISR runs, or the decoder's frame log streams (a save's
+/// SPI erase would outlast its ring): the save waits.
 #[cfg(target_os = "none")]
 #[inline(always)]
 fn streaming() -> bool {
-    crate::hy3131::streaming()
+    crate::hy3131::streaming() || crate::scope::LOG_LIVE.load(core::sync::atomic::Ordering::Relaxed)
 }
+
 
 #[cfg(not(target_os = "none"))]
 fn streaming() -> bool {

@@ -68,6 +68,7 @@ const CYC_PER_US: u32 = crate::clock::HCLK_HZ / 1_000_000;
 
 /// Samples per call at most (the host loops for more): ~1.2 s at the
 /// slowest rung (1667 us), ~0.3 s bit-bang-limited at the fast ones.
+#[cfg(feature = "ad2-exp")]
 pub const N_MAX: u32 = 2000;
 
 fn cyc() -> u32 {
@@ -75,6 +76,7 @@ fn cyc() -> u32 {
 }
 
 /// Wait for AD2F; false after 4 periods + 1 ms.
+#[cfg(feature = "ad2-exp")]
 fn wait_ad2(period_ns: u32) -> bool {
     let t0 = cyc();
     let lim = (period_ns / 1000 * 4 + 1000) * CYC_PER_US;
@@ -90,6 +92,7 @@ fn wait_ad2(period_ns: u32) -> bool {
 
 /// Set the rung and let it settle: two periods (+ the comb filter's three
 /// stages) and drop what is pending.
+#[cfg(feature = "ad2-exp")]
 fn setup(r26: u8) -> u32 {
     hy::set_ad2_stream(r26);
     let p = hy::ad2_period_ns(r26);
@@ -99,11 +102,13 @@ fn setup(r26: u8) -> u32 {
     p
 }
 
+#[cfg(feature = "ad2-exp")]
 struct Out<'a> {
     b: &'a mut [u8],
     n: usize,
 }
 
+#[cfg(feature = "ad2-exp")]
 impl Out<'_> {
     fn s(&mut self, t: &[u8]) {
         let k = t.len().min(self.b.len() - self.n);
@@ -138,11 +143,13 @@ impl Out<'_> {
 }
 
 /// bit_length(x): 0 for 0, 1 for 1, 9 for 256..511.
+#[cfg(feature = "ad2-exp")]
 fn bitlen(x: u32) -> usize {
     (32 - x.leading_zeros()) as usize
 }
 
 /// DBG:AD2:TORN? (see the module header). Returns the reply length.
+#[cfg(feature = "ad2-exp")]
 #[inline(never)] // .cold (link-native.x): not inlined into the hot caller
 pub fn torn(r26: u8, n: u32, sync: bool, out: &mut [u8]) -> usize {
     let n = n.clamp(1, N_MAX);
@@ -181,6 +188,7 @@ pub fn torn(r26: u8, n: u32, sync: bool, out: &mut [u8]) -> usize {
     o.n
 }
 
+#[cfg(feature = "ad2-exp")]
 /// DBG:AD2:NOISE? (see the module header). `op1chop` > 3 = keep the row's.
 #[inline(never)] // .cold (link-native.x): not inlined into the hot caller
 pub fn noise(r26: u8, n: u32, op1chop: u8, out: &mut [u8]) -> usize {
@@ -341,6 +349,7 @@ impl Acc {
         (self.m() / 1000) as i32
     }
     /// Sample standard deviation in 1/1000 code.
+    #[cfg(feature = "ad2-exp")]
     fn sd_m(&self) -> i64 {
         if self.n < 2 {
             return 0;
@@ -509,6 +518,7 @@ pub fn dc_enter(mode: u8, r: u8, r26: u8, measure: bool) {
 /// DBG:AD2:DCV? (module header): the AD2 / AD1 numbers of the DC-coupled
 /// V row at the current DC V range `r`. Reply length; the caller appends
 /// the AD1 volts and restores the DMM row (dmm.start).
+#[cfg(feature = "ad2-exp")]
 #[inline(never)] // .cold (link-native.x): not inlined into the hot caller
 pub fn dcv_test(r: u8, r26: u8, n: u32, flags: u8, out: &mut [u8]) -> (usize, [i32; 2]) {
     let n = n.clamp(1, 16);
@@ -554,6 +564,7 @@ pub fn dcv_test(r: u8, r26: u8, n: u32, flags: u8, out: &mut [u8]) -> (usize, [i
 }
 
 /// DBG:AD2:N7? (module header). `mode` 1 / 3, `r` the DMM range.
+#[cfg(feature = "ad2-exp")]
 #[inline(never)] // .cold (link-native.x)
 pub fn n7_test(item: u8, mode: u8, r: u8, state: u8, n: u32, out: &mut [u8]) -> usize {
     use crate::hy3131_tables::{CFG_F1, CFG_F3};
@@ -601,6 +612,7 @@ pub fn n7_test(item: u8, mode: u8, r: u8, state: u8, n: u32, out: &mut [u8]) -> 
 }
 
 /// Newton square root (no libm).
+#[cfg(feature = "ad2-exp")]
 fn sqrt(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;

@@ -16,7 +16,7 @@
 //!
 //! Hook (scope_page.rs, the "fewer samples than columns" branch): replace
 //! the linear `v0 + (v1 - v0) * fr` at fractional sample `p` with
-//! `crate::sinc::at(&f.data, p)`.
+//! `crate::sinc::at(&f.data, p)` (any `pack10::Src`).
 
 use core::f32::consts::PI;
 
@@ -83,7 +83,7 @@ pub fn weights(fr: f32) -> [f32; 6] {
 
 /// The record `src` reconstructed at fractional sample position `p`
 /// (0 ..= len - 1; outside it is clamped). Empty `src`: 0.
-pub fn at(src: &[u16], p: f32) -> f32 {
+pub fn at<S: crate::pack10::Src + ?Sized>(src: &S, p: f32) -> f32 {
     let n = src.len();
     if n == 0 {
         return 0.0;
@@ -94,14 +94,14 @@ pub fn at(src: &[u16], p: f32) -> f32 {
     let mut acc = 0.0;
     for (i, wi) in w.iter().enumerate() {
         let m = (k + i as i32 - 2).clamp(0, n as i32 - 1) as usize;
-        acc += wi * src[m] as f32;
+        acc += wi * src.at(m) as f32;
     }
     acc
 }
 
 /// `out[i]` = `at(src, x0 + i * dx)`.
 #[allow(dead_code)]
-pub fn resample(src: &[u16], x0: f32, dx: f32, out: &mut [f32]) {
+pub fn resample<S: crate::pack10::Src + ?Sized>(src: &S, x0: f32, dx: f32, out: &mut [f32]) {
     for (i, o) in out.iter_mut().enumerate() {
         *o = at(src, x0 + i as f32 * dx);
     }

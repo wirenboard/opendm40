@@ -1234,8 +1234,13 @@ impl Ink {
 /// (cfg(test)): 0 = background, else `layer << 8 | glyph`, layer 1.. indexing
 /// `layers` = (probe kind, background colour) of each drawn element, so one
 /// composite window still reports its shapes, texts and icons separately.
-#[inline(never)]
+#[inline(always)]
 pub fn paint(r: Rect, layers: &[(u8, Color)], mut f: impl FnMut(i16, i16) -> (Color, u16)) {
+    paint_dyn(r, layers, &mut f)
+}
+
+#[inline(never)]
+fn paint_dyn(r: Rect, layers: &[(u8, Color)], f: &mut dyn FnMut(i16, i16) -> (Color, u16)) {
     let x0 = r.x.max(0);
     let y0 = r.y.max(0);
     let x1 = (r.x + r.w - 1).min(lcd::W as i16 - 1);

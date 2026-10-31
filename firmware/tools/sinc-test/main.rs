@@ -4,6 +4,8 @@
 //! 399-column grid (sinc vs linear error), edges and degenerate records.
 //!   tools/sinc-test/run.sh
 #[allow(dead_code)]
+#[path = "../../src/pack10.rs"]
+mod pack10;
 #[path = "../../src/sinc.rs"]
 mod sinc;
 

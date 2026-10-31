@@ -144,6 +144,23 @@ SECTIONS
          * from region C audit #1 (133f81e) and in C from region B audit #4
          * (2026-10-25, B at 15 KB). */
         *(.text.*8opendm409scope_csv*);
+        /* The decoder's frame log: a frame's waveform, drawn on a tap, the
+         * top bar / counters, the page draw, the setup popup and the
+         * view's touches (app_log.rs `.text.log_cold`; ui_log.rs's panel
+         * buttons below). The log streams by DMA (the decode catches up
+         * from its ring, log_poll / log_tick / log_row stay in B). It
+         * never runs with the AD2 stream: `log_open` refuses while one
+         * runs, LOG:STAT ON is refused while the log is open (main.rs
+         * log_on_check), and every other stream start (Wave view, inrush,
+         * the fast logger's page) leaves View::Decode first. */
+        *(.text.log_cold*);
+        *(.text.*8opendm408scope_ui3log12panel_button*);
+        *(.text.*8opendm408scope_ui3log9panel_hit*);
+        /* The keypad's digit font: read only by ui::keypad_key (above, in
+         * C: the Keypad page / popup, no stream). */
+        *(.rodata.fonts.K_FONT_E);
+        *(.rodata.fonts.K_FONT_B);
+
         /* NOT the scope WAVeform:* / ACQ:SRAT? / TRIG:STAT? / CHAN1:OFFS?
          * replies (src/scope_wav.rs) nor their parser scpi::wav_cmd: a host
          * polls them while the Wave view's stream runs (device c830e09:
@@ -312,8 +329,10 @@ SECTIONS
          * (App::sp_save_csv, with scope_csv::set and the DLG block plan). */
         *(.text.*8opendm403app*3App14with_temp_page*);
         *(.text.*8opendm403app*3App11sp_save_csv*);
-        /* Once per scope drag, at its axis decision (scope_ui::drag_target). */
-        *(.text.*8opendm408scope_ui11drag_target*);
+        /* scope_ui::drag_target (once per scope drag) and
+         * Scope::hw_calibrate are back in region B (2026-10-26, the long
+         * scope record: region C had < 8 KiB, B had room after
+         * stockfont::paint stopped being one copy per closure). */
         /* Region B audit #3 (2026-10-22, 11.9 KB free on 1ad38aa):
          * `#[inline(never)]` event / start-up code that sat inlined in hot
          * callers. App::wave_open runs at event rate. (App::tap with
@@ -371,15 +390,19 @@ SECTIONS
          * continuity / the resistive temperature sensors (a fault), never
          * with the bus handed to a stream (it talks to the HY3131 itself). */
         *(.text.*8opendm408sentinel*8Sentinel11jack_result*);
+        *(.text.*8opendm408sentinel*8Sentinel6v_both*);
         *(.text.*8opendm403dmm*3Dmm9cont_jack*);
         /* V_GATE of ohm / continuity / diode, once per reading (no HY3131
          * access; region B at 16 KiB). */
         *(.text.*8opendm403dmm*3Dmm10v_side_ohm*);
+        /* AC mV's V_GATE, once per AC mV result (no HY3131 access). */
+        *(.text.*8opendm403dmm*3Dmm8mv_vside*);
         /* DBG:SRC? and DBG:ACDC:TRACE? reply text (SCPI only; room in region B
          * for the jack check above). */
         *(.text.*8opendm40*8src_text*);
+        /* DBG:SRC's parser (region B at 16 KiB, 2026-10-26). */
+        *(.text.*8opendm406dbgsrc5index*);
         *(.text.*6acdctr*5Trace4text*);
-        *(.text.*8opendm405scope*5Scope12hw_calibrate*);
         *(.text.*8opendm406hwtrig*6HwTrig9calibrate*);
         *(.text.*8opendm405touch*5Touch3new*);
         *(.text.*8opendm402bt*2Bt3new*);
@@ -427,6 +450,30 @@ SECTIONS
         *(.text.*8opendm406vwrite5check*);
         *(.text.*8opendm406vwrite8finalize*);
         *(.text.*8opendm406vwrite6commit*);
+        /* Region B audit #8 (2026-10-30, test/scope-chain-0.4 on 0.4.0 with
+         * GEN / CH2): functions whose every caller is region C code (a call
+         * graph from the ELF, every address-taken function counted as hot):
+         * the generator page's wave preview (ui::gen_values), vwrite's
+         * staging of a host write (VDisk::write_block), the scope CSV's DLG
+         * sample coder (App::sp_save_csv), the gallery's DLG decoders,
+         * HwTrig::calibrate's sweep, the limits / keypad / record page
+         * helpers. */
+        *(.text.*8opendm402ui11gen_preview*);
+        *(.text.*8opendm406vwrite5stage*);
+        *(.text.*8opendm406vwrite9ours_live*);
+        *(.text.*4dlog*4SEnc4next*6pack105Codes*);
+        *(.text.*4dlog*4SEnc3put*);
+        *(.text.*7gallery4GSrcE*);
+        *(.text.*8opendm406csvlog5ascii*);
+        *(.text.*8opendm402ui21ok_and_limits_buttons*);
+        *(.text.*8opendm406hwtrig*6HwTrig5sweep*);
+        *(.text.*8opendm402ui2pw7outline*);
+        *(.text.*8opendm402ui13record_button*);
+        *(.text.*8opendm403app12kp_unit_text*);
+        *(.text.*8opendm408spiflash9block_crc*);
+        /* Struct templates copied only by region C code (fastlog::begin,
+         * csvlog::start from App::rec_start, App::tt_open). */
+        *(.rodata.cold_tpl*);
         . = ALIGN(4);
         __cold_end = .;
     } > FLASH_C

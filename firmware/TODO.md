@@ -903,11 +903,32 @@ the scope full record.
       (power cycle = two runs, the disk carried over). Device 25b6ec3 (2026-10-24): first boot SETFILE CREATED seeded
       from BKP; SYST:BEEP:VOL 40 -> SAVE OK seq 2; key power-off + on: POR+BOR, SETTINGS,FILE,1,2, volume 40. Open: after a power-off the
       DMM function starts on DC V (persist::same_session needs BKP_LAST, which is gone).
-- [ ] Longer scope record (owner 2026-10-24: "worth doing, not now"): 26 624 samples today vs the stock
-      65 520. u16 per 10-bit sample makes 65 520 = 131 KB, too much next to the screenshot CAP (49 KB) and the
-      logger rings. Packed 4 samples in 5 bytes: 65 520 = ~82 KB, +29 KB over today, within the free SRAM.
-      DMA writes u16, so pack after the capture (or capture in chunks) and unpack for the render / zoom / CSV.
-      Open PR #41: 65 520 samples from 100 ms/div, 43 008 at the faster timebases.
+- [x] Longer scope record (owner 2026-10-24: "worth doing, not now"; done 2026-10-26, branch
+      feat/scope-long-record): was 26 624 samples vs the stock 65 520 (u16 per 10-bit sample makes 65 520 =
+      131 KB; the screenshot buffer the item once named is gone since 2026-10-22). Now 65 520 packed 4 in 5
+      bytes at <= 25 kS/s (from 100 ms/div) and in the wave view, 43 008 raw (packed when it stops) faster;
+      Single / DIGitize fill the whole record. Design and costs: docs/ram-budget.md "The scope record".
+      Emulator: emu/wavtest.py (lengths at 1 / 100 / 200 ms/div, no seam, the trigger at the centre, Save
+      CSV of the long record = WAV:DATA?, stopped zoom).
+- [x] Device check of the long scope record (a6c177d8, 0.3.0, 2026-10-26). PASS: MCX DIGitize (Auto, nothing
+      on the MCX) at 1 us / 20 us / 1 ms/div: 43 008 samples; 100 ms/div: 49 932 and 500 ms/div: 25 417 (the
+      untriggered record ends at the Auto timeout); wave view (DC V, 4800 S/s) on an MR9270 20.001 Hz square:
+      STOP after 14 s keeps 65 520 samples, 20.001 Hz, every period 239..240 samples (no seam), AD2 dropped /
+      late / overruns 0; Save CSV of it = WAV:DATA? (65 520 rows); stopped zoom; a screenshot. Triggered
+      MCX on the device (2026-10-26, this branch + #30 rails fix; MR9270 50 Hz 0-10 V square on CH1, EDGE POS
+      5 V, NORM, DIG): 1 ms/div 43 008 samples, 100 ms/div 65 520 samples, the trigger point on the rising edge
+      mid-record, 50.001 Hz from the record. Without #30 the scope read code 0 after a boot with Analog power
+      Both (nothing triggered).
+- [x] Long scope record: pan through a stopped record by touch on the device (796e2970 with #30, 2026-10-26;
+      MR9270 1.6 Hz 0-10 V square, 100 ms/div, NORM, DIG, 65 520 samples): DBG:DRAG by half a screen moves
+      the trace 200 px, both ends stop the pan, a drag back from the start moves at once; 200 / 500 ms/div
+      while stopped show the record (at 500 ms/div ~210 columns). Before 796e2970 a drag right after a
+      screenshot (DBG:LCD? holds drawing 300 ms) left the drag preview on the screen, half of it blank.
+- [ ] Not possible / not done for the long record (docs/ram-budget.md "The scope record"): 65 520 at the
+      fast timebases needs a 131 KB raw ring in one piece (BUF + logger::RING + calbackup::SCRATCH + the
+      csvlog buffers + gen::WAVE lent for the capture: no logging / screenshot / CSV / FFT / generator
+      meanwhile); an 8-bit byte-DMA capture cannot work on this board (the ADC's 10 bits are PB0..PB9, a
+      byte read of GPIOB gives PB0..7 or PB8..15).
 - [x] reload.sh --image: the first upload failed twice in a row on 2026-10-24 ("upload failed, nothing
       installed"), the immediate retry worked both times (once with the Scope view open). Cause: the SCPI
       error queue is a FIFO that lives across USBTMC clients, and dm40dbg.py upload took the first
@@ -1105,6 +1126,62 @@ the scope full record.
         fast logger. SCPI: DEC:UART:... config and a frame-FIFO read, so a host can tail the bus live.
       - Constraints: the decoder runs per DMA half-buffer in the main loop, so it must keep up at 1.25 MS/s and stay
         in region B (no region-C code while streaming). DMM / generator keep running alongside.
+      - [x] Phase 1 (PR #63, draft, on feat/scope-dlg-ring): UART and Modbus RTU as a band on the scope page
+            (owner 2026-10-28: an overlay on the scope page, not a separate view; the first streaming view of
+            the PR was dropped). Owner 2026-10-28 (2): not in real time: each record is decoded once, a
+            running one that triggered (Normal / Single, Auto when it fired; not roll, not the Wave view while
+            running) and the stored one on STOP; the bytes / frames kept in TCM (80 / 16, positions in the
+            record) and every redraw, zoom and pan draws from them; a record with more: the screen's window
+            again when stopped. The decode runs in the main loop (`dec_step`, 3 ms a pass), never in the frame
+            draw; the next acquisition waits for it (Scope::hold_restart). Settings: an MF tab (Decode, the
+            fifth). src/decode.rs (levels auto / manual, auto-baud from
+            the shortest runs with a TooFast cap, 8N1 / 8E1 / 8O1 / 7E1, inverted polarity, characters with a
+            quarter-bit idle step, a Modbus framer with a running CRC and request / reply pairing),
+            app_decode.rs (the decode per frame; DECode:...), ui_decode.rs (the band: byte boxes with hex and
+            the character, Modbus frame boxes with the fields and the reply time, errors red, a bar zoomed
+            out, "Rate too low for N baud" under 4 samples per bit; the MF Decode tab). DECode:FRAMes?: the
+            kept frames (stopped with more than the lists hold: the record decoded again on the query). The
+            cache (`ANN`, ~1.3 KB) in TCM; no SRAM used. Tests: tools/decode-test (incl. filtered edges
+            at 8 samples per bit), ui-render `--decode` (24 zooms x 3 pans x both views, 0 violations),
+            scpi-test, emu/decodetest.py (MCX and the Wave view: ScopeFeeder / HY3131 SetBitsFile).
+      - [x] Frame log (owner 2026-10-28, Mode Log of the Decode tab, DECode:MODE LOG): the first draft's
+            streaming list back, in the scope's record memory instead of a static: scope.rs `log_*` (a
+            16 K-sample circular DMA ring at the start of BUF, 1.25 MS/s for auto-baud, ~16 samples a bit
+            for a set rate), app_log.rs (levels, auto-baud again after framing errors in a quarter of 32
+            characters, decode.rs chars_step / Framer over the ring in up to 4 ms a pass; a circular byte
+            store of the frames in the rest of BUF, ~44 KB, the oldest dropped), ui_log.rs (the list,
+            counters, LIVE / page / CLEAR / STOP / SCOPE, the Decode page as SETUP). Each frame keeps its
+            waveform: ~8 samples a bit from 2 bits before to 2 after (`snip_write`: 8-bit means, a byte-wise
+            run / difference code, ~150 B for an 8-byte Modbus frame; dlog's DLG coder took 6-8 bits a
+            sample on a square wave), coded when the pass has time (about one a pass: at 115200 not every
+            frame has one); tap a row to see it with the band (region C, `log_cold`). Emulator: 267 Modbus
+            19200 frames with waveforms kept; 9600 and 115200 (4 588 frames in 3 s, none lost), pairing.
+            DECode:FRAMes? reads it as a FIFO, DECode:CLEar. Leaving the view ends it (BUF back to the
+            scope, a new record). The Wave view refuses it.
+
+      - [ ] Phase 2: tap a frame to centre the record on it; trigger / filter on a decoded value (address,
+            function, a byte pattern); disk logging (LOGS/UARTnnn.CSV); Modbus ASCII; the other protocols of
+            the list above.
+            Known limits: the frame costs ~0.1 ms more with the decoder on (s.frame 6.98 against 6.89 ms at
+            1 ms/div); a record's decode is 2-5 ms at 1 ms/div (9600 / 115200, up to 8 ms when it measures the
+            rate), and the next acquisition waits for it (70 against 79 frames in 3 s at 1 ms/div, 9600;
+            emulator, native-boot.md "Protocol decoder"); the band covers the graph's bottom 35 px (the trace is not drawn there); a long
+            coded record (Single at 100 ms/div and slower) decodes at ~1.3 us a sample; at 1 ms/div a 9600
+            baud screen holds 9 characters, the first may be misread when the screen starts inside a run of
+            back-to-back characters (they realign at an idle gap); the AD2 filter's edge shape in the
+            emulator is INFERRED (a sinc^2-like mean over 2 periods).
+      - [ ] Device check (a USB-UART adapter or a Modbus device: the generator cannot make UART): (1) 3.3 V
+            USB-UART TX -> OSC, text at 9600 / 115200 8N1: the band at 200 us .. 5 ms/div, DEC:RATE?,
+            DEC:FRAM? after STOP matches what was sent; (2) 8E1 / 7E1 and a wrong parity -> red boxes, PE;
+            (3) RS-232 levels with Inverted; (4) Modbus RTU master + slave on RS-485, probe across A-B, 9600 /
+            19200 8E1: REQ / RSP boxes, the reply time vs the master's log, a corrupted frame red; (5) the Wave
+            view, DC V, RS-485 A-B on V-COM at 2400 / 4800 (and 9600 at 1 ms/div): the AD2 filter's real edge
+            shape, DEC:RATE? after STOP; (6) DBG:PROF? dec.job (a record's decode), x2 and s.frame at 1 / 10 /
+            100 ms/div with 9600 and 115200 traffic, frames off / on, against the emulator's numbers
+            (native-boot.md "Protocol decoder"); (7) Mode Log: 115200 text for 60 s, DEC:COUN? lost 0 and
+            the FIFO complete; a tapped row's waveform matches the scope's look of the same bytes; Modbus
+            pairing and the reply time; leaving Log, the scope captures again; Log in the Wave view refused.
+
 - [ ] Scope in ngscopeclient (owner-approved 2026-10-22: a libscopehal driver + a full-record readout).
       Done in the emulator (branch scope-full-record): opendm40 WAV:POINts SCReen|MAXimum|<n>, WAV:FORMat BYTE|WORD,
       WAV:SOURce CHAN1, 10-field Keysight/Rigol WAV:PREamble? (was 4 fields), DIGitize, TRIGger:STATus?,
@@ -4035,6 +4112,32 @@ Emulator (emu/):
       LIVE_CLEAR_MS old asserts no more (sentinel test live_does_not_flap_after_the_source). Device: doc
       4.13 check list item 5. **Device c6a3ac3: PASS**, DBG:SENT:LOG? +0 after the off in 5 of 5 (5 V x 3,
       10 V, the square); LIVE? clears 1.0-1.25 s after the off and stays off.
+- [ ] False A-JACK / A-PROT from a 66 kHz signal on V-COM (owner 2026-10-26, 0.2.0, A jack empty, modes through
+      AUTO): AC mV 600 mV `AJACK,AD1PK_PB1` (26.57 mV), DC mV 600 mV OL with `CMP_PB1` A-JACK then A-PROT, AC mV
+      60 mV A-PROT (the latch from DC mV), AC V 6 V a DC? hint (1.162 mV). Cause: the RMS block misses a signal
+      above the ~20 kHz AC bandwidth, so AC mV's V_GATE said "free"; plain DC mV had no V gate and its A-PROT probe
+      on PB2 read the pickup; DC? compared the V tap's DC with an AC reading that misses the AC part. Fix (branch
+      fix/hf-false-ajack, 0.2.1, [doc 4.13](docs/power-meter-and-misconnect.md#413-a-voltage-on-v-com-the-jack-check-the-ac-mv-gate-2026-10-24)):
+      the counter above `V_HF_KHZ` (10 kHz) = driven in plain AC mV and no DC? in AC V; DC mV OL = driven, also for
+      the A-PROT trip. That the counter sees the signal in those rows is INFERRED (AC mV: not, below). Emulator: senttest acmv-hf600 /
+      acmv-hf60 / dcmv-hf600 / dcmv-hf600-slow / acv-hf / acv-auto-hf, loudtest ajack-acmv-hf / ajack-dcmv-hf FAIL
+      on 8a0f59d1, pass; aprot-dcmv-24 latency 137 -> 444 ms. The two AC mV ranges disagree on the same input
+      (26.57 mV on 600 mV, 2.16 mV on 60 mV, ~12x), so neither reading is the input's RMS (cause unknown).
+      **Device 0.2.4 (the MR9270's 66 kHz 0 / 9.5 V square, 2026-10-26): FAIL in AC mV 600 mV** (AJACK on all
+      polls, field 12 = 0: the counter did not say driven), AC mV 60 mV / DC mV / AC V pass, DC V AUTO logged
+      one `AJACK,CMP_PB1` (CTSTA 0x70 / 0). Second fix (doc 4.13): AC mV |LPF| > 300 mV = driven
+      (`MV_DC_DRV_MV`; the clipped square's LPF 0.509 V on the device); DC V / DC mV windows of 0x70 mixed with empty
+      reads are no hit (MIXED in `sample_cmp`). Emulator acmv-sq66k-600 / dcv-auto-sq66k / dcmv-sq66k: FAIL on
+      0.2.4, pass. **Device 0.2.5 (2026-10-26): PASS** for steps 1-5 below (no alert, no log entry in any; AC mV
+      field 12 = 1; AC+DC 600 mV AC-phase LPF 0.509 V). Step 6 (a current in A) not run: the A jack is not wired.
+      Device check (alarm OFF, the MR9270 at 66 kHz on V-COM, A jack empty; `SYST:ALER?`, `DBG:SENT?`,
+      `DBG:SENT:LOG?`, `READ?` ~20 polls per step; script: hfdev4.py pattern):
+      1. AC mV 600 mV, then 60 mV (manual): no AJACK, no new log entry; `DBG:SENT?` field 12 = 1.
+      2. DC mV 600 mV: OL, no AJACK / APROT; DC V AUTO: no new log entry (field 8, hits, may stay near 0).
+      3. AC V 6 V and AC V AUTO: no DC, no AJACK.
+      4. AC+DC 600 mV: `DBG:ACDC?` dcp of the AC phase (the LPF the fix keys on; expect ~0.6 V).
+      5. 5 V DC from the calibrator: DC mV and DC V AUTO, no AJACK.
+      6. If the A jack can be wired: a current in A with V-COM open in AC mV, DC mV, DC V: AJACK within ~1 s.
 - [x] False A-JACK from a large AC signal on V-COM in AC mV (device 2f56ff9 new bug 1: AJACK,AD1PK_PB1 and
       the danger alarm with the A jack empty, the 0 / 9.5 V square, AC V AUTO on 60 mV). The square drives
       the mV input into its clamp; the clamp current shows on PB1, where the AD1 peak hold watches the A-jack

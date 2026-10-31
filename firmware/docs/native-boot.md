@@ -674,6 +674,35 @@ A2 keeps ~0.9 KB above its 2 KiB warning for the shim; B ~1 KB above its
 16 484 B, C 7 152 B). The next relief for C needs a real cut (the candidates of
 audit #1 above) or a larger blob moved out of B.
 
+### The long scope record (2026-10-26)
+
+The scope record buffer `scope::BUF` grew from 53 248 B to 86 016 B (the
+design: [ram-budget.md, The scope record](ram-budget.md#the-scope-record-raw-ring-and-coded-ring)).
+Flash for the new code (the packed ring, the `pack10` reads in every
+record user) came from `stockfont::paint`: it was one copy per closure
+type (23 copies, 4.0 KB in region B); it is now a thin generic wrapper
+around one `paint_dyn` that takes the closure as `&mut dyn FnMut` (region
+B +1.3 KB). Emulator (emu/dragperf.py, the scope page with trigger-level
+drags): `s.paint` maximum 4 790 -> 4 960 us per pass, the average
+unchanged. With that room, `scope_ui::drag_target` and
+`Scope::hw_calibrate` (378 B) moved from region C back to B.
+
+| | before (d0436633) | after |
+|---|---|---|
+| scope::BUF | 53 248 B | 86 016 B |
+| SRAM free | 44 944 B | 12 136 B |
+| region B free | 16 500 B | 16 716 B |
+| region C free | 8 024 B | 8 316 B |
+| stack headroom (static worst path) | 20 548 B | 20 516 B |
+
+Without `ad2-isr` (`--no-default-features --features vdisk`): B 26 320 ->
+26 328 B, C 9 064 -> 9 392 B, stack headroom 21 008 -> 20 984 B, SRAM
+free 45 204 -> 12 396 B.
+
+The new ring state (`scope::RING`) is in `.sram_bss`, not in the TCM
+`Scope`, so the stack keeps its headroom. The per-poll code (the staging
+drain, the packed reads) is in region B.
+
 ### Region B audit #5 (2026-10-26, fix/low-freq)
 
 The low-frequency Hz counter (`Dmm::freq_gate`, the gate checks, the
@@ -834,6 +863,168 @@ stack headroom (each gains the same ~5.6 KB of C):
 
 Next candidates if C gets tight again (DBG-only, still in C): `hyspi`
 (DBG:HYSPI:SELF? / WR?, 2.3 KB), `boot::put_info` (DBG:BOOT?, 1.6 KB).
+
+### Region B audit #7 (2026-10-30, test/scope-chain-0.4)
+
+The scope chain #41 (long record) + #59 (coded ring) + #63 (protocol
+decoder) merged on release/0.4.0 (8eecb058, with #44) did not link: the
+decoder's ~23 KB of region B code had been budgeted against an older
+base. Free flash in all was B -6 296 + C 10 824 + A2 2 208 = 6 736 B
+against 12 288 B of floors, so moves alone could not fit it; about 5.6 KB
+had to leave the image.
+
+| | merged, before | after |
+|---|---|---|
+| region A2 free | 2 208 B | 156 B |
+| region B free | -6 296 B (no link) | 8 704 B |
+| region C free | 10 824 B | 7 204 B |
+| stack headroom (static worst path) | 20 320 B | 21 560 B |
+| SRAM free | 7 244 B | 11 484 B |
+
+RAM:
+- `scope_ui::dec::ANN` (1 236 B) TCM -> `.sram_bss` (stack headroom).
+- `app_decode::JOB` zero bytes until `init` writes None (no `.data` image).
+- `acdctr::TR_N` 192 -> 64 entries, `TR_POST` 32 (1 792 B of SRAM); with
+  the trace off (below) one entry.
+
+Moves (no code removed):
+- `fft::QSIN` (2 052 B, read per butterfly) -> region A2 (`.rodata.a2`):
+  as fast as B. A2 is left with 156 B (build.sh banner below 2 KiB).
+- `K_FONT` (2 420 B) -> C: its only reader is `ui::keypad_key`, already
+  in C (the Keypad page / popup, no stream).
+- The decoder frame log's page draw, setup popup, touches and panel
+  buttons (`log_page`, `log_setup_draw`, `log_gesture`, ... ~2 KB) ->
+  `.text.log_cold`. The per-pass decode and row drawing (`log_poll`,
+  `log_tick`, `log_row`, `store_frame`) stay in B. The decode tab
+  (`dec::page`, `dec_setup_tap`) and the DECode:* queries stay in B: the
+  Wave view's MF popup and a host reach them while its AD2 stream runs.
+  New guards, so that no AD2 stream runs with the log: `log_open`
+  refuses while `hy3131::streaming()`, `LOG:STAT ON` is refused while the
+  log is open (`log_on_check`). Before, a host `LOG:STAT ON` with the log
+  open could run the existing `.text.log_cold` code under the ISR.
+
+Left out of this test image (cargo features, not default here; build with
+them for a debug session, which does not fit region B with the decoder):
+- `ad2-exp`: DBG:AD2:TORN? / NOISE? / DCV? / N7? (`ad2exp` torn / noise /
+  dcv_test / n7_test, `dbg_dcv`, `dbg_n7`, `dcv_arg`, `n7_arg`; E7's
+  `dc_enter` / `dcv_row` stay): B +5 040 B.
+- `acdc-trace`: DBG:ACDC:TRACE records nothing (the query answers an empty
+  ring): B +864 B, SRAM +1 768 B.
+- `dbg-src`: DBG:SRC (`dbgsrc_dmm`, the parser): B +2 640 B, C +984 B.
+
+Back to region B: `App::sp_popup_close`, `sp_uncover`, `scope_ui::uncover`
+(292 B; C since region B audit #3). MENU with an MF popup open in the
+Wave view closes it while the AD2 stream runs (hy3131/wavetest.py "exit
+(MENU)", reached once its Settings tap missed the five-tab MF bar).
+
+Not done: the decode tab to C (it would need the tab hidden in the Wave
+view); the gallery's `dlog` decoder copies for `GSrc` (~0.6 KB of B,
+`.text.vdisk_rd` on the generic functions); glyph tables without the
+code field where dense (~0.65 KB).
+
+### Region B audit #8 (2026-10-30, test/scope-chain-0.4 on 0.4.0 + GEN / CH2)
+
+The chain merged again on release/0.4.0 (e3229f7a: #64 / #177 GEN and
+DMM CH2, #172, #180) did not link: region B -6 304 B, SRAM -6 924 B
+(release alone: B 8 280, SRAM 24 244), with region C 6 588 B and A2 156 B
+free. With CH2 the AD2 stream also runs on the MCX scope page, so no
+scope-page code can go to region C; about 12 KB of flash and 15 KB of
+SRAM had to leave the image.
+
+| | merged | after |
+|---|---|---|
+| region A2 free | 156 B | 156 B |
+| region B free | -6 304 B (no link) | 9 440 B |
+| region C free | 6 588 B | 6 064 B |
+| stack headroom (static worst path) | 21 312 B | 21 312 B |
+| SRAM free | -6 924 B | 9 460 B |
+
+Left out (cargo features, not default here):
+- `dec-log`: the decoder's frame log (Mode Log, DECode:MODE LOG, the
+  FRAMes? FIFO of the log; src/app_log.rs, a stub app_log_off.rs refuses
+  it): B ~9 KB, C ~5 KB. The Decode tab's Mode row shows Band only.
+- `dec-modbus`: Modbus RTU in the decoder (decode.rs `MODBUS`; UART
+  only, DECode:PROTocol MODBus refused): B 1 176 B. The host tests build
+  it always.
+
+SRAM: `scope::CAP` 42 K -> 34 K u16 (-16 384 B): the raw ring of the fast
+timebases 43 008 -> 34 816 samples, the packed ring (`PCAP`, white
+noise) 65 520 -> 52 400, the post-trigger part of a coded Single at the
+centre 52 156 -> 39 036; a compressible signal keeps ~0.8 of what it did
+(tools/cring-test). The `recovery-usb` split of CAP is gone (it was the
+smaller one).
+
+Moves (functions whose every caller is region C code, from a call graph
+of the ELF with every address-taken function counted as hot): the
+generator page's wave preview (`ui::gen_preview`, from `gen_values`),
+vwrite's `stage` / `ours_live` (`VDisk::write_block`), `HwTrig::sweep`
+(`calibrate`), `csvlog::ascii`, `ui::ok_and_limits_buttons`,
+`ui::pw::outline`, `ui::record_button`, `app::kp_unit_text`,
+`spiflash::block_crc`: B +2 992 B. The struct templates copied by region
+C code only (`fastlog::JOB0` 1 864 B for `fastlog::begin`, `csvlog::JOB0`
+512 B for `start` from `App::rec_start`, `app_touchtest::TT0` for
+`tt_open`) are statics in `.rodata.cold_tpl` (C): B +2 552 B. A `const`
+copied by `*j = JOB0` is an anonymous image in region B whoever reads it.
+
+Still off: `ad2-exp`, `acdc-trace`, `dbg-src` (audit #7).
+
+### Protocol decoder (2026-10-28, feat/decoder-uart)
+
+The decoder band (src/decode.rs, app_decode.rs, ui_decode.rs) decodes each
+stored record once (running: one that triggered; stopped: on STOP), in
+the main loop (`dec_step`, up to 3 ms a pass) while the next acquisition
+waits (`Scope::hold_restart`), and keeps its bytes and frames
+(`ui_decode::ANN`: 80 bytes, 16 frames, ~1.3 KB) in TCM; every redraw
+draws from them. SRAM is untouched (the scope ring of feat/scope-dlg-ring
+leaves 8.5 KB). All of it is region B (emu/decodetest.py: no region C
+function while the Wave view's AD2 stream ISR owns the bus).
+
+| | feat/scope-dlg-ring (4f4294eb) | with the decoder |
+|---|---|---|
+| region B free | 46 300 B | 29 940 B |
+| region C free | 8 196 B | 8 240 B |
+| stack headroom (static worst path) | 22 220 B | 20 656 B |
+| SRAM free | 8 524 B | 8 524 B |
+
+Variants (B / C free, headroom): recovery-usb 28 532 / 8 276 / 21 168 B,
+recovery-file 29 780 / 7 752 / 20 656 B, no-ad2-isr 39 000 / 9 244 /
+21 128 B, spi-disk 48 064 / 18 216 / 22 244 B, fatren-dry-run 29 924 /
+8 664 / 20 656 B, keep-screen 29 972 / 8 232 / 20 656 B, mute 29 620 /
+8 120 / 20 656 B.
+
+Cost (emulator at --mips 110, DBG:PROF?: `dec.job` one record's decode,
+`x2` a pass's part of it, `s.frame` the frame; UART traffic on MCX, Auto
+sweep with the trigger level in the swing, 3 s running; emu/decodetest.py):
+
+| s/div | baud | frames off / on | frame avg, us (off / on) | decode per record avg / max, us |
+|---|---|---|---|---|
+| 1 ms | 9600 | 79 / 70 | 6 887 / 6 978 | 3 049 / 8 328 |
+| 10 ms | 9600 | 24 / 24 | 6 887 / 7 247 | 2 296 / 2 797 |
+| 100 ms | 9600 | 3 / 3 | 6 887 / 6 978 | 115 / 169 (the note) |
+| 1 ms | 115200 | 89 / 69 | 6 887 / 7 253 | 4 098 / 4 904 |
+| 10 ms | 115200 | 25 / 25 | 6 887 / 6 978 | 133 / 178 (the note) |
+| 100 ms | 115200 | 3 / 3 | 6 887 / 6 978 | 123 / 140 (the note) |
+
+STOP: one decode of the stored record (1 ms/div 3.9-4.3 ms); a pan or zoom
+inside what is kept: none; outside it (a record with more than the lists
+hold): the window, ~2 ms. A pass decodes for up to 3 ms (`x2` max
+3.3 ms); the next acquisition waits for the decode: at 1 ms/div 70 / 69
+frames in 3 s instead of 79 / 89.
+
+The frame log (Mode Log, app_log.rs, ui_log.rs) lends BUF from the scope
+(`Scope::log_begin`): its first 16 K samples a circular DMA ring, then
+`app_log::Log` (the decoder and the view, under 1 KB), a snippet's
+decoded samples (8 KB), then the frame store (~44 KB with CAP 42 K; 32 KB
+in recovery-usb's 36 K, which has no scope). TCM: a pointer; SRAM:
+nothing. Region B 18 780 B free, region C 5 668 B (the waveform view and
+the log's top bar / counters, `.text.log_cold`; variants: B 16 900 ..
+36 576 B, C 5 180 .. 15 684 B, mute 17 804 / 5 564 B). No idle power-off
+while the log runs. While the log
+streams, the settings save and the screenshot clusters' erase wait (an
+SPI erase outlasts the 13 ms ring at 1.25 MS/s). The static worst path is 24 728 B (headroom 20 600 B).
+Emulator (--mips 110): a pass decodes for at most 3 ms (`x2` max 1.6 ms
+at 115200 with traffic), 4 588 frames in 3 s at 115200 without a lost
+sample; 267 Modbus 19200 frames with their waveforms fill the store.
 
 ### Region B audit #9 (2026-10-30, feat/region-b-profile)
 
@@ -1040,6 +1231,40 @@ section puts it behind a feature.
 | region C free | 13 556 B | 13 996 B |
 | stack headroom (static worst path) | 20 744 B | 20 760 B |
 | SRAM free | 24 244 B | 34 628 B |
+
+On test/scope-chain-0.4 (the decoder's paths: static worst stack path
+24 800 B, 240 B more than 0.4.0) TCM has room for `dmm::REC_COPY` and
+`ui::GEN_SP` (484 B) only; `vdisk::CSV_CUR2` and `lcd::DEFER` stay in
+`.sram_bss`, and `touch::LOG` was in SRAM there already. The SRAM
+freed takes `scope::CAP` from 34 K to 40 K u16, not to 42 K (that needs
+4 KB more): the raw ring of the fast timebases 34 816 -> 40 960 samples,
+the packed ring (`PCAP`, white noise) 52 400 -> 62 240, the post-trigger
+part of a coded Single at the centre 39 036 -> 48 876. The `recovery-usb`
+variant keeps CAP 36 K / PCAP 55 000 again (it has its own MSC buffers).
+
+| | before (a5352720, CAP 34 K) | after (CAP 40 K) |
+|---|---|---|
+| region A2 free | 156 B | 156 B |
+| region B free | 9 440 B | 14 056 B |
+| region C free | 6 064 B | 6 472 B |
+| stack headroom (static worst path) | 21 312 B | 20 620 B |
+| SRAM free | 9 460 B | 8 308 B |
+
+Then (feat/sram-extra-areas, the next sections) `scope::CAP` goes back to
+42 K u16 / `PCAP` 65 520 (the raw ring 43 008, the post-trigger part of a
+coded Single at the centre 52 156; the test floors as on
+feat/scope-long-record). On this branch `ui::GEN_SP` also moves from TCM
+to the backup SRAM, except in a `dbg-prof` build (`prof::P` takes that
+room).
+
+| | CAP 40 K, release/0.4.0 + extra areas merged | CAP 42 K |
+|---|---|---|
+| region A2 free | 156 B | 156 B |
+| region B free | 14 904 B | 14 912 B |
+| region C free | 6 624 B | 6 624 B |
+| stack headroom (static worst path) | 20 596 B | 21 076 B |
+| SRAM free | 14 756 B | 10 660 B |
+| backup SRAM free | 1 424 B | 936 B |
 
 ### AC+DC trace behind a feature (2026-10-30, feat/sram-extra-areas)
 

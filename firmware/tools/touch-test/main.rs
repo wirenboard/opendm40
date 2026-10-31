@@ -22,6 +22,12 @@
 mod host;
 pub use host::mmio;
 
+#[path = "../../src/pack10.rs"]
+mod pack10;
+#[path = "../../src/cring.rs"]
+mod cring;
+#[path = "../../src/dlog.rs"]
+mod dlog;
 #[path = "../../src/ident.rs"]
 mod ident;
 #[path = "../../src/bargraph.rs"]
@@ -63,6 +69,10 @@ mod scope;
 mod scope_meas;
 #[path = "../../src/trigsoft.rs"]
 mod trigsoft;
+// scope_ui.rs draws the decoder view (ui_decode.rs) with decode.rs.
+#[allow(dead_code)]
+#[path = "../../src/decode.rs"]
+mod decode;
 #[path = "../../src/scope_ui.rs"]
 mod scope_ui;
 #[path = "../../src/stockfont.rs"]
@@ -990,10 +1000,11 @@ fn hit_tests(ck: &mut Ck) {
     scope_ui::invalidate();
     scope_ui::update(&scope_ui::Model::DEFAULT);
     page(ck, "replica panel", &|x, y| scope_ui::panel_hit(x, y).map(|k| k as u32), &|b| b.x0 >= 414, &[0, 1, 2, 3, 4, 5, 6]);
-    let pv = scope_ui::PopVals { meas: [0, 10, 9, 11], meas_n: 4, roll: false, persist: 0, bright: 100, grid: 50, rising: true, mode: 0, ac: false, probe: 3, colour: 2, math_colour: 1, pressed_cell: None, math_mode: 5, fft_hz: 3, hz_opts: [scope_ui::Txt::EMPTY; 4], fft_win: 2, fft_vrms: false, ttype: 0, pcond: 0, pwidth: 1e-3, runt_v: 0.0, tsrc: 0, gen_trace: false, ch2_on: false, ch2_vdiv: scope_ui::Txt::EMPTY };
-    for tab in 0..4u8 {
+    let pv = scope_ui::PopVals { meas: [0, 10, 9, 11], meas_n: 4, roll: false, persist: 0, bright: 100, grid: 50, rising: true, mode: 0, ac: false, probe: 3, colour: 2, math_colour: 1, pressed_cell: None, math_mode: 5, fft_hz: 3, hz_opts: [scope_ui::Txt::EMPTY; 4], fft_win: 2, fft_vrms: false, ttype: 0, pcond: 0, pwidth: 1e-3, runt_v: 0.0, tsrc: 0, gen_trace: false, ch2_on: false, ch2_vdiv: scope_ui::Txt::EMPTY, dec: scope_ui::dec::SetupVals::DEFAULT };
+    for tab in 0..5u8 {
         host::reset(0);
         scope_ui::draw_mf(tab, &pv);
+        use scope_ui::dec::SetupHit as D;
         let hit = move |x: u16, y: u16| match scope_ui::mf_hit(tab, &pv, x as i16, y as i16) {
             scope_ui::MfHit::Tab(t) => Some(1000 + t as u32),
             scope_ui::MfHit::Cell(i) => Some(i as u32),
@@ -1008,7 +1019,15 @@ fn hit_tests(ck: &mut Ck) {
             scope_ui::MfHit::Mode(m) => Some(340 + m as u32),
             scope_ui::MfHit::PriScr => Some(350),
             scope_ui::MfHit::SaveCsv => Some(351),
+            scope_ui::MfHit::Dec(D::Proto(i)) => Some(400 + i as u32),
+            scope_ui::MfHit::Dec(D::Mode(i)) => Some(410 + i as u32),
+            scope_ui::MfHit::Dec(D::Fmt(i)) => Some(420 + i as u32),
+            scope_ui::MfHit::Dec(D::Inv(i)) => Some(430 + i as u32),
+            scope_ui::MfHit::Dec(D::ThrAuto(a)) => Some(440 + a as u32),
+            scope_ui::MfHit::Dec(D::Baud(up)) => Some(450 + up as u32),
+            scope_ui::MfHit::Dec(D::Thr(up)) => Some(460 + up as u32),
             _ => None,
+
         };
         page(ck, &format!("replica MF tab {tab}"), &hit, &|b| b.y0 >= 21, &[]);
     }

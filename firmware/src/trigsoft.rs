@@ -3,7 +3,8 @@
 //! stream search only know edges). Pure, host-tested by tools/trig-test.
 //!
 //! Limits (by construction, stated in the Trigger tab notes and the TODO):
-//!  * not a hardware trigger: each record (scope::CAP = 26624 samples) is
+//!  * not a hardware trigger: each record (scope.rs `lin_len`: 26624 samples
+//!    or up to 0.1 s, at most scope::CAP) is
 //!    searched after it is complete, so an event in the dead time between
 //!    two records (search + drawing + restart) is missed; a rare glitch is
 //!    caught with probability ~ record time / (record time + dead time);
@@ -11,8 +12,8 @@
 //!    around the trigger point (the trigger position) count;
 //!  * width resolution = one sample (1 / sample rate of the timebase), the
 //!    10-bit codes with +-2 codes of hysteresis around each level;
-//!  * slow timebases need the whole record per frame (26624 samples: 0.5 ms
-//!    at 50 MS/s, 0.2 s at 125 kS/s, 10.6 s at 1 s/div);
+//!  * slow timebases need the whole record per frame (26624 samples: 0.2 s
+//!    at 125 kS/s, 10.6 s at 1 s/div; 43008 = 0.9 ms at 50 MS/s);
 //!  * roll mode has no trigger (as the edge trigger).
 
 /// Trigger types (Settings::ttype).
@@ -35,15 +36,15 @@ const HYS: i32 = 2;
 /// crossings of level `l`) meets `cond` against `w` samples (`EQ`: within
 /// +-5 %, at least +-1 sample). `positive`: a high pulse (rising, then
 /// falling), else a low one. Returns the trailing-edge index.
-pub fn pulse(d: &[u16], lo: usize, hi: usize, l: i32, positive: bool, cond: u8, w: f32) -> Option<usize> {
+pub fn pulse<S: crate::pack10::Src + ?Sized>(d: &S, lo: usize, hi: usize, l: i32, positive: bool, cond: u8, w: f32) -> Option<usize> {
     let hi = hi.min(d.len());
     // state: 0 waiting for the far side (arm), 1 armed, 2 inside a pulse
     // (start = leading edge), the trailing edge needs the near side first.
     let (mut armed, mut start, mut inside) = (false, 0usize, false);
     let mut deep = false;
     let tol = (w * 0.05).max(1.0);
-    for (i, &v) in d[..hi].iter().enumerate() {
-        let v = v as i32;
+    for i in 0..hi {
+        let v = d.at(i) as i32;
         let (pre, past, back) = if positive { (v < l - HYS, v > l, v < l) } else { (v > l + HYS, v < l, v > l) };
         let deep_now = if positive { v > l + HYS } else { v < l - HYS };
         if !inside {
@@ -79,15 +80,15 @@ pub fn pulse(d: &[u16], lo: usize, hi: usize, l: i32, positive: bool, cond: u8, 
 /// without reaching the upper one; else a pulse that falls through the
 /// upper level and returns above it without reaching the lower one. The
 /// return crossing in [lo, hi) is the trigger point.
-pub fn runt(d: &[u16], lo: usize, hi: usize, l1: i32, l2: i32, positive: bool) -> Option<usize> {
+pub fn runt<S: crate::pack10::Src + ?Sized>(d: &S, lo: usize, hi: usize, l1: i32, l2: i32, positive: bool) -> Option<usize> {
     let hi = hi.min(d.len());
     let (a, b) = (l1.min(l2), l1.max(l2));
     if b - a <= 2 * HYS {
         return None;
     }
     let (mut armed, mut inside, mut reached, mut deep) = (false, false, false, false);
-    for (i, &v) in d[..hi].iter().enumerate() {
-        let v = v as i32;
+    for i in 0..hi {
+        let v = d.at(i) as i32;
         if positive {
             if !inside {
                 if v < a - HYS {

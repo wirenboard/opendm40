@@ -45,6 +45,8 @@ import emusync  # noqa: E402
 # them there with the boot of emusync.BOOT_S (3.56 s, fresh disk); if the boot changes,
 # only the phase lengths move (the markers keep the windows on the inputs).
 VLAG = emusync.BOOT_S - 0.5
+# The 66 kHz model knobs (the hf scenarios below; INFERRED ratios).
+HF = 'hfbw:6000;hfdc:0.3;hfpb1:10;hfpb2:1'
 # A bouncing contact (cont-bounce): (s after the phase's input, V-COM ohm; 1e12 = open), set
 # through SetOption (no input marker); the phase's own input is the open resistor.
 BOUNCE_ON = [(0.05, 814.6), (0.12, 1e12), (0.2, 277), (0.3, 28.85), (0.38, 1e12), (0.45, 28.85), (0.6, 1e12),
@@ -61,7 +63,9 @@ SC = {
     'dcv-step': ('VOLT:DC', 36, [(0, 'open;vsrc:1', {'NONE'}), (8, 'vsrc:10', {'NONE'}), (14, 'vsrc:1', {'NONE'}),
                                  (20, 'vsrc:10', {'NONE'}), (26, 'vsrc:1;isrc:0.001', {'AJACK'})]),
     'dcmv':     ('VOLT:DC', 20, [(0, 'open;vsrc:0.1', {'NONE'}), (10, 'isrc:0.002', {'AJACK'})]),
-    'ohm':      ('RES', 26, [(0, 'open;r:4700', {'NONE'}), (12, 'isrc:0.002', {'AJACK'})]),
+    # (ohm: 4.7 Mohm, the 6 Mohm row, whose jack check line tells a current in A from a source;
+    # on the rows below it a current in A shows LIVE?, the gap: ohm-v5-600)
+    'ohm':      ('RES', 26, [(0, 'open;r:4.7e6', {'NONE'}), (12, 'isrc:0.002', {'AJACK'})]),
     'temp':     ('TEMP', 26, [(0, 'open;tc:100;cj:25', {'NONE'}), (12, 'isrc:0.005', {'AJACK'})]),
     'acv':      ('VOLT:AC', 26, [(0, 'open;vsrc:0,ac=1.0,f=50', {'NONE'}), (10, 'isrc:0,ac=0.01,f=50', {'AJACK'}), (18, 'isrc:none', {'NONE'})]),
     'acv-dc':   ('VOLT:AC', 20, [(0, 'open;vsrc:0,ac=1.0,f=50', {'NONE'}), (10, 'isrc:0.001', {'AJACK'})]),
@@ -77,10 +81,13 @@ SC = {
     # (sentinel.rs JACK CHECK: AD2 on OP1O while PB1 hits) tells it: LIVE?, never A-JACK. A current
     # in A with V-COM open (the last phase) is A-JACK as before. ohm-v5-600: manual 600 ohm.
     'ohm-v5':   ('RES', 42, [(0, 'open;r:4700', {'NONE'}), (8, 'vsrc:5', {'LIVE'}), (16, 'vsrc:10', {'LIVE'}),
-                             (24, 'vsrc:4.776,ac=4.776,f=40,shape=square', {'LIVE'}), (32, 'open;isrc:0.002', {'AJACK'})],
+                             (24, 'vsrc:4.776,ac=4.776,f=40,shape=square', {'LIVE'}), (32, 'open;isrc:0.002;aiohm:31e6', {'AJACK'})],
                  [], {'monitor': ['sysbus.hy3131 Pb1VjackMv 10'], 'never': [('AJACK', 1, 4)]}),
+    # (ohm-v5-600's last phase: on 600 ohm the open input's own source, 2.17 V, is in the band of a
+    # source on V-COM, and the reading is OL either way: a DC current in A with V-COM open reads
+    # 0x70 as a source does and shows LIVE? there, the gap of doc 4.13)
     'ohm-v5-600': ('RES 600', 42, [(0, 'open;r:470', {'NONE'}), (8, 'vsrc:5', {'LIVE'}), (16, 'vsrc:10', {'LIVE'}),
-                                   (24, 'vsrc:4.776,ac=4.776,f=40,shape=square', {'LIVE'}), (32, 'open;isrc:0.002', {'AJACK'})],
+                                   (24, 'vsrc:4.776,ac=4.776,f=40,shape=square', {'LIVE'}), (32, 'open;isrc:0.002', {'LIVE'})],
                    [], {'monitor': ['sysbus.hy3131 Pb1VjackMv 10'], 'never': [('AJACK', 1, 4)]}),
     # Continuity, the same inputs (device 40728b8 item 4 / d2aff22 S6: A-JACK at 5 V from the AD2
     # peak on PB1; LIVE? at 1 V): the jack check's window says driven -> LIVE?.
@@ -100,6 +107,58 @@ SC = {
     'acmv-dc5': ('VOLT:AC 0.6', 30, [(0, 'open;mvclamp:1.212;mvpb1:10;vsrc:0,ac=0.003,f=50', {'NONE'}),
                                      (10, 'vsrc:5', {'NONE'}),
                                      (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [], {'never': [('AJACK', 1, 2)]}),
+    # A 66 kHz signal on V-COM (device 2026-10-26, A jack empty: AC mV 600 mV AJACK,AD1PK_PB1 at
+    # 26.6 mV, DC mV 600 mV OL with CMP_PB1 A-JACK / A-PROT, AC V 6 V a DC? hint at 1.16 mV). The
+    # model's HF knobs (INFERRED): the RMS blocks roll off above 6 kHz (`hfbw`), the DC mV node and
+    # the AC V tap carry 0.3 x the rms as DC (`hfdc`: DC mV OL), PB1 10 mV / V and PB2 1 mV / V of
+    # the jack (`hfpb1` / `hfpb2`). AC mV: the counter's 66 kHz says driven (sentinel V_HF_KHZ); DC mV:
+    # its OL result (V_GATE), also for A-PROT; AC V: no DC?. The last phase: a current in A with
+    # V-COM open (DC mV) or a small 50 Hz on it (AC mV) still asserts A-JACK.
+    'acmv-hf600': ('VOLT:AC 0.6', 30, [(0, 'open;%s;vsrc:0,ac=0.003,f=50' % HF, {'NONE'}),
+                                       (10, 'vsrc:0,ac=3,f=66000', {'NONE'}),
+                                       (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [],
+                   {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'acmv-hf60': ('VOLT:AC 0.06', 30, [(0, 'open;%s;vsrc:0,ac=0.003,f=50' % HF, {'NONE'}),
+                                       (10, 'vsrc:0,ac=3,f=66000', {'NONE'}),
+                                       (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [],
+                  {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'dcmv-hf600': ('VOLT:DC 0.6', 30, [(0, 'open;%s;vsrc:0.1' % HF, {'NONE'}),
+                                       (10, 'vsrc:0,ac=3,f=66000', {'NONE'}),
+                                       (20, 'vsrc:none;isrc:0.002', {'AJACK'})], [],
+                   {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    # The same at the SLOW rate (0.4 s conversions; the V gate's lag is 250 ms) and through AC V
+    # AUTO (mV-first, as the owner switched).
+    'dcmv-hf600-slow': ('VOLT:DC 0.6', 30, [(0, 'open;%s;vsrc:0.1' % HF, {'NONE'}),
+                                            (10, 'vsrc:0,ac=3,f=66000', {'NONE'}),
+                                            (20, 'vsrc:none;isrc:0.002', {'AJACK'})], ['SENS:RATE SLOW'],
+                        {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'acv-auto-hf': ('VOLT:AC', 30, [(0, 'open;%s;vsrc:0,ac=0.003,f=50' % HF, {'NONE'}),
+                                    (10, 'vsrc:0,ac=3,f=66000', {'NONE'}),
+                                    (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [],
+                    {'never': [('AJACK', 1, 2), ('APROT', 0, 3), ('DC', 1, 2)]}),
+    # The device check of 2026-10-26 (0.2.4): the MR9270's 66 kHz output, a 0 / 9.5 V square, on
+    # V-COM. AC mV 600 mV: AJACK,AD1PK_PB1 (~30 mV RMS); the counter did not say driven (the
+    # model's `hfnocnt`); the input clips the square (`mvclamp`, its PB1 pickup `mvpb1`): the LPF's
+    # ~0.6 V says driven (MV_DC_DRV_MV). DC V AUTO: AJACK,CMP_PB1 once in the log.
+    'acmv-sq66k-600': ('VOLT:AC 0.6', 30, [(0, 'open;%s;hfnocnt:1;mvclamp:1.212;mvpb1:10;vsrc:0,ac=0.003,f=50' % HF, {'NONE'}),
+                                           (10, 'vsrc:4.776,ac=4.776,f=66000,shape=square', {'NONE'}),
+                                           (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [],
+                       {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'acmv-sq66k-60': ('VOLT:AC 0.06', 30, [(0, 'open;%s;hfnocnt:1;mvclamp:1.212;mvpb1:10;vsrc:0,ac=0.003,f=50' % HF, {'NONE'}),
+                                           (10, 'vsrc:4.776,ac=4.776,f=66000,shape=square', {'NONE'}),
+                                           (20, 'vsrc:0,ac=0.003,f=50;isrc:0,ac=0.005,f=60', {'AJACK'})], [],
+                      {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    # (`hfboth`: the comparator on PB1 reads 0x70 and 0 in turn, as the device in DC V AUTO / DC mV)
+    'dcv-auto-sq66k': ('VOLT:DC', 30, [(0, 'open;%s;hfnocnt:1;hfboth:0.3;mvclamp:1.212;mvpb1:10;vsrc:1' % HF, {'NONE'}),
+                                       (10, 'vsrc:4.776,ac=4.776,f=66000,shape=square', {'NONE'}),
+                                       (20, 'vsrc:none;isrc:0.002', {'AJACK'})], [],
+                       {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'dcmv-sq66k': ('VOLT:DC 0.6', 30, [(0, 'open;%s;hfnocnt:1;hfboth:0.3;mvclamp:1.212;mvpb1:10;vsrc:0.1' % HF, {'NONE'}),
+                                       (10, 'vsrc:4.776,ac=4.776,f=66000,shape=square', {'NONE'}),
+                                       (20, 'vsrc:none;isrc:0.002', {'AJACK'})], [],
+                   {'never': [('AJACK', 1, 2), ('APROT', 0, 3)]}),
+    'acv-hf':     ('VOLT:AC 6', 24, [(0, 'open;%s;vsrc:0,ac=1,f=50' % HF, {'NONE'}),
+                                     (10, 'vsrc:0,ac=3,f=66000', {'NONE'})], [], {'never': [('DC', 1, 2)]}),
     # AC+DC V on manual 600 mV (doc 4.13 gap): its AC phase is the AC mV row with the same AD1
     # peak sentinel; V_GATE takes the AC phase's result there too (both phases share the run).
     'acdcmv-sq600': ('VOLT:ACDC 0.6', 34, [(0, 'open;mvclamp:1.212;mvpb1:10;vsrc:0,ac=0.003,f=50', {'NONE'}),
@@ -151,9 +210,27 @@ SC = {
     'aca-vdc':  ('CURR:AC', 18, [(0, 'open;vsrc:24', {'NONE'})]),
     'aca-vac':  ('CURR:AC', 20, [(0, 'open', {'NONE'}), (10, 'vsrc:0,ac=230,f=50', {'VJACK'})]),
     'aca-vi':   ('CURR:AC', 18, [(0, 'open;vsrc:24;isrc:0,ac=0.01,f=50', {'NONE'})]),
-    # Frequency carries no sentinel (device d8e249d: PB1 - PB3 stands at ~54 mV in its row, a
-    # false A-JACK; doc 4.7 gaps): a current in A shows nothing there.
-    'freq-gap': ('FREQ', 24, [(0, 'open;vsrc:0,ac=1,f=1000', {'NONE'}), (10, 'isrc:0.001', {'NONE'})]),
+    # Frequency: A-JACK on a one-sided PB1 - PB3 level above PK_DC_THR (~180 mV; negative:
+    # PK_DC_NEG_THR, ~280 mV) only; the row's +2.5 mV with V-COM open (PR #55, SAD1I 00; the
+    # model's `hzpb1`) under it: 1 mA in A (~50 mV with it) shows nothing there. 10 V DC on
+    # V-COM puts -140 mV there (PR #55): nothing either.
+    'freq-gap': ('FREQ', 24, [(0, 'open;hzpb1:2.5;vsrc:0,ac=1,f=1000', {'NONE'}), (10, 'isrc:0.001', {'NONE'})]),
+    'freq-v10': ('FREQ', 20, [(0, 'open;hzpb1:-140;vsrc:10', {'NONE'})]),
+    # A current in A with the V jack open (device 2026-10-26, the owner's PSU 20 mA CC into A /
+    # COM: AC mV, ohm and Hz showed no A-JACK; DC V / AC V / continuity / diode / capacitance
+    # did). Ohm: PB1 above the window reads 0x70 (the model's `pb1cmp70`, default), as a source on
+    # V-COM does; RES AUTO sits on the 60 Mohm row, whose jack check reads OP1O at its own source
+    # (1.6 V in the model) and the reading is in range (31 Mohm on the device: `aiohm`): A-JACK,
+    # never LIVE?. AC mV: the open input carries 0.146 x PB1 as DC
+    # and 1.5 V RMS of 50 kHz (`ailift` / `ainz`, INFERRED: the device read OL and Hz ~50 kHz),
+    # which says driven (the counter, the RMS); PB1 pinned above the node's level overrides it.
+    # Hz: PB1 - PB3 pinned. Each: the current off again, and (Hz) a signal on V-COM first.
+    'ohm-acur': ('RES', 30, [(0, 'open;aiohm:31e6', {'NONE'}), (10, 'isrc:0.02', {'AJACK'}), (20, 'isrc:none', {'NONE'})], [],
+                 {'never': [('LIVE', 1, 3)], 'queries': ['RES:RANG?']}),
+    'acmv-acur': ('VOLT:AC 0.6', 30, [(0, 'open;ailift:0.146;ainz:1500', {'NONE'}), (10, 'isrc:0.02', {'AJACK'}),
+                                      (20, 'isrc:none', {'NONE'})]),
+    'freq-acur': ('FREQ', 30, [(0, 'open;hzpb1:2.5;vsrc:0,ac=1,f=1000', {'NONE'}), (10, 'vsrc:none;isrc:0.02', {'AJACK'}),
+                               (20, 'isrc:none', {'NONE'})]),
     # (continuity / diode: A-JACK only while V-COM reads OL, as with the leads in A / COM; with a
     # part still on V-COM -closed- a current in A is no A-JACK there: cont-closed-a)
     'cont-a':   ('CONT', 24, [(0, 'open;r:10', {'NONE'}), (10, 'open;isrc:0.002', {'AJACK'}), (17, 'isrc:none', {'NONE'})]),
@@ -251,9 +328,14 @@ SC = {
     'aprot-dcv-12': ('VOLT:DC', 32, [(0, 'open', {'NONE'}), (8, 'avsrc:12', {'APROT'}), (16, 'open', {'APROT'}),
                                      (22, 'open', {'NONE'})], [], {'acts': {19.5: 'DBG:KEY 2'}, 'aprot_ms': (400, 560)}),
     'aprot-dcv-24': ('VOLT:DC', 22, [(0, 'open', {'NONE'}), (8, 'avsrc:24', {'APROT'})], [], {'aprot_ms': (100, 450)}),
+    # DC mV (its V_GATE since the 66 kHz fix: a trip needs a DC mV result inside the range since
+    # the hit run began): the same sources, the latency of the trip.
+    'aprot-dcmv-12': ('VOLT:DC 0.6', 22, [(0, 'open', {'NONE'}), (8, 'avsrc:12', {'APROT'})], [], {'aprot_ms': (400, 800)}),
+    'aprot-dcmv-24': ('VOLT:DC 0.6', 22, [(0, 'open', {'NONE'}), (8, 'avsrc:24', {'APROT'})], [], {'aprot_ms': (100, 800)}),
     # Ohm / temperature carry no probe (device 22c85ba: there it follows the V input, 5 V on V-COM
     # read 1.7 A and latched A-PROT): a source across A-COM is A-JACK only.
-    'aprot-ohm-12': ('RES', 24, [(0, 'open;r:4700', {'NONE'}), (10, 'avsrc:12', {'AJACK'})]),
+    # (4.7 Mohm: the 6 Mohm row, as `ohm`)
+    'aprot-ohm-12': ('RES', 24, [(0, 'open;r:4.7e6', {'NONE'}), (10, 'avsrc:12', {'AJACK'})]),
     'aprot-temp-12': ('TEMP', 26, [(0, 'open;tc:100;cj:25', {'NONE'}), (12, 'avsrc:12', {'AJACK'})]),
     # The user acts (another function) while the source is still there: the latch stays; the current goes later and
     # the latch ends 1 s after that (the act counts).

@@ -18,6 +18,16 @@ Checks (USBTMC over USB/IP, Bluetooth over --bt-port):
     the preamble it is the input sine (frequency, Vpp, mean), the trigger
     point (t = 0) on the level with the right slope, x increment = 1 /
     ACQ:SRAT?; reading it twice gives the same bytes;
+  * the long record: DIGitize at 1 ms/div (2.5 MS/s, the raw ring) gives
+    43 008 samples with the trigger at the centre; at 100 ms/div (25 kS/s,
+    the packed ring) 64 600 .. 65 520 samples, the sine without a seam, the
+    trigger 52 156 samples before the end (the coded ring: long_checks);
+    a roll record (200 ms/div) all it took;
+  * STOP while running (5 / 2 ms/div the raw ring, 100 ms/div the packed
+    one; Auto at several moments, Normal without a trigger) ends on one
+    more complete capture: the DIGitize length, the sine everywhere (no
+    garbage or seam), in Auto the trigger point on the level;
+    --only-stop runs only these;
   * CHAN1:OFFSet moves the trace (pos) but not the volts the preamble
     gives;
   * the main loop keeps running during a streamed read (DBG:DIAG? loop
@@ -50,6 +60,7 @@ ap.add_argument('--hz', type=float, default=1000.0, help='input sine frequency')
 ap.add_argument('--vpp', type=float, default=1.0, help='input sine Vpp')
 ap.add_argument('--mips', default='200')
 ap.add_argument('--hwtrig', action='store_true', help='keep the comparator trigger on (default: off, see below)')
+ap.add_argument('--only-stop', action='store_true', help='run only the STOP checks (stop_checks)')
 A = ap.parse_args()
 os.environ['USBIP_PORT'] = str(A.port)
 sys.path.insert(0, HERE)
@@ -173,6 +184,171 @@ def connect():
     sys.exit('wavtest: no USB/IP device on port %d' % A.port)
 
 
+def scop_files(t):
+    cat = t.q('MMEM:CAT?')
+    return {f.split(',')[0]: int(f.split(',')[2]) for f in cat.split('"')[1::2] if f.upper().startswith('SCOP')}
+
+
+def csv_check(t, p, codes):
+    """MF > Settings > Save CSV of the stopped long record (scope page,
+    driven by DBG:KEY / DBG:TAP): a new SCOPnnn.DLG whose decoded CSV
+    (firmware/tools/dlog.py) has one row per record sample, the volts of
+    WAV:DATA? (preamble-scaled codes) and t = 0 at the trigger sample."""
+    sys.path.insert(0, os.path.join(ROOT, 'firmware', 'tools'))
+    import dlog  # noqa: E402
+    before = scop_files(t)
+    v0 = t.vtime()
+    def until(dt):
+        v = t.vtime()
+        while t.vtime() < v + dt:
+            time.sleep(0.05)
+    t.w('DBG:KEY 0')
+    until(0.5)
+    t.w('DBG:TAP 341,107')  # the Oscilloscope tile
+    until(1.5)
+    view = t.q('DBG:VIEW?')
+    t.w('DBG:KEY 3')  # MF popup
+    until(0.5)
+    t.w('DBG:TAP 330,40')  # Settings tab
+    until(0.5)
+    t.w('DBG:TAP 154,93')  # Save CSV
+    new = {}
+    while t.vtime() < v0 + 60 and not new:
+        until(1.0)
+        t.w('*CLS')  # MMEM:CAT? during the write queues "Mass storage busy"
+        new = {k: z for k, z in scop_files(t).items() if k not in before}
+    check(view.startswith('Oscilloscope') and len(new) == 1, 'Save CSV of the long record: %s (%s)' % (new, view))
+    if not new:
+        return
+    name, size = next(iter(new.items()))
+    d = bytearray()
+    while len(d) < size:
+        b = block(t.qraw('MMEM:DATA? "%s",%d,6000' % (name, len(d)), timeout=30))
+        if not b:
+            break
+        d += b
+    errors = []
+    text, info = dlog.decode(bytes(d), errors)
+    rows = [r.split(',') for r in text.splitlines() if r[:1] in '+-']
+    n = len(codes)
+    vs = [float(r[1]) for r in rows]
+    ok = len(rows) == n and not errors
+    dv = max(abs(vs[i] - (p['yorig'] + p['yinc'] * codes[i])) for i in range(n)) if ok else float('nan')
+    i0 = min(range(len(rows)), key=lambda i: abs(float(rows[i][0]))) if rows else -1
+    check(ok and dv < 0.003, '%s: %d bytes, %d rows (record %d), volts = WAV:DATA? within %.4f V %s' % (name, size, len(rows), n, dv, errors))
+    check(i0 == round(-p['xorig'] / p['xinc']), '%s: t = 0 at row %d (trigger sample %d)' % (name, i0, round(-p['xorig'] / p['xinc'])))
+
+
+def long_checks(t):
+    """Slow timebases: the coded ring (cring.rs). DIGitize at 100 ms/div
+    (25 kS/s): 10 s wanted, the trigger at the centre; the post part is
+    what any signal leaves room for (65 520 less the margins and the
+    screen's pre part: 52 156), the pre part what the ring keeps (up to
+    125 000; the model's 25-sample sine: ~96 000), so the record is
+    100 000 .. 177 000 samples, the input sine in it, no seam; a roll record (200
+    ms/div, STOP after 6.5 s) all 81 000 samples; back to 1 ms/div after."""
+    t.w('WAV:FORM WORD')
+    t.w('WAV:POIN MAX')
+    t.w('TIM:SCAL 0.1')
+    t.w('DIG')
+    check(t.wait_stop(s=30, wall=900), 'DIGitize at 100 ms/div ends in STOP')
+    p = pre(t)
+    sr = float(t.q('ACQ:SRAT?'))
+    w = block(t.qraw('WAV:DATA?', maxlen=1 << 20, timeout=120))
+    v, codes = volts(p, w)
+    n = len(codes)
+    check(sr == 25000 and 100000 <= n <= 180000 and p['n'] == n, '100 ms/div record: %d samples at %g S/s' % (n, sr))
+    f, vpp, _ = sine_fit(v, p['xinc'])
+    check(abs(f - A.hz) < A.hz * 0.02 and abs(vpp - A.vpp) < A.vpp * 0.2, '100 ms/div record: %.2f Hz, %.3f Vpp' % (f, vpp))
+    i0 = round(-p['xorig'] / p['xinc'])
+    ok = 2 <= i0 < n - 2
+    # On the level within one sample's step (25 samples per period).
+    step = 2 * math.pi * A.hz * p['xinc'] * A.vpp / 2
+    check(ok and 52156 <= n - i0 <= 52156 + 2000 and abs(v[i0]) < step + 0.05 * A.vpp and v[i0 + 1] > v[i0 - 1],
+          '100 ms/div record: trigger sample %d of %d, %.3f V, rising' % (i0, n, v[i0] if ok else float('nan')))
+    # A smooth sine end to end: no seam from the ring / staging (25 samples
+    # per period: neighbours differ by at most ~0.13 Vpp).
+    jump = max(abs(v[i + 1] - v[i]) for i in range(n - 1))
+    check(jump < 0.25 * A.vpp, '100 ms/div record: no seam (largest step %.3f V)' % jump)
+    csv_check(t, p, codes)
+    # Stopped zoom into the long record: 1 ms/div shows 250 of its samples
+    # (the screen columns of WAV:DATA? follow the re-rendered frame).
+    t.w('TIM:SCAL 1e-3')
+    t.w('WAV:POIN SCR')
+    v1 = t.vtime()
+    while t.vtime() < v1 + 1.0:
+        time.sleep(0.05)
+    ps = pre(t)
+    vz, _ = volts(ps, block(t.qraw('WAV:DATA?')))
+    fz, vppz, _ = sine_fit(vz, ps['xinc'])
+    check(abs(fz - A.hz) < A.hz * 0.05 and abs(vppz - A.vpp) < A.vpp * 0.25, 'stopped zoom to 1 ms/div: %.1f Hz, %.3f Vpp on screen' % (fz, vppz))
+    t.w('WAV:POIN MAX')
+    t.w('TIM:SCAL 0.2')
+    t.w('RUN')
+    v0 = t.vtime()
+    while t.vtime() - v0 < 6.5:
+        time.sleep(1)
+    t.w('STOP')
+    time.sleep(0.5)
+    p = pre(t)
+    w = block(t.qraw('WAV:DATA?', maxlen=1 << 20, timeout=120))
+    v, codes = volts(p, w)
+    f, vpp, _ = sine_fit(v, p['xinc'])
+    jump = max(abs(v[i + 1] - v[i]) for i in range(len(v) - 1))
+    check(78000 <= len(codes) <= 90000 and abs(f - A.hz) < A.hz * 0.02 and jump < 0.4 * A.vpp,
+          'roll record (200 ms/div): %d samples, %.2f Hz, largest step %.3f V' % (len(codes), f, jump))
+    t.w('TIM:SCAL 1e-3')
+    t.w('WAV:FORM BYTE')
+
+
+def stop_checks(t):
+    """STOP of a running acquisition: at 5 and 2 ms/div (the raw ring) and
+    100 ms/div (the packed ring), Auto with STOP at several moments (after
+    frames were shown, so BUF holds a packed record and the next capture is
+    in flight), and Normal with the level above the sine (no trigger). STOP
+    ends on a complete capture (TRIG:STAT? STOP once it is in, at most the
+    screen's time + 1 s and a margin later, device time): the DIGitize
+    length capped at the screen + 0.5 s (43 008 less the margins at 5 / 2
+    ms/div, 37 500 at 100 ms/div; untriggered at the deadline, what is
+    in), the input sine everywhere (every code inside its range, no
+    step larger than the sine's: no seam), in Auto the trigger point inside
+    the record on the level. Before: the samples of the capture in flight
+    up to the STOP (device 2026-10-27: 1 753 at 5 ms/div) or, with the
+    stop's own TCIF4 read as a wrap, the full ring with a seam."""
+    t.w('WAV:FORM WORD')
+    t.w('WAV:POIN MAX')
+    for tb, nmin, waits in ((5e-3, 42144, (0.6, 0.9, 1.3)), (2e-3, 42144, (0.5, 0.8)), (0.1, 37000, (2.5, 4.0))):
+        for mode, lev, wait in [('AUTO', 0, w) for w in waits] + [('NORM', 2 * A.vpp, 1.0)]:
+            for c in ('TIM:SCAL %g' % tb, 'TRIG:SWE %s' % mode, 'TRIG:LEV %g' % lev, 'RUN'):
+                t.w(c)
+            v0 = t.vtime()
+            while t.vtime() - v0 < wait:
+                time.sleep(0.05)
+            vs = t.vtime()
+            t.w('STOP')
+            stopped = t.wait_stop(s=15, wall=600)
+            dt = t.vtime() - vs
+            stopped = stopped and dt < tb * 10 + 1.6
+            p = pre(t)
+            v, codes = volts(p, block(t.qraw('WAV:DATA?', maxlen=1 << 20, timeout=120)))
+            n = len(v)
+            out = sum(1 for x in v if abs(x) > 0.6 * A.vpp)
+            step = 2 * math.pi * A.hz * p['xinc'] * A.vpp / 2
+            jump = max(abs(v[i + 1] - v[i]) for i in range(n - 1)) if n > 1 else 0.0
+            i0 = round(-p['xorig'] / p['xinc']) if p['xinc'] else -1
+            ok = stopped and n >= nmin and out == 0 and jump < step + 0.05 * A.vpp
+            trig = ''
+            if mode == 'AUTO':
+                # On the level within one sample's step (25 samples per
+                # period at 100 ms/div), rising.
+                ok = ok and 2 <= i0 < n - 2 and abs(v[i0]) < step + 0.05 * A.vpp and v[i0 + 1] > v[i0 - 1]
+                trig = ', trigger sample %d (%.3f V)' % (i0, v[i0] if 0 <= i0 < n else float('nan'))
+            check(ok, '%g ms/div, %s, STOP after %.1f s: %s in %.2f s, %d samples (>= %d)%s, %d outside the sine, largest step %.3f V (sine %.3f)'
+                  % (tb * 1e3, mode, wait, 'STOP' if stopped else 'no STOP', dt, n, nmin, trig, out, jump, step))
+    for c in ('TRIG:SWE AUTO', 'TRIG:LEV 0', 'TIM:SCAL 1e-3', 'WAV:FORM BYTE'):
+        t.w(c)
+
+
 def bt_checks(t):
     try:
         s = socket.create_connection(('127.0.0.1', A.bt_port), timeout=5)
@@ -268,6 +444,10 @@ def bt_checks(t):
         s.close()
 
 
+class OnlyStop(Exception):
+    pass
+
+
 try:
     t = connect()
     print('*IDN?', t.q('*IDN?'), flush=True)
@@ -279,6 +459,9 @@ try:
         t.w(c)
     e = t.err()
     check(e.startswith('0,'), 'set-up accepted (%s)' % e)
+    if A.only_stop:
+        stop_checks(t)
+        raise OnlyStop
 
     # --- the default form, unchanged (after the first frames came)
     t0 = time.time()
@@ -368,6 +551,8 @@ try:
     if 2 <= i0 < len(v) - 2:
         slope = v[i0 + 2] - v[i0 - 2]
         check(abs(v[i0]) < 0.08 * A.vpp and slope > 0, 'trigger point (t = 0, sample %d of %d): %.3f V, rising' % (i0, len(v), v[i0]))
+        per = sr / A.hz
+        check(-0.03 * n < i0 - n / 2 < per + 0.03 * n, 'DIGitize: the trigger at the record centre (trigger position 50 %%; the first edge after it: %d of %d)' % (i0, n))
     else:
         check(False, 'trigger point inside the record (sample %d of %d)' % (i0, len(v)))
     wcodes = codes
@@ -412,6 +597,12 @@ try:
           'SINGle record: %.2f Hz, %.3f Vpp, trigger sample %d' % (f2, vpp2, i0))
     t.w('TRIG:SWE AUTO')
 
+    # --- STOP of a running raw ring (the stop's own TCIF4)
+    stop_checks(t)
+
+    # --- the long record (scope.rs: the packed ring at fs <= 25 kS/s)
+    long_checks(t)
+
     # --- CHAN1:OFFSet: the position (the offset PWM shifts the ADC codes on
     # the device; the emulator's scope feeder does not model that shift, so
     # only the preamble's y origin moving by -offset is checked here)
@@ -435,6 +626,8 @@ try:
 
     t.w('STOP')
     bt_checks(t)
+except OnlyStop:
+    pass
 finally:
     try:
         os.killpg(emu.pid, 15)

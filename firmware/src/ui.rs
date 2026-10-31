@@ -112,6 +112,9 @@ pub enum View {
     Inrush,
     /// Touch test (Settings 3/3 -> Touch test; app_touchtest.rs).
     TouchTest,
+    /// The protocol decoder's frame log (scope MF > Decode, Mode Log;
+    /// app_log.rs).
+    Decode,
 }
 
 impl View {
@@ -2613,11 +2616,14 @@ pub fn gen_status(st: &Status) {
 
 /// `gen_preview` in strips: the wave the table holds (its `sel` + 1, the
 /// square's duty above bit 8; 0 = none) and each column's trace rows (from
-/// the preview's top). All zero
-/// at boot: `.sram_bss` is zeroed by the startup code, whatever the
-/// initialiser says (#153: a 255 "none" read back 0 = Sine with an empty
-/// table, so the boot-time Sine drew no trace).
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+/// the preview's top). All zero at boot, whatever the initialiser says
+/// (#153: a 255 "none" read back 0 = Sine with an empty table, so the
+/// boot-time Sine drew no trace): on test/scope-chain-0.4 it is in the
+/// backup SRAM (.bkp_bss, link-native.x; CPU only, zeroed by
+/// native::extra_ram_init; docs/native-boot.md "Extra RAM areas"), which
+/// leaves TCM to the stack and SRAM to the scope record. A dbg-prof build
+/// keeps it in TCM .bss (prof::P takes that room).
+#[cfg_attr(all(target_os = "none", not(feature = "dbg-prof")), link_section = ".bkp_bss")]
 pub(crate) static mut GEN_SP: (u32, [(u8, u8); 239]) = (0, [(0, 0); 239]);
 
 // Region B (not inlined into the region C callers): drawn per strip.
@@ -3268,7 +3274,9 @@ pub fn view_name(v: View) -> &'static str {
         View::Help => "Help",
         View::Inrush => "Inrush",
         View::TouchTest => "Touch test",
+        View::Decode => "Decode log",
     }
+
 }
 
 /// On-device help (UF-29: owners have no manual; gestures, resets and limits

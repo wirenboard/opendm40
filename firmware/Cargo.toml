@@ -47,6 +47,24 @@ fatren-dry-run = []
 #   recovery-usb: our own minimal USB mass-storage disk (no LCD).
 recovery-file = []
 recovery-usb = []
+# The AD2 device experiments DBG:AD2:TORN? / NOISE? / DCV? / N7? (src/ad2exp.rs;
+# tools/dm40scpi.py `ad2 torn` / `ad2 noise`, tools/experiments/ad2dcv.py).
+# Not default on test/scope-chain-0.4: region B had no room for them next to
+# the protocol decoder (docs/native-boot.md "Region B audit #7"). Build with
+# --features ad2-exp for an experiment session.
+ad2-exp = []
+# DBG:SRC, the ohm-source map row (src/dbgsrc.rs, tools/srcmap.py). Not
+# default on test/scope-chain-0.4 for the same reason.
+dbg-src = []
+# The decoder's frame log (Mode Log, DECode:MODE LOG, View::Decode;
+# src/app_log.rs). Not default on test/scope-chain-0.4: region B has no room
+# for it next to 0.4.0's GEN / CH2 channels; without it Mode Log is refused
+# and the band decode is unchanged.
+dec-log = []
+# Modbus RTU in the protocol decoder (src/decode.rs `MODBUS`). Not default on
+# test/scope-chain-0.4 for the same reason; without it the decoder is UART
+# only (DECode:PROTocol MODBus is refused).
+dec-modbus = []
 # DBG:HYSPI:SELF? / WR?, the HY3131 bus self-test and write experiment
 # (src/hyspi.rs; emu/hy3131/ad2streamtest.py). Off by default: ~2.3 KB of
 # region C (docs/native-boot.md "Region B audit #9"); without it the two
@@ -73,8 +91,7 @@ dbg-diag = []
 dbg-ohm6 = []
 # DBG:SENTinel? / DBG:SENTinel:REG? (Sentinel::diag_text, Dmm::reg_text).
 dbg-sent = []
-# DBG:SRC, the ohm-source map row (src/dbgsrc.rs, tools/srcmap.py).
-dbg-src = []
+# DBG:SRC: dbg-src above.
 # DBG:ACDC:METH / STAT / ZERO / R0, the AC+DC prototype methods B and C
 # (src/acdcm.rs; docs/acdc-approaches.md; ~6.6 KB of region B, 2.7 KB of
 # region C, 480 B of RAM). Off by default: AC+DC is method A (the stock

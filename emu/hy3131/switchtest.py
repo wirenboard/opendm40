@@ -146,7 +146,9 @@ SC = {
                   ['dcv', 'res', 'dcv', 'cont', 'acv', 'res', 'acmv', 'cont', 'acmv60', 'dcv', 'acv', 'temp', 'res',
                    'diod', 'cont', 'acv', 'dcv'], {}),
     # ... and a real current in A (V-COM open) is still caught after every switch in
-    'real-ajack-pickup': ('open;isrc:0.001;mvclamp:1.212;mvpb1:10', 'ajack', ['sysbus.hy3131 Pb1VjackMv 10'],
+    # (`aiohm`: RES reads the open input pulled into range while a current flows, as the device
+    # at 20 mA, 2026-10-26; RES's A-JACK needs that with the jack check's OP1O under its line)
+    'real-ajack-pickup': ('open;isrc:0.001;aiohm:31e6;mvclamp:1.212;mvpb1:10', 'ajack', ['sysbus.hy3131 Pb1VjackMv 10'],
                           ['dcv', 'res', 'dcv', 'cont', 'dcv', 'acmv', 'dcv', 'acmv60', 'dcv', 'res'],
                           {'res': ('AJACK', 2.0), 'cont': ('AJACK', 1.2), 'acmv': ('AJACK', 2.0), 'acmv60': ('AJACK', 2.0)}),
     # model knobs: the AD1 decimation memory (a mux switch without a restart mixes the old
@@ -171,16 +173,16 @@ SC = {
                      ['dca', 'SCOPE', 'dcma', 'SCOPE', 'dca', 'res', 'dca', 'res', 'dcma'], {}),
     'real-vjack-ohmexit': ('open;vsrc:24;ohmexit:3.5;ohmexitlo:1.2', 'v24', [], ['dcv', 'dca', 'res', 'dca', 'res', 'dcma'],
                            {'dca': ('VJACK', 6.5), 'dcma': ('VJACK', 6.5)}),
-    'real-ajack-swtr': ('open;isrc:0.001;swtr:300;swtau:50', 'ajack', [],
+    'real-ajack-swtr': ('open;isrc:0.001;aiohm:31e6;swtr:300;swtau:50', 'ajack', [],
                         ['acv', 'dcv', 'res', 'dcv', 'temp', 'dcv', 'vacdc', 'dcv', 'acv', 'cont', 'acv'],
                         {'dcv': ('AJACK', 1.0), 'acv': ('AJACK', 1.6), 'cont': ('AJACK', 1.0), 'vacdc': ('AJACK', 2.5)}),
     # real conditions: how fast after a switch in (settle + the detector)
-    'real-ajack': ('open;isrc:0.001', 'ajack', [], ['acv', 'dcv', 'res', 'dcv', 'temp', 'dcv', 'aca', 'dcv', 'acv', 'cont', 'acv'],
+    'real-ajack': ('open;isrc:0.001;aiohm:31e6', 'ajack', [], ['acv', 'dcv', 'res', 'dcv', 'temp', 'dcv', 'aca', 'dcv', 'acv', 'cont', 'acv'],
                    {'dcv': ('AJACK', 1.0), 'acv': ('AJACK', 1.6), 'cont': ('AJACK', 1.0)}),
     # 24 V across A-COM connected at virtual 12 s (fw ~9.2 s), during RES (A-JACK only there, no
     # probe), then the switch into DC V: A-PROT after the switch (a source on from boot latches in
     # DC V at once). RES holds until 1 s after the connection's marker (`later` in run()).
-    'real-aprot': ('open', 'aprot', [], ['res', 'dcv'], {'dcv': ('APROT', 1.5)}, [(12, 'avsrc:24')]),
+    'real-aprot': ('open;aiohm:31e6', 'aprot', [], ['res', 'dcv'], {'dcv': ('APROT', 1.5)}, [(12, 'avsrc:24')]),
     'real-achint': ('open;vsrc:0,ac=2,f=50', 'ac2', [], ['acv', 'dcv', 'res', 'dcv', 'temp', 'dcv'], {'dcv': ('AC', 4.0)}),
     'real-dchint': ('open;vsrc:5', 'dc5', [], ['dcv', 'acv', 'res', 'acv', 'temp', 'acv'], {'acv': ('DC', 6.0)}),
     'real-vjack': ('open;vsrc:24', 'v24', [], ['dcv', 'dca', 'res', 'dca', 'aca', 'dca'], {'dca': ('VJACK', 4.0)}),

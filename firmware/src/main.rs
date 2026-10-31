@@ -44,7 +44,10 @@ mod mmio;
 mod persist;
 mod power;
 mod prof;
+mod pack10;
+mod cring;
 mod scope;
+mod decode;
 mod hwtrig;
 mod scope_meas;
 mod scope_ui;
@@ -1077,14 +1080,21 @@ fn run(mut clk: Clock, app: &'static mut app::App) -> ! {
                         log_draw = level;
                         false
                     }
+                    #[cfg(feature = "ad2-exp")]
                     scpi::Dbg::Ad2(6, state, n, item) => {
                         dbg_n7(app, &mut clk, logger, &mut scpi, port, item, state, n);
                         false
                     }
+                    #[cfg(feature = "ad2-exp")]
                     scpi::Dbg::Ad2(5, r26, nr, flags) => {
                         dbg_dcv(app, &mut clk, logger, &mut scpi, port, r26, nr, flags);
                         false
                     }
+                    // Without the feature the parser makes no TORN / NOISE /
+                    // DCV / N7 request.
+                    #[cfg(not(feature = "ad2-exp"))]
+                    scpi::Dbg::Ad2(..) => false,
+                    #[cfg(feature = "ad2-exp")]
                     scpi::Dbg::Ad2(kind, r26, n, b) => {
                         // Synchronous AD2 experiment in the current stock AC
                         // row; the row is rewritten afterwards.
@@ -1112,6 +1122,11 @@ fn run(mut clk: Clock, app: &'static mut app::App) -> ! {
                     false
                 }
                 scpi::Out::Inr(c) => app.inrush_query(&mut clk, c, &mut scpi),
+                scpi::Out::Dcd(scpi::Dcd::Frames(n)) => {
+                    port.respond_with(&mut |b| Some(app.dec_frames(n, b)));
+                    false
+                }
+                scpi::Out::Dcd(c) => app.dec_scpi(&mut clk, c, &mut scpi),
                 scpi::Out::Mmem(scpi::Mmem::Cat) => {
                     let mut err = None;
                     port.respond_with(&mut |b| csvlog::catalog_scpi(b).map_err(|e| err = Some(e)).ok());
@@ -1658,7 +1673,11 @@ fn run(mut clk: Clock, app: &'static mut app::App) -> ! {
                 && !upload::busy()
                 && !logger.disk_writes_blocked()
                 && !hy3131::streaming()
+                // The decoder's frame log streams (its 13 ms ring at
+                // 1.25 MS/s outlasts no erase).
+                && !scope::LOG_LIVE.load(core::sync::atomic::Ordering::Relaxed)
                 && now.saturating_sub(host_io_t) >= 500,
+
         );
         // The generated USB volume (vdisk.rs): rebuilt when the SPI files
         // changed (a recording ended, a screenshot / scope record, a delete),
@@ -1886,11 +1905,13 @@ fn block_reply(o: &scpi::Out) -> bool {
         Out::Mmem(Mmem::Cat | Mmem::Data(..))
             | Out::Log(Log::Data)
             | Out::Inr(scpi::Inr::Data(..))
+            | Out::Dcd(scpi::Dcd::Frames(..))
             | Out::Dbg(Dbg::Lcd(..) | Dbg::Touch(false) | Dbg::Prof(false) | Dbg::HySpi(..) | Dbg::HySpiWr(..))
             | Out::Dbg(Dbg::Ad2(0 | 1, ..))
     )
 }
 
+#[cfg(feature = "ad2-exp")]
 /// DBG:AD2:DCV? range,r26,n[,flags] (device test 6.5, src/ad2exp.rs
 /// `dcv_test`): in plain DC V, not while logging; sets the manual DC V
 /// range, runs the test, appends the AD1 means in uV (the DC V calibration
@@ -1938,6 +1959,7 @@ fn dbg_dcv(app: &mut app::App, clk: &mut Clock, logger: &logger::Logger, scpi: &
     app.last_raw = None;
 }
 
+#[cfg(feature = "ad2-exp")]
 /// DBG:AD2:N7? item,state,n (datasheet note 7 in the stock DC rows,
 /// src/ad2exp.rs `n7_test`): in DC V / DC mV, not while logging; sets the
 /// MF range item (0 = 600 mV DC, 1..4 = 6 .. 1000 V; it stays manual), runs
@@ -2167,8 +2189,10 @@ fn fast_req(app: &mut app::App, logger: &mut logger::Logger, r: app::FastReq, no
 #[inline(never)] // .cold (link-native.x): once per session
 fn log_on_check(app: &mut app::App, logger: &mut logger::Logger, disk: bool, dur_s: u32, trusted: bool) -> Option<&'static str> {
     let hz = fast_next_hz(logger, logger.ad2());
-    if (logger.wave() && logger.active()) || fastlog::active() {
-        // The DMM wave view owns the AD2 stream / a disk session runs.
+    if (logger.wave() && logger.active()) || fastlog::active() || app.scope.log_on() {
+        // The DMM wave view owns the AD2 stream / a disk session runs / the
+        // decoder's frame log is open (its view code is in region C, which
+        // must not run under the stream ISR: app_log.rs log_open).
         return Some("Settings conflict");
     }
     if disk && !trusted {

@@ -166,9 +166,123 @@ Third tenant: the strip renderer
   user inside a page draw; none is known): the page is then drawn again
   directly.
 
-Two small statics serve the strip passes: `ui::GEN_SP` (SRAM, 484 B: the
+Two small statics serve the strip passes: `ui::GEN_SP` (TCM, 484 B: the
 generator preview's trace rows, worked out once per wave and square duty
 instead of per strip) and `scope_ui::COLC` (400 B, flash).
+
+## The scope record: raw ring and coded ring
+
+`scope::BUF` ([`src/scope.rs`](../src/scope.rs), 81 920 B in SRAM on
+test/scope-chain-0.4 with 0.4.0's GEN / CH2 after the
+[SRAM audit](native-boot.md#sram-audit-2026-10-30-featsram-overlays):
+86 016 B before GEN / CH2) is the whole SRAM the budget leaves (8 KiB link
+floor + ~0.1 KB). The
+stock record is 65 520 samples; as u16 that is 131 040 B, more than the
+SRAM has free. 10-bit codes packed 4 in 5 bytes
+([`src/pack10.rs`](../src/pack10.rs): a little-endian bit stream, sample
+i at bits 10 i .. 10 i + 9, one unaligned 32-bit load per sample) make
+65 520 samples 81 900 B; BUF holds 65 520 packed (`PCAP`).
+
+The DMA writes u16 (GPIOB IDR, or the TIM8 latch, at up to 50 MS/s), and
+opendm40 has no interrupt besides the AD2 stream's (the main loop polls
+everything, passes up to ~25 ms), so only the main loop can pack. That
+sets two modes:
+
+- **fs > 25 kS/s** (faster than 100 ms/div): the DMA writes a raw ring of
+  `CAP` = 43 008 u16 (linear or circular as before). When the
+  acquisition stops, the ring is packed in place (`pack_in_place`: group
+  g's 5 bytes are written after its 8 raw bytes are read, so it never
+  overtakes unread samples; ~0.7 ms for 43 008 samples, inferred from the
+  instruction count). Packing during
+  the capture would need the CPU at 50 MS/s (4 cycles per sample at
+  200 MHz), and with the comparator trigger the main loop learns of the
+  edge only at its next poll.
+- **fs <= 25 kS/s** and the DMM-input wave view: the coded ring
+  ([`src/cring.rs`](../src/cring.rs)) in BUF's first 77 820 B. MCX: the
+  DMA fills a 2048-sample raw staging ring at BUF's top (82 ms at
+  25 kS/s), every poll moves the new samples into the ring (`pk_drain`).
+  A gap between two polls longer than the staging ring (time x rate)
+  restarts the acquisition: a record with a hole is never kept. The wave
+  view pushes the AD2 samples as it drains them (`wave_drain`).
+
+  The ring is a sequence of 4096-sample blocks. The newest is written
+  packed (4 in 5 bytes); a full one is coded in place with the DLG scope
+  coder (dlog.rs, [compact-log-format.md](compact-log-format.md#scope-record-kind-2):
+  the fixed predictor with the least sum of |residual|, adaptive Rice)
+  when that is smaller and the coded bytes never run more than 64 codes
+  (`LA`, read ahead) past the packed codes they replace (a dry run checks
+  both first), else it stays packed. The next block starts after it; the
+  oldest goes when room is needed (a coded one whole, a packed one 4
+  samples at a time). So a record is at least about 62 250 samples (white
+  noise: all packed, the old packed ring) and at most 64 blocks (262 144
+  samples; `dlog::SBLK_MAX`, the Save CSV file's block table). Blocks are
+  coded only for the long captures (Single, DIGitize, roll; in the Wave
+  view also only at 9600 S/s and slower): a running frame's record fits
+  the packed ring, and while no block was coded the ring is the plain
+  packed ring (`rb` * 8 a multiple of 10), read through plain views at the
+  old cost.
+
+  Reads go through `pack10::Codes` views with `cap` 0 (`pack10::CODED` =
+  `cring::at`): packed blocks directly, coded ones through one decoder
+  cursor (forward reads one code each; the last 16 codes it decoded are
+  kept, so the sin(x)/x taps step back for free; a read further behind
+  decodes its block again from the start).
+
+Every stored record (STOP, a shown frame, Single) is packed or coded; its users
+(the render, zoom / pan, measurements, FFT, autoset, Save CSV,
+`WAV:DATA?`, the software triggers, the sin(x)/x interpolation) read it
+through `pack10::Codes`, a window of the ring (index `off + i`, wrapping
+at the ring size), so a full circular ring is never rotated. `Codes`
+also implements `pack10::Src`, the read trait those functions take (the
+host tests pass u16 slices).
+
+Single / DIGitize wait for a whole record (at most 10 s, `rec_split`),
+the trigger point at the trigger position of the record. A STOP while
+running (`apply`) goes on until such a capture of the screen + 0.5 s is
+in, at most 0.5 s more (the deadline: then what is in, untriggered). A STOP cannot keep
+the frame shown before: the capture after it has already started
+overwriting it in BUF, the only record buffer. Normal / Auto
+frames wait for a screen around the trigger, as before, so their records
+hold whatever the ring had collected before the trigger. Linear records
+(the pulse / runt triggers, the software edge search above 1.25 MS/s)
+are the whole raw ring but at most max(26 624 samples, 0.1 s) in Normal /
+Auto, so the slow timebases do not wait longer per frame than before.
+
+Cost of the coded ring (emulator at --mips 110, the device's speed per
+instruction; [`emu/ringperf.py`](../../emu/ringperf.py), a 50 Hz sine on
+the model's input, which has no ADC noise; DBG:PROF?):
+
+| | before (packed ring) | coded ring |
+|---|---|---|
+| running, 100 ms/div: acquisition / frame / measurements | 2.1 % CPU, max 1.0 ms / 6.9 ms / 19.6 ms | 3.2 % CPU, max 1.0 ms / 6.9 ms / 23.1 ms |
+| roll, 200 ms/div (coding on): acquisition | 6.7 % CPU, max 6.1 ms | 4.6 % CPU, max 4.8 ms (the coding of a full block) |
+| DIGitize at 100 ms/div (177 380 samples) redrawn at 10 ms/div: frame + measurements | - | 5.9 + 16.3 ms |
+| the same at 100 ms/div (25 000 samples on the screen) | - | 36 + 133 ms |
+| the same zoomed out to 1 s/div (the whole record) | - | 228 ms |
+
+The coding of a full block costs ~4.5 ms in one pass, every 164 ms at
+25 kS/s; the plan (the order's bits, the in-place rule) runs as the codes
+come. A coded record is read ~1.3 us a code (the decoder), a packed one
+as before.
+
+Cost (emulator, emu/dragperf.py, 200 us/div): the acquisition section
+max 939 -> 3 545 us per pass (the in-place pack and the trigger search
+through `Codes`), a measurement of a 25 000-sample screen 3.1 -> 6.9 ms.
+
+The bound of a record is also the scope DLG format's: 64 blocks of 4096
+samples (`dlog::SBLK_MAX`), 262 144. Single / DIGitize on the coded ring
+(edge trigger) want 10 s, the trigger at the trigger position; the part
+after the trigger point is at most PCAP less the margins and the
+screen's pre part (39 036 at the centre), so it fits the ring whatever
+the signal, the part before it is what the ring keeps.
+
+Not done: the fast timebases at 65 520 samples. That needs 131 040 B of
+raw ring in one piece: BUF plus ~45 KB of buffers lent for the capture
+(`logger::RING`, `calbackup::SCRATCH`, the csvlog buffers, `gen::WAVE`),
+i.e. no DMM logging, no screenshot / Save CSV / FFT and no generator
+while a fast capture runs. An 8-bit capture (byte DMA) is not possible
+on this board: the 3PA1030's 10 bits are PB0..PB9, and a byte read of
+GPIOB gives PB0..PB7 or PB8..PB15, never the top 8 bits.
 
 ## Every static of 1 KiB or more
 
@@ -178,7 +292,7 @@ re-run to refresh). TCM = 0x1000xxxx (shared with the stack), SRAM = 0x200xxxxx.
 
 | static | size (B) | live when | live at the same time | overlay / shrink? |
 |---|---|---|---|---|
-| scope::BUF (SRAM) | 53 248 | always: the scope acquires in the background in every view (measurements, SCPI); the stored record while stopped | everything | Lent to inrush (`Scope::lend_buf`) while the inrush page is open. Keep. |
+| scope::BUF (SRAM) | 69 632 | always: the scope acquires in the background in every view (measurements, SCPI); the stored record while stopped | everything | Lent to inrush (`Scope::lend_buf`) while the inrush page is open. Keep. |
 | logger::RING (SRAM) | 16 540 | LOG:STAT ON sessions (AD1 / AD2 stream), the Wave view, inrush, fast-log sessions | csvlog is refused by the Wave view, inrush and `fastlog::begin`, but not by an SCPI LOG:STAT ON session | Idle in plain DMM / scope use. An overlay with the csvlog buffers would need csvlog and LOG:STAT ON to refuse each other, plus an owner token. Not done. |
 | diskbuf::ARENA (SRAM) | 12 288 | any disk job (table above) + the FFT | see above | Already shared with the FFT. |
 | scope_ui::GRAPH (SRAM) | 9 956 | the scope pages (Scope, combined view, Wave view): trace / persistence / math rows and their on-screen diff copies | the scope record, the FFT | The combined view rules out an overlay with anything scope-side. The math rows (`ma`, `d_ma`) could go when math is off. Not done. |
@@ -196,6 +310,7 @@ re-run to refresh). TCM = 0x1000xxxx (shared with the stack), SRAM = 0x200xxxxx.
 | fastlog::JOB (SRAM) | 1 864 | a fast-log disk session | logger::RING | Keep. |
 | scope::ROLL_COLS (SRAM) | 1 600 | roll mode | | Keep. |
 | vwrite::W0 (SRAM) | 1 376 | the writable USB volume session | | Keep. |
+| scope_ui::dec::ANN (SRAM) | 1 236 | the decoder band's kept bytes / frames (positions in the record) | the scope record | Keep (TCM until 2026-10-30: stack headroom). |
 | dmm::REC_COPY (TCM) | 1 024 | always: the RAM copy of the settings / calibration record (the record is in the slow flash bank) | | Keep. |
 | bt::RX (SRAM) | 1 024 | the DMA ring, while BT is powered | | Keep. |
 

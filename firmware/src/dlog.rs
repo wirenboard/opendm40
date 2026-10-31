@@ -54,7 +54,7 @@ pub const ROW_MAX: usize = 96;
 /// Bytes one `Enc::row` may emit (worst case ~22).
 pub const ROW_BYTES: usize = 32;
 /// Rice: unary prefix length that switches to a raw 32-bit value.
-const QMAX: u32 = 24;
+pub(crate) const QMAX: u32 = 24;
 
 // ------------------------------------------------------------- CRC-32 (zlib)
 
@@ -324,35 +324,37 @@ fn from_scale(n: i32, k: i32) -> Val {
     Val::Num { neg: n < 0, m: a, e }
 }
 
-fn zz(x: i32) -> u32 {
+pub(crate) fn zz(x: i32) -> u32 {
     ((x << 1) ^ (x >> 31)) as u32
 }
 #[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
-fn unzz(u: u32) -> i32 {
+pub(crate) fn unzz(u: u32) -> i32 {
     ((u >> 1) as i32) ^ -((u & 1) as i32)
 }
 
 /// LOCO-I style adaptive Rice parameter.
 #[derive(Clone, Copy, Debug)]
-struct Ad {
-    a: u32,
-    n: u32,
+pub(crate) struct Ad {
+    pub(crate) a: u32,
+    pub(crate) n: u32,
 }
 
 impl Ad {
-    const fn new(a: u32) -> Ad {
+    pub(crate) const fn new(a: u32) -> Ad {
         Ad { a, n: 1 }
     }
     #[cfg_attr(target_os = "none", link_section = ".text.dlog_row")]
-    fn k(&self) -> u32 {
-        let mut k = 0;
-        while k < 30 && (self.n << k) < self.a {
-            k += 1;
+    pub(crate) fn k(&self) -> u32 {
+        // The least k with n << k >= a (a < 2^29, so k < 30): from the bit
+        // lengths, n << k0 >= 2^(len(a - 1) - 1) and n << (k0 - 1) < a.
+        if self.a <= self.n {
+            return 0;
         }
-        k
+        let k0 = (self.n.leading_zeros() - (self.a - 1).leading_zeros()).min(30);
+        if k0 < 30 && (self.n << k0) < self.a { k0 + 1 } else { k0 }
     }
     #[cfg_attr(target_os = "none", link_section = ".text.dlog_row")]
-    fn upd(&mut self, x: u32) {
+    pub(crate) fn upd(&mut self, x: u32) {
         self.a = self.a.saturating_add(x.min(1 << 24));
         self.n += 1;
         if self.n >= 32 {
@@ -638,18 +640,19 @@ pub fn file_header(kind: u8, unit: &[u8], text: &[u8], out: &mut [u8]) -> usize 
 /// predictor (sample j < order uses order j; order 0 predicts 512) and the
 /// Rice state, so a block decodes on its own (random access for the CSV).
 pub const SCOPE_PAR: usize = 24;
-/// Samples per coded block, blocks per record at most (65536 samples).
+/// Samples per coded block, blocks per record at most (262 144 samples:
+/// the scope's coded ring, cring.rs).
 pub const SBLK: usize = 4096;
-pub const SBLK_MAX: usize = 16;
+pub const SBLK_MAX: usize = 64;
 /// Raw-mode block bytes (the bound of any block).
 pub const SBLK_RAW: usize = (3 + SBLK * 10).div_ceil(8);
 const S_RAW: u32 = 4;
-const AS0: u32 = 16;
+pub(crate) const AS0: u32 = 16;
 
 /// Fixed predictor of `order` from the previous codes h[0] = x[-1],
 /// h[1] = x[-2], h[2] = x[-3] (`j` = index in the block).
 #[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
-fn s_pred(order: u32, j: usize, h: &[i32; 3]) -> i32 {
+pub(crate) fn s_pred(order: u32, j: usize, h: &[i32; 3]) -> i32 {
     match order.min(j as u32) {
         0 => 512,
         1 => h[0],
@@ -660,11 +663,11 @@ fn s_pred(order: u32, j: usize, h: &[i32; 3]) -> i32 {
 
 /// The fixed order (0..3) with the least sum of |residual| over `codes`.
 #[cfg_attr(target_os = "none", link_section = ".text.scope_plan")]
-pub fn scope_order(codes: &[u16]) -> u32 {
+pub fn scope_order<S: crate::pack10::Src + ?Sized>(codes: &S) -> u32 {
     let mut sum = [0u64; 4];
     let mut h = [0i32; 3];
-    for (j, &c) in codes.iter().enumerate() {
-        let x = (c & 0x3FF) as i32;
+    for j in 0..codes.len() {
+        let x = (codes.at(j) & 0x3FF) as i32;
         for (o, s) in sum.iter_mut().enumerate() {
             *s += (x - s_pred(o as u32, j, &h)).unsigned_abs() as u64;
         }
@@ -715,7 +718,7 @@ impl SEnc {
     }
     /// The next byte of the block coding `codes`; None at its end.
     #[cfg_attr(target_os = "none", link_section = ".text.scope_plan")]
-    pub fn next(&mut self, codes: &[u16]) -> Option<u8> {
+    pub fn next<S: crate::pack10::Src + ?Sized>(&mut self, codes: &S) -> Option<u8> {
         loop {
             if self.qh != self.qt {
                 let b = self.q[(self.qh & 15) as usize];
@@ -724,7 +727,7 @@ impl SEnc {
                 return Some(b);
             }
             if self.j < codes.len() {
-                let x = (codes[self.j] & 0x3FF) as i32;
+                let x = (codes.at(self.j) & 0x3FF) as i32;
                 if self.mode == S_RAW {
                     self.put(x as u32, 10);
                 } else {
@@ -771,7 +774,7 @@ impl SEnc {
 /// region B) runs at the Save CSV tap, while the Wave view's stream may run:
 /// a dyn sink closure would be a symbol of its own in region C.
 #[inline(always)]
-pub fn scope_block<F: FnMut(u8)>(codes: &[u16], mode: u32, sink: &mut F) -> usize {
+pub fn scope_block<S: crate::pack10::Src + ?Sized, F: FnMut(u8)>(codes: &S, mode: u32, sink: &mut F) -> usize {
     let mut e = SEnc::new(mode, 0);
     while let Some(b) = e.next(codes) {
         sink(b);
@@ -782,7 +785,7 @@ pub fn scope_block<F: FnMut(u8)>(codes: &[u16], mode: u32, sink: &mut F) -> usiz
 /// Choose and size a block's coding: (mode, bytes, CRC-32 of the bytes).
 /// The fixed order with the least |residual|, or raw when that is smaller.
 #[cfg_attr(target_os = "none", link_section = ".text.scope_plan")]
-pub fn scope_plan(codes: &[u16]) -> (u32, u32, u32) {
+pub fn scope_plan<S: crate::pack10::Src + ?Sized>(codes: &S) -> (u32, u32, u32) {
     let o = scope_order(codes);
     let mut crc = !0u32;
     let n = scope_block(codes, o, &mut |b| crc = crc32_upd(crc, &[b]));
@@ -1233,10 +1236,12 @@ pub struct Gen<S: Src> {
     ul: usize,
     unit: [u8; UNIT_MAX],
     win: Win,
-    /// Kind 2: a, b, dt, t0; block start offsets (`nb` + 1 used); the
-    /// block decoder (`sd_b` = its block, `sd_ok`), the last code it gave.
+    /// Kind 2: a, b, dt, t0; the first block's offset and the blocks'
+    /// coded bytes (<= SBLK_RAW: u16); the block decoder (`sd_b` = its
+    /// block, `sd_ok`), the last code it gave.
     sc: (f32, f32, f32, u32),
-    offs: [u32; SBLK_MAX + 1],
+    off0: u32,
+    blen: [u16; SBLK_MAX],
     sd: SDec,
     sd_b: u32,
     sd_ok: bool,
@@ -1282,7 +1287,8 @@ impl<S: Src> Gen<S> {
             unit,
             win: Win::new(),
             sc: (0.0, 0.0, 0.0, 0),
-            offs: [0; SBLK_MAX + 1],
+            off0: 0,
+            blen: [0; SBLK_MAX],
             sd: SDec { pos: 0, bit: 0, end: 0, mode: 0, j: 0, h: [0; 3], ad: Ad::new(AS0) },
             sd_b: 0,
             sd_ok: false,
@@ -1314,19 +1320,32 @@ impl<S: Src> Gen<S> {
                 return None;
             }
             let t0 = at + SCOPE_PAR as u32;
-            let mut t = [0u8; 8 * SBLK_MAX + 4];
             let tl = 8 * nb + 4;
-            if !g.s.read(t0, &mut t[..tl]) || !crc32_upd(!0, &t[..tl - 4]) != le32(&t, tl - 4) {
+            // The table (8 bytes a block, read twice: no copy of it on the
+            // stack), then its CRC.
+            let mut e8 = [0u8; 8];
+            let mut c = !0u32;
+            for b in 0..nb {
+                if !g.s.read(t0 + 8 * b as u32, &mut e8) {
+                    return None;
+                }
+                c = crc32_upd(c, &e8);
+            }
+            if !g.s.read(t0 + 8 * nb as u32, &mut e8[..4]) || !c != le32(&e8, 0) {
                 return None;
             }
             g.sc = (f(0), f(4), f(8), le32(&p, 12));
             // The whole, CRC-correct blocks (a torn file: the ones before).
             let mut o = t0 + tl as u32;
             let mut rows = 0u32;
-            g.offs[0] = o;
+            g.off0 = o;
             for b in 0..nb {
-                let e = o + le32(&t, 8 * b);
-                if e > size {
+                if !g.s.read(t0 + 8 * b as u32, &mut e8) {
+                    break;
+                }
+                let l = le32(&e8, 0);
+                let e = o + l;
+                if e > size || l > SBLK_RAW as u32 {
                     break;
                 }
                 let mut c = !0u32;
@@ -1336,10 +1355,10 @@ impl<S: Src> Gen<S> {
                     c = crc32_upd(c, &[v]);
                     x += 1;
                 }
-                if x < e || !c != le32(&t, 8 * b + 4) {
+                if x < e || !c != le32(&e8, 4) {
                     break;
                 }
-                g.offs[b + 1] = e;
+                g.blen[b] = l as u16;
                 o = e;
                 rows = ((b + 1) * SBLK).min(n as usize) as u32;
             }
@@ -1520,7 +1539,8 @@ impl<S: Src> Gen<S> {
         let j = (k % SBLK as u32) as usize;
         if !(self.sd_ok && self.sd_b == b && self.sd.j > 0 && self.sd.j - 1 <= j) {
             self.sd_ok = false;
-            self.sd = SDec::new(&mut self.s, &mut self.win, self.offs[b as usize], self.offs[b as usize + 1])?;
+            let o = self.off0 + self.blen[..b as usize].iter().map(|&l| l as u32).sum::<u32>();
+            self.sd = SDec::new(&mut self.s, &mut self.win, o, o + self.blen[b as usize] as u32)?;
             self.sd_b = b;
             self.sd_code = self.sd.next(&mut self.s, &mut self.win)?;
             self.sd_ok = true;

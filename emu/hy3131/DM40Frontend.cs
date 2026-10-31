@@ -104,6 +104,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         /// AJACK,AD1PK_PB1 came 0.45-0.9 s later in 8 of 13 runs, held while the input was open. The
         /// charge, which rows see it and the PB1 pickup are INFERRED (phenomenological). Kept by "open".
         public double MvHoldV, MvHoldPb1Mv;
+        /// A current in A with nothing on the V jack pulls the open input like this many ohm to COM
+        /// (opt-in, "aiohm:ohm"; device 2026-10-26, the owner's PSU 20 mA in A, V open: RES AUTO read
+        /// 31 Mohm instead of OL; the mechanism is unknown, the shape INFERRED); 0 = off.
+        public double AiOhm;
         public int MvHoldRows = 3;
         /// The hold is in force (a source went off with MvHoldV set).
         public bool MvHeld;
@@ -149,6 +153,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // ---- queries ----
+        /// Nothing on the V jack (no source, resistor, thermocouple, diode or capacitor).
+        public bool VOpen => VSrc == null && double.IsInfinity(R) && ISrcV == null && !Tc && double.IsNaN(DiodeVf) && C <= 0;
+
         /// Voltage at the V jack seen by the HY3131 input (path 0 = divider / V path, 1 = ohm-mV network
         /// including the thermocouple). The jack is open when the relay routes it elsewhere.
         public void VJack(int path, out double dc, out double ac, out double hz, out string shape, out double duty)
@@ -188,6 +195,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(ISrcV != null) i += ISrcV.Dc;
             // lead V -> A: V/ohm sees the A jack's fuse + the relay-selected shunt chain to COM
             if(LeadVA && !FuseOpen) g += 1 / (ShuntR + RFuse);
+            if(AiOhm > 0 && VOpen)
+            {
+                double idc, iac, ihz, iduty; string ish;
+                ACurrent(out idc, out iac, out ihz, out ish, out iduty);
+                if(idc != 0 || iac != 0) g += 1 / AiOhm;
+            }
         }
 
         /// Current through the A jack shunt chain (A), DC and AC RMS.
@@ -302,7 +315,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         ///   vsrc:none, isrc:none, r:none ... remove one element
         /// Aliases of the older per-function form: dcv:V, acv:RMS@Hz[,dc=,shape=,duty=], hz:F[,duty=,amp=],
         ///   dca:A, aca:RMS@Hz[,dc=], ohm:OHM, cap:F, temp:C[,cj=], tcmv:MV, tcopen, chip:C.
-        /// Model options (returned to the caller): noise:, cal:, beat:, powmix:, ad1mix:, swtr:, swtau:, swhz:, powvg:, powz:, op1vos:, ad2dcg:, mvclamp:, mvpb1:, contbump: ...
+        /// Model options (returned to the caller): noise:, cal:, beat:, powmix:, ad1mix:, swtr:, swtau:, swhz:, powvg:, powz:, op1vos:, ad2dcg:, mvclamp:, mvpb1:, hfbw:, hfdc:, hfpb1:, hfpb2:, contbump:, pb1cmp70:, hzpb1:, ailift:, ainz:, aiohm: ...
         public List<KeyValuePair<string, double>> Apply(string spec)
         {
             var options = new List<KeyValuePair<string, double>>();
@@ -437,11 +450,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case "mvhold": MvHoldV = v; if(v <= 0) MvHeld = false; break;
                 case "mvholdpb1": MvHoldPb1Mv = v; break;
                 case "mvholdrows": MvHoldRows = (int)v; break;
+                case "aiohm": AiOhm = v; break;
                 case "noise": case "cal": case "beat": case "powmix": case "ad1mix": case "ohmexit": case "ohmexitlo": case "ohmexitrst": case "ohmtau": case "swtr": case "swtau": case "swhz": case "ctsettle": case "ctretain": case "ct0dead": case "powvg": case "powz": case "op1vos": case "ad2dcg":
                 case "n7": case "n7g": case "n7a": case "ad1acg": case "ad3sh": case "hpftau": case "rmsfill": case "acarrive": case "acaoff": case "rmsbig": case "rmsbigp":
                 case "agndz": case "lpfcreep": case "creeptau": case "creepord": case "lpfn":
                 case "pb5drift": case "pb5tau": case "acastep": case "acastepms": case "acasteptau": case "ad1vos": case "ad1ug": case "ad1chopjit": case "r22part": case "r22off": case "r22n": case "r22win": case "chophalf": case "chopskew": case "vjblind": case "senseneg": case "sensetau":
-                case "mvclamp": case "mvpb1": case "contbump": case "contbumptau":
+                case "mvclamp": case "mvpb1": case "hfbw": case "hfdc": case "hfpb1": case "hfpb2": case "hfnocnt": case "hfboth": case "contbump": case "contbumptau":
+                case "pb1cmp70": case "hzpb1": case "ailift": case "ainz": case "ainzhz":
                     options.Add(new KeyValuePair<string, double>(key, v));
                     break;
                 default:

@@ -36,7 +36,7 @@ use crate::scpi::{Cmd, Scpi};
 /// so it is copied at once, never streamed); `n` points. All zero at reset
 /// (SRAM .sram_bss, not the TCM: the stack's headroom).
 struct Src {
-    rec: Option<&'static [u16]>,
+    rec: crate::pack10::Codes,
     stride: usize,
     n: usize,
     word: bool,
@@ -44,7 +44,7 @@ struct Src {
 }
 
 #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
-static mut SRC: Src = Src { rec: None, stride: 0, n: 0, word: false, screen: false };
+static mut SRC: Src = Src { rec: crate::pack10::Codes::EMPTY, stride: 0, n: 0, word: false, screen: false };
 
 /// The last frame's 400 screen columns, mean 10-bit codes (App::scope_poll).
 #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
@@ -78,7 +78,8 @@ fn fill(off: usize, out: &mut [u8]) {
         let c = if s.screen {
             screen()[k]
         } else {
-            s.rec.and_then(|r| r.get(k * s.stride.max(1))).copied().unwrap_or(0)
+            let i = k * s.stride.max(1);
+            if i < s.rec.len() { s.rec.at(i) } else { 0 }
         } & 0x3FF;
         *o = if !s.word {
             (c >> 2) as u8
@@ -102,8 +103,8 @@ fn decimate(len: usize, pts: u32) -> (usize, usize) {
 }
 
 /// The record readable now: stopped with a stored record.
-fn record(app: &App) -> &'static [u16] {
-    if app.scope.s.run { &[] } else { app.scope.record() }
+fn record(app: &App) -> crate::pack10::Codes {
+    if app.scope.s.run { crate::pack10::Codes::EMPTY } else { app.scope.record() }
 }
 
 /// Points the next WAV:DATA? holds.
@@ -219,7 +220,7 @@ pub fn data(app: &mut App, port: &mut dyn crate::bt::ScpiPort, scpi: &mut Scpi) 
         }
         let (stride, n) = decimate(rec.len(), app.wav_points);
         s.screen = false;
-        s.rec = Some(rec);
+        s.rec = rec;
         s.stride = stride;
         s.n = n;
     }

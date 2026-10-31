@@ -4,6 +4,13 @@
 
 #[path = "../../src/ident.rs"]
 mod ident;
+#[allow(dead_code)]
+#[path = "../../src/pack10.rs"]
+#[allow(dead_code)]
+mod pack10;
+#[allow(dead_code)]
+#[path = "../../src/decode.rs"]
+mod decode;
 #[path = "../../src/scpi.rs"]
 mod scpi;
 mod hy3131 {
@@ -538,7 +545,59 @@ fn ping_keepalive() {
     check(scpi::keepalive_left(5_000, 20_000) == 0, "keepalive_left past the deadline");
 }
 
+/// DECode:... (the protocol decoder): the parse, the refused values.
+fn decode_cmds() {
+    use scpi::Dcd as D;
+    let mut s = Scpi::new();
+    let ok: &[(&str, D)] = &[
+        ("DEC:PROT MODB", D::Proto(Some(2))),
+        ("DECODE:PROTOCOL UART", D::Proto(Some(1))),
+        ("DEC:PROT OFF", D::Proto(Some(0))),
+        ("DEC:PROT?", D::Proto(None)),
+        ("DEC:BAUD 9600", D::Baud(Some(9600))),
+        ("DEC:BAUD AUTO", D::Baud(Some(0))),
+        ("DEC:BAUD 115.2k", D::Baud(Some(115_200))),
+        ("DEC:BAUD?", D::Baud(None)),
+        ("DEC:RATE?", D::Rate),
+        ("DEC:FORM 7e1", D::Fmt(Some(3))),
+        ("DEC:FORMAT 8O1", D::Fmt(Some(2))),
+        ("DEC:POL INV", D::Inv(Some(true))),
+        ("DEC:POLARITY NORMAL", D::Inv(Some(false))),
+        ("DEC:THR 1.5", D::Thr(Some(1.5))),
+        ("DEC:THR 800MV", D::Thr(Some(0.8))),
+        ("DEC:THR?", D::Thr(None)),
+        ("DEC:LEV?", D::Level),
+        ("DEC:COUN?", D::Count),
+        ("DEC:FRAM?", D::Frames(0)),
+        ("DEC:FRAM? 10", D::Frames(10)),
+        ("DEC:MODE LOG", D::Mode(Some(1))),
+        ("DECODE:MODE BAND", D::Mode(Some(0))),
+        ("DEC:MODE?", D::Mode(None)),
+        ("DEC:CLE", D::Clear),
+        ("DECODE:CLEAR", D::Clear),
+    ];
+    for (cmd, want) in ok {
+        let got = s.handle(cmd.as_bytes(), 1);
+        check(matches!(got, Out::Dcd(c) if c == *want), &format!("{cmd}: parsed"));
+    }
+    match s.handle(b"DEC:THR AUTO", 1) {
+        Out::Dcd(D::Thr(Some(v))) => check(v.is_nan(), "DEC:THR AUTO: NaN"),
+        _ => check(false, "DEC:THR AUTO: parsed"),
+    }
+    check(err(&mut s) == "0,\"No error\"", "DECode: no error");
+    for bad in ["DEC:BAUD 100", "DEC:BAUD 1E6", "DEC:FORM 8N2", "DEC:POL UP", "DEC:PROT CAN", "DEC:THR 1A", "DEC:FRAM? -1", "DEC:MODE LIST"] {
+        check(!matches!(s.handle(bad.as_bytes(), 1), Out::Dcd(_)), &format!("{bad}: refused"));
+        check(err(&mut s).contains("Illegal parameter value"), &format!("{bad}: Illegal parameter value"));
+    }
+    for undef in ["DEC:WHAT?", "DEC ON", "DEC:CLE?"] {
+
+        check(!matches!(s.handle(undef.as_bytes(), 1), Out::Dcd(_)), &format!("{undef}: refused"));
+        check(err(&mut s).contains("Undefined header"), &format!("{undef}: Undefined header"));
+    }
+}
+
 fn main() {
+    decode_cmds();
     suffixes();
     set_commands();
     error_queue();

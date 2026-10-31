@@ -67,7 +67,7 @@ Stock: `scope_gen_v2_6.h`, `scope_gen_ui_v2_6.h`. opendm40: [`scope.rs`](../src/
 | Persistence | MATCH | Trace persistence in `app.rs` (commit 01972ab). |
 | Settings window (MF) | MATCH | Scope settings window tabs (`scope_page.rs`). |
 | AUTO-set | PARTIAL | Two-phase state machine (`autoset_start` / `autoset_step` in `scope_page.rs`; the last run's decisions via `autoset_log`). Untested whether it reproduces the stock period→timebase table (`FUN_08033388`) exactly. |
-| Zoom in STOP | PARTIAL (shorter record) | While stopped, a timebase or V/div change re-renders the stored record and a drag pans it (`scope.rs` "Stop-and-zoom"). The record is `CAP` = 26 624 samples; the stock keeps 65 520. |
+| Zoom in STOP | PARTIAL (shorter record at the fast timebases) | While stopped, a timebase or V/div change re-renders the stored record and a drag pans it (`scope.rs` "Stop-and-zoom"). The record is up to 65 520 samples (the stock's) at <= 25 kS/s (from 100 ms/div) and in the wave view, up to 43 008 faster ([ram-budget.md](ram-budget.md#the-scope-record-raw-ring-and-coded-ring)). |
 | Math / FFT channel | MATCH, extended | [`fft.rs`](../src/fft.rs): 2048 points, six windows (Rectangular, Blackman, Hanning, Hamming, Triangular, Flat-top), dB or Vrms; ABS math mode. opendm40 adds the dB/div, centre-frequency, Hz/div and peak readouts. |
 
 ---

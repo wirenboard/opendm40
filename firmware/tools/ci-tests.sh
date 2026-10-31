@@ -14,7 +14,7 @@
 # (emu/, Renode).
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
-SUITES="accuracy-test bargraph-test bt-scpi-test dbgsrc-test dlog-test fft-test gen-test
+SUITES="accuracy-test bargraph-test bt-scpi-test cring-test dbgsrc-test decode-test dlog-test fft-test gen-test
 logfmt-test meter-test scpi-test scpi-msg-test sinc-test ch2-test touch-test trig-test
 ui-render gallery-test fatren-test font-matrix stock-ui"
 # Start order: the long ones first (seconds on a GitHub runner, 2026-10-25:

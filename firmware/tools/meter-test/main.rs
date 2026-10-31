@@ -2,6 +2,8 @@
 // UF-21): the modules are compiled for the host with their register-level
 // dependencies; the tests only call pure logic (no MMIO is touched).
 #![allow(dead_code, unused_imports, clippy::all)]
+#[path = "../../src/pack10.rs"]
+mod pack10;
 #[path = "../../src/mmio.rs"]
 mod mmio;
 #[path = "../../src/hy3131.rs"]

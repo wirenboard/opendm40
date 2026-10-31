@@ -246,6 +246,7 @@ recorded.
 | [`hy3131/wavetest.py`](hy3131/wavetest.py) | the DMM Wave view (scope page, source DMM); build with `--features ad2-isr` | | 3591 |
 | [`railstest.py`](railstest.py) | analog rails (PE2 / PC4, `run.py --rail-log`) after a boot with Both always and a switch to Auto on the Scope page: the scope rail comes on, never both rails off | | free (50000-50999) |
 | [`wavedroptest.py`](wavedroptest.py) | the Wave view's ring drops no samples (`--ch2`: the scope page with CH2 (DMM) on) | | free |
+| [`pantest.py`](pantest.py) | stopped long record: pan by touch to both ends and back, zoom across it; each change right after a `DBG:LCD?` read (drawing held) | ~5 min | free |
 | [`trigdragtest.py`](trigdragtest.py) | marker drags with a wobbling finger: one item, one axis per gesture | | free |
 | [`sratetest.py`](sratetest.py) | the timebase list's per-entry sample rates = the ui-render `s07-srate-*` renders and ACQ:SRAT? across timebases, roll and the Wave view; picks in the open list (`--refs` = a `tools/ui-render/run.sh` output directory) | | free |
 | [`rollmeastest.py`](rollmeastest.py) | roll mode: no measurements while rolling (not the last frame's), a stopped roll record measured | | free |
@@ -256,6 +257,7 @@ recorded.
 | [`dragperf.py`](dragperf.py) | trigger-level drag: main-loop period and touch-to-pixel latency (prints figures) | | free |
 | [`triglevtest.py`](triglevtest.py) | `TRIG:LEV` keeps the level as given (V/div steps, off screen); Normal triggers on it | ~2 min | free |
 | [`stopzoomtest.py`](stopzoomtest.py) | stopped scope: each timebase change re-renders the stored record, also right after a screen read-back | ~2 min | free |
+| [`decodetest.py`](decodetest.py) | the protocol decoder's band: UART and Modbus RTU bit patterns on the scope input and (Wave view) on V-COM, DECode:FRAMes? running and stopped at several timebases, the band in screenshots (a box per byte / frame, red errors, the bar, the note), the decode's cost (DBG:PROF?), region C hooks while the AD2 stream runs | ~20 min | free |
 
 ### Logger and the AD2 stream
 
@@ -349,8 +351,8 @@ Models are C# files compiled by Renode at start-up; the platform is
 | DMA | [`GD32_DMA.cs`](peripherals/GD32_DMA.cs) | circular, double buffer, M2M |
 | SPI flash (W25Q128) | [`GD32_SPI.cs`](peripherals/GD32_SPI.cs), [`W25Q128.cs`](peripherals/W25Q128.cs) | file-backed 16 MiB; program / erase busy times; byte timing as the device (`--spi-disk-gap-ns`) |
 | Touch (I2C) | [`GD32_I2C.cs`](peripherals/GD32_I2C.cs), [`CST_Touch.cs`](peripherals/CST_Touch.cs) | `Tap`, `Press`, `Move`, `Release`, `Drag`, `Key` |
-| HY3131 and the front end | [`hy3131/HY3131.cs`](hy3131/HY3131.cs), [`hy3131/DM40Frontend.cs`](hy3131/DM40Frontend.cs) | registers, conversion timing, every DMM function, with the meter's calibration: [emu/hy3131/README.md](hy3131/README.md) |
-| Scope ADC and comparator | [`ScopeFeeder.cs`](peripherals/ScopeFeeder.cs) | one sample per TIM1 update; comparator on PA15 with the board's delay and hysteresis |
+| HY3131 and the front end | [`hy3131/HY3131.cs`](hy3131/HY3131.cs), [`hy3131/DM40Frontend.cs`](hy3131/DM40Frontend.cs) | registers, conversion timing, every DMM function, with the meter's calibration: [emu/hy3131/README.md](hy3131/README.md); `SetBitsFile PATH`: a bit pattern on V-COM for the AD2 stream (serial decoding in the Wave view; the AD2 filter's edge shape INFERRED) |
+| Scope ADC and comparator | [`ScopeFeeder.cs`](peripherals/ScopeFeeder.cs) | one sample per TIM1 update; comparator on PA15 with the board's delay and hysteresis; `SetBitsFile PATH`: a bit pattern from a file the test may rewrite while the emulator runs (serial decoding) |
 | Bluetooth module (UART4) | [`BtModule.cs`](peripherals/BtModule.cs) | AT set-up, start-up banner, PC14 "connected", `--bt-port`; its bytes to the firmware at most 115200 (`RxByteUs`), the firmware's TX at once |
 | Battery ADC | [`SimpleADC.cs`](peripherals/SimpleADC.cs) | channel 15 = 4.0 V (`SetVolts ch v`) |
 | Watchdog, reset flags | [`FWDGT.cs`](peripherals/FWDGT.cs) | a timeout resets the machine; RSTSCK flags |
@@ -376,7 +378,10 @@ Models are C# files compiled by Renode at start-up; the platform is
 - **Boot timing.** The ROM's and FS-loader's PA2 (debug header TX) poll
   timing is set empirically: a release at 0.55 s gives the three-stage chain.
 - **Scope trigger.** opendm40's comparator path sometimes never completes a
-  frame after a restart; [`wavtest.py`](wavtest.py) turns it off.
+  frame after a restart; [`wavtest.py`](wavtest.py) turns it off. Its
+  STOP checks with `--hwtrig` end in `WAIT` for that reason; the device
+  check of the comparator path is
+  [`firmware/tools/scope-stop-check.py`](../firmware/tools/scope-stop-check.py).
 - **Gestures.** Horizontal swipes from the touch model were not recognised
   by opendm40's gesture engine; not investigated. The tests swipe with
   `DBG:SWIPE` over USB.

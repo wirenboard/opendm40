@@ -187,6 +187,11 @@ static mut CACHE: Cache = Cache {
     ps_t: 0,
 };
 
+/// The shown frame's column rows (the decoder's bar, app_decode.rs).
+pub(super) fn cache_seg() -> &'static [(i16, i16); 400] {
+    &cache().seg
+}
+
 fn cache() -> &'static mut Cache {
     unsafe { &mut *core::ptr::addr_of_mut!(CACHE) }
 }
@@ -570,6 +575,8 @@ impl App {
             rec: crate::csvlog::active(),
             rec_dim: su::rec_blink(now),
             rec_unit: su::rec_unit(self.rec_func),
+            dec: self.dec_band(),
+            dec_gen: self.dec_gen_shown(),
             tsrc: if wave { scope::TSRC_CH1 } else { s.tsrc },
             ch2_txt: self.ch2_label(true),
         }
@@ -815,11 +822,7 @@ impl App {
             } else if n >= scope::COLS {
                 let a = i * n / scope::COLS;
                 let b = ((i + 1) * n / scope::COLS).max(a + 1).min(n);
-                let (mut cl, mut ch) = (u16::MAX, 0u16);
-                for &v in &f.data[a..b] {
-                    cl = cl.min(v);
-                    ch = ch.max(v);
-                }
+                let (cl, ch) = f.data.min_max(a, b);
                 let (r1, r2) = (row(cl), row(ch));
                 lo = r1.min(r2);
                 hi = r1.max(r2);
@@ -829,7 +832,7 @@ impl App {
                 // interpolation (UF-41, src/sinc.rs Lanczos-3) instead of
                 // straight lines between the samples.
                 let p = i as f32 * (n - 1) as f32 / (scope::COLS - 1) as f32;
-                let r = (r0 + slope * crate::sinc::at(f.data, p)) as i32;
+                let r = (r0 + slope * crate::sinc::at(&f.data, p)) as i32;
                 lo = r;
                 hi = r;
             } else {
@@ -852,6 +855,8 @@ impl App {
         c.tb = s.tb;
         self.sp_gen_frame(f);
         self.ch2_rows(f, &mut c.c2seg);
+        // The protocol decoder's band (app_decode.rs).
+        self.dec_frame(f);
         self.sp_math_frame(f);
         self.sp_render();
     }
@@ -1034,10 +1039,7 @@ impl App {
         }
         let Some(g) = self.scope.gen_sync() else { return };
         let rec = self.scope.record();
-        let off = (f.data.as_ptr() as usize).wrapping_sub(rec.as_ptr() as usize) / 2;
-        if off + f.data.len() > rec.len() {
-            return;
-        }
+        let Some(off) = rec.offset_of(&f.data) else { return };
         let n = f.data.len();
         let row = |v: f32| self.scope.row_of_volts(v).clamp(-30000.0, 30000.0) as i16;
         for i in 0..scope::COLS {
@@ -1082,10 +1084,9 @@ impl App {
         let (off, n) = if f.data.is_empty() {
             (0, rec.len())
         } else {
-            let o = (f.data.as_ptr() as usize).wrapping_sub(rec.as_ptr() as usize) / 2;
-            if o + f.data.len() > rec.len() {
+            let Some(o) = rec.offset_of(&f.data) else {
                 return;
-            }
+            };
             (o, f.data.len())
         };
         // N points: the window decimated by k (mean of k samples) when it
@@ -1107,7 +1108,7 @@ impl App {
             return;
         };
         crate::prof::enter(crate::prof::FFT);
-        fft().load(w, &rec[start..], k, len, a, b, f.fs as f32, m.win);
+        fft().load(w, &rec.sub(start, rec.len()), k, len, a, b, f.fs as f32, m.win);
         crate::prof::exit(crate::prof::FFT);
     }
 
@@ -2215,6 +2216,7 @@ impl App {
             pcond: s.pcond,
             pwidth: s.pwidth,
             runt_v: self.scope.runt_volts(),
+            dec: self.dec_setup_vals(),
             tsrc: s.tsrc,
             gen_trace: self.scope.gen_trace,
             ch2_on: self.ch2.on,
@@ -2222,7 +2224,7 @@ impl App {
         }
     }
 
-    fn sp_popup_draw(&mut self) {
+    pub(super) fn sp_popup_draw(&mut self) {
         // The box's fills wait for its widgets (lcd.rs "deferred fills").
         crate::lcd::defer_start();
         let v = self.sp_popvals();
@@ -2249,7 +2251,7 @@ impl App {
     /// only that (`sp_uncover`, the next tick); the combined view, whose
     /// popups also cover the meter strip, repaints the whole page.
     #[inline(never)] // region C (link-native.x)
-    fn sp_popup_close(&mut self) {
+    pub(super) fn sp_popup_close(&mut self) {
         let grey = match self.sp.popup {
             su::Popup::Ch1(_) => 1,
             su::Popup::Math(_) => 2,
@@ -2378,6 +2380,7 @@ impl App {
                         su::TbHit::Row(r) => self.sp_tb_pick(r, now),
                         su::TbHit::Inside => {}
                     },
+
                     su::Popup::None => {}
                 }
                 if had_press && self.sp.popup != su::Popup::None && !self.redraw {
@@ -2590,6 +2593,11 @@ impl App {
                 self.sp_save_csv(now);
                 return;
             }
+            su::MfHit::Dec(h) => {
+                self.dec_setup_tap(clk, h, now);
+                return;
+            }
+
         }
         let _ = clk;
         self.sp_popup_draw();
@@ -2700,11 +2708,7 @@ impl App {
             return;
         }
         let mut st = self.scope.s;
-        let (mut lo, mut hi) = (1023u16, 0u16);
-        for &v in f.data {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
+        let (lo, hi) = f.data.min_max(0, f.data.len());
         let pp = (hi - lo) as f32;
         let (l30, l70) = (lo as f32 + 0.3 * pp, lo as f32 + 0.7 * pp);
         let swing = l70 - l30 > 19.0;
@@ -2712,8 +2716,8 @@ impl App {
         // Period from rising crossings of the 30 % / 70 % levels.
         let (mut armed, mut first, mut last, mut n) = (false, 0usize, 0usize, 0u32);
         if swing {
-            for (i, &v) in f.data.iter().enumerate() {
-                let v = v as f32;
+            for i in 0..f.data.len() {
+                let v = f.data.at(i) as f32;
                 if v < l30 {
                     armed = true;
                 } else if armed && v > l70 {
@@ -2835,7 +2839,7 @@ impl App {
         st.range = r;
         st.pos = ((141.0 * mid / (4.0 * scope::VDIV[r] * probe)) as i32).clamp(-392, 392);
         st.trig_row = 140;
-        let res = crate::scope_meas::compute(f.data, f.fs as f32, &self.scope);
+        let res = crate::scope_meas::compute(&f.data, f.fs as f32, &self.scope);
         let cyc = res.v[9];
         if period > 0.0 {
             let ok = cyc.is_finite() && cyc > 0.0 && cyc < 2.0 * period && cyc > 0.5 * period;

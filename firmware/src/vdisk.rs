@@ -751,9 +751,11 @@ fn rd_cyc() -> u32 {
     return 0;
 }
 
-/// The second CSV cursor (`file_read`; TCM .bss like CSV_CUR since the SRAM
-/// audit, docs/native-boot.md; all zero = empty) and the least recently
-/// used one; a cursor at most this far before a read goes on from there.
+/// The second CSV cursor (`file_read`; SRAM on test/scope-chain-0.4, TCM
+/// .bss on release/0.4.0: docs/native-boot.md "SRAM audit"; all zero =
+/// empty) and the least recently used one; a cursor at most this far before
+/// a read goes on from there.
+#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
 static mut CSV_CUR2: dlog::Slot<(u16, u32)> = dlog::Slot::new();
 static mut CSV_LRU: u8 = 0;
 const CUR_NEAR: u32 = 1 << 20;

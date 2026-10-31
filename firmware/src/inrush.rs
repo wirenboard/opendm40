@@ -11,10 +11,10 @@
 //! drains the ring (`logger::wave::drain`) every pass and feeds `push`.
 //! Each sample is kept as a 16-bit code `(raw + 4) >> 3` (3.8 mA per code;
 //! the AD2 noise is ~32 raw codes = 4 of these, so nothing is lost) in the
-//! scope's record buffer (scope::BUF, 26 624 slots, lent while the inrush
-//! page is open: `Scope::lend_buf`), used as a ring until the capture is
-//! complete, then rotated so the trace runs PRE samples before the trigger
-//! to POST samples after it.
+//! scope's record buffer (scope::BUF as u16, scope::CAP = 43 008 slots,
+//! lent while the inrush page is open: `Scope::lend_buf`), used as a ring
+//! until the capture is complete, then rotated so the trace runs PRE
+//! samples before the trigger to POST samples after it.
 //!
 //! Trigger rule (`Cap::push`): the mean of |I| over the last SHORT samples
 //! (~1 ms) exceeds the largest such mean of the previous ~100 ms (NBLK
@@ -330,7 +330,10 @@ impl Cap {
         let cap = buf.len() as u64;
         let start = self.trig - PRE as u64;
         let r = (start % cap) as usize;
-        buf.rotate_left(r);
+        // = rotate_left(r), in less code (core's rotate is ~0.2 KB).
+        buf[..r].reverse();
+        buf[r..].reverse();
+        buf.reverse();
         self.rd = 0;
     }
 

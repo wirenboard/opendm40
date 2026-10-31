@@ -119,6 +119,10 @@ EXC_FRAME = 26 * 4 + 4
 INDIRECT = [
     (r'^opendm40::run$', r' as opendm40::bt::ScpiPort>::'),
     (r' as opendm40::bt::ScpiPort>::respond_with$', r'^opendm40::run::\{closure#\d+\}$'),
+    # stockfont::paint hands its pixel closure to paint_dyn as &mut dyn FnMut
+    # (one copy of the loop); the closures are the scope page's (scope_ui,
+    # App::sp_*): every one of those counts as a callee (an upper bound).
+    (r'^opendm40::stockfont::paint_dyn$', r'^(opendm40::scope_ui::|<opendm40::app::App>::sp_)\S*::\{closure#\d+\}$'),
 ]
 
 

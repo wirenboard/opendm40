@@ -1070,6 +1070,11 @@ struct Freq {
     conf: [bool; 2],
     /// The pick of the latest `take` is provisional (`Reading::prov`).
     prov: bool,
+    /// The counter shows no input above its latest result (`f_khz`; NaN:
+    /// none yet) up to `hf_t` (ms, low 32 bits): AC mV's V_GATE
+    /// (`mv_vside`). False until the first check of a row's gate.
+    hf_ok: bool,
+    hf_t: u32,
 }
 
 /// Two clean gates in a row agree within this (relative): `Freq::take`.
@@ -1506,7 +1511,7 @@ pub struct Dmm {
     /// node); 1 = the next result, whose window began before that read.
     ac_lead: u8,
     /// AC+DC mV: the last DC phase result's magnitude was over the range
-    /// (`mv_vside`).
+    /// (`mv_vside`); plain DC mV: the last result was (its V_GATE).
     mv_dc_drv: bool,
     f_ac: f32,
     f_lpf: f32,
@@ -2162,7 +2167,7 @@ impl Dmm {
             t_phase: 0,
             t_code_a: 0,
             t_cj: 0.0,
-            freq: Freq { next: 0, src_alt: false, fresh: false, seen: [false; 2], zc: [0; 2], shown: false, last: [0.0; 2], lastd: [0.0; 2], change: [0.0; 2], f_khz: 0.0, duty: 0.0, range: 0, t0: 0, lastn: [0; 2], n: 0, prev: f32::NAN, conf: [false; 2], prov: false },
+            freq: Freq { next: 0, src_alt: false, fresh: false, seen: [false; 2], zc: [0; 2], shown: false, last: [0.0; 2], lastd: [0.0; 2], change: [0.0; 2], f_khz: 0.0, duty: 0.0, range: 0, t0: 0, lastn: [0; 2], n: 0, prev: f32::NAN, conf: [false; 2], prov: false, hf_ok: false, hf_t: 0 },
             seq: 0,
             pa_now: None,
             suspended: false,
@@ -2570,6 +2575,7 @@ impl Dmm {
             ctr_restart(row[0]);
         }
         self.freq.fresh = ctr;
+        self.freq.hf_ok = false;
         self.r22 = row[2];
         if let (true, Some(k)) = (self.r22 == fastvos::R22_FAST && self.dc_rated(), Fast::path(m, self.range)) {
             self.fast.start(k, clk.now_ms());
@@ -2600,13 +2606,18 @@ impl Dmm {
         // AC mV: its own result says how far beyond the range the input is
         // (sentinel MV_DRV_K), a block late (MV_VGATE_LAG_MS). AC+DC mV: the
         // AC phase is that row and its sentinel; both phases share the run
-        // and the AC phase's verdict (doc 4.13).
+        // and the AC phase's verdict (doc 4.13). Plain DC mV: its own result
+        // over the range (the readout's OL) = driven, also for A-PROT
+        // (sentinel V_HF_KHZ: a 66 kHz signal on V-COM).
         let mv = self.mode == 2 || (self.acdc && self.mode == 3);
+        let dcmv = self.mode == 3 && !self.acdc;
         // Continuity / diode: V_GATE on OL (`CLOSED_HOLD_MS`).
-        self.sent.vgate = matches!(self.mode, 10 | 11 | 12 | 15) || mv;
+        self.sent.vgate = matches!(self.mode, 10 | 11 | 12 | 15) || mv || dcmv;
         self.closed_t = 0;
         self.sent.vlag = if mv {
             sentinel::MV_VGATE_LAG_MS
+        } else if dcmv {
+            sentinel::DCMV_VGATE_LAG_MS
         } else if matches!(self.mode, 11 | 12) {
             CLOSED_VGATE_LAG_MS
         } else {
@@ -2618,8 +2629,11 @@ impl Dmm {
         self.sent.bridge = self.acdc;
         // A-JACK evidence a driven V-COM can fake (sentinel `soft`): the
         // ohm-network rows (ohm, continuity, diode, capacitance, the
-        // resistive temperature sensors' ohm rows).
-        self.sent.soft = matches!(self.mode, 10..=13) || (self.mode == 15 && self.t_sensor != 0);
+        // resistive temperature sensors' ohm rows); frequency (its PB1
+        // follows the input path; its thresholds sit 1.3-2 x over the V-side
+        // levels measured, PK_DC_THR / PK_DC_NEG_THR).
+        self.sent.soft = matches!(self.mode, 10..=14) || (self.mode == 15 && self.t_sensor != 0);
+        self.sent.pk_dc = self.mode == 14;
         // DC? / AC? hints (doc 4.4): AC V alternates AD1 between PB1 - PB3
         // and the V tap, DC V 6 V alternates the comparator between PB1 and
         // SENSE, one 100 ms window each (`poll`, `poll_ac`).
@@ -4270,6 +4284,8 @@ impl Dmm {
     #[inline(never)]
     fn v_side_ohm(&mut self, now: u64, ol: bool) {
         let drv = if self.mode == 10 {
+            // (the jack check's BOTH: sentinel `own`)
+            self.sent.vin_t = if ol { 0 } else { now.max(1) };
             self.live
         } else {
             if !ol {
@@ -4469,6 +4485,15 @@ impl Dmm {
         if m == 3 && acdc {
             // (AC+DC mV's V_GATE, `mv_vside`: the magnitude over the range)
             self.mv_dc_drv = mag > ov * lim;
+        } else if m == 3 {
+            // plain DC mV's V_GATE: over the range (OL) = a source on V-COM;
+            // "free" needs two results in range in a row (`mv_dc_drv` = the
+            // last one was over): one stray conversion (a row rewrite of the
+            // A-PROT probe) read in range among OL ones in the emulator and
+            // let A-PROT trip (loudtest ajack-dcmv-hf, 1 of 3 runs)
+            let ol = mag > ov * lim;
+            self.sent.v_side(now, ol || self.mv_dc_drv);
+            self.mv_dc_drv = ol;
         }
         let hold = vet && self.acs_dc_step(now, x, lim);
         self.tr_dc(now, ad1, x, lim, vet, hold);
@@ -4824,9 +4849,6 @@ impl Dmm {
         let rms = (b[9] as u64) | (b[10] as u64) << 8 | (b[11] as u64) << 16 | (b[12] as u64) << 24
             | ((b[13] & 0x1F) as u64) << 32;
         let sq = sqrt(rms as f32);
-        if sq > 262_144.0 {
-            return None;
-        }
         let lpf = (((b[6] as u32) << 13 | (b[7] as u32) << 21 | (b[8] as u32) << 29) as i32 >> 13) as f32;
         let r = self.range as usize;
         let (f, ov) = (self.factor(), self.over());
@@ -4841,8 +4863,13 @@ impl Dmm {
         let ci = ci as u32;
         let mut ac = sq * s * cal(g_rms + 4 * ci, 1.0) - cal(o_rms + 4 * ci, 0.0);
         let dcp = lpf * s * cal(g_lpf + 4 * ci, 1.0) - cal(o_lpf + 4 * ci, 0.0);
+        let over = sq > 262_144.0;
         if m == 2 && self.sent.vgate {
-            self.mv_vside(now, dcp.abs() + core::f32::consts::SQRT_2 * sq * s);
+            // (over the converter range: NaN, no verdict but the PB1 one)
+            self.mv_vside(now, dcp.abs(), if over { f32::NAN } else { core::f32::consts::SQRT_2 * sq * s });
+        }
+        if over {
+            return None;
         }
         if self.diag_on {
             if !self.acdc && self.diag[self.diag_k as usize % ACDC_DIAG_N].n >= 4 {
@@ -5450,6 +5477,12 @@ impl Dmm {
     /// FREQ_CHECK_MS after the restart: None while the gate runs; at its end
     /// or timeout the counts (f kHz, duty %, its SYSCLK ticks, the check:
     /// `Gate::Done` = a whole gate) and a restart with `src`.
+    ///
+    /// `hf_t`: a gate still open at a check had no input edges since its
+    /// first 53.3 ms (any edge after the CTA overflow ends it), so nothing
+    /// above the AC bandwidth up to the check; a gate given up the same up
+    /// to its end. A whole gate's result holds from the gate's start only
+    /// (it may have ended long before the check).
     #[inline(never)]
     fn freq_gate(&mut self, now: u64, src: u8) -> Option<(f32, f32, u32, Gate)> {
         if now < self.freq.next {
@@ -5464,10 +5497,13 @@ impl Dmm {
         hy::read(0x1B, &mut a);
         let el = (now as u32).wrapping_sub(self.freq.t0);
         let g = gate_check(ctc, ctb, cta, u24(&a), el, self.freq.f_khz);
+        self.freq.hf_ok = true;
         if g == Gate::Wait {
+            self.freq.hf_t = now as u32;
             self.freq.next = now + FREQ_RECHECK_MS;
             return None;
         }
+        self.freq.hf_t = if g == Gate::Done { self.freq.t0 } else { now as u32 };
         self.diag_ctr = self.diag_ctr.saturating_add(1);
         ctr_restart(src);
         self.freq.t0 = now as u32;
@@ -5507,7 +5543,11 @@ impl Dmm {
             let k = K_ACV[r.max(1)];
             let vdc = (mn as f32 + mx as f32) * 0.5 * 32.0 * 1.25 / (3.6 * AD1_DIV) * k;
             let fs = (self.factor() * DEC4[r]).min(1000.0);
-            let on = vdc.abs() > sentinel::DC_HINT_V.max(0.02 * fs) && self.f_ac < sentinel::DC_HINT_AC * vdc.abs();
+            // (not with a counter frequency above the AC bandwidth: the AC
+            // reading then misses the AC part, sentinel V_HF_KHZ)
+            let on = vdc.abs() > sentinel::DC_HINT_V.max(0.02 * fs)
+                && self.f_ac < sentinel::DC_HINT_AC * vdc.abs()
+                && !(self.freq.f_khz > sentinel::V_HF_KHZ);
             self.sent.dc_hint(now, on);
         }
         hy::write(0x29, &[self.r29 & !sentinel::R29_ENPKH]);
@@ -5580,8 +5620,10 @@ impl Dmm {
         hy::write(0x29, &[self.r29 & !sentinel::R29_ENPKH]);
         hy::write(0x29, &[self.r29]);
         if self.jack_mode() {
-            // the jack check's row (ohm / resistive temperature): no A-PROT
-            self.sent.jack_result(now, true, hy::s24(&b[0..3]), hy::s24(&b[3..6]));
+            // the jack check's row (ohm / resistive temperature): no A-PROT;
+            // the 6 / 60 Mohm rows' line (sentinel JACK_OWN_V)
+            let line = if self.mode == 10 && self.range >= 5 { sentinel::JACK_OWN_V } else { f32::NEG_INFINITY };
+            self.sent.jack_result(now, true, hy::s24(&b[0..3]), hy::s24(&b[3..6]), line);
             return;
         }
         let amps = sentinel::probe_amps(hy::s24(&b[0..3]), hy::s24(&b[3..6]));
@@ -5600,9 +5642,12 @@ impl Dmm {
             // Only while the comparator still sees the current: a real one
             // through the 47.5 ohm chain is far above its window (5 mA =
             // 0.24 V at PB1), so a probe reading without hits is not one.
+            // DC mV: not while its own V side says driven or has not said
+            // free since the run began (V_GATE: a 66 kHz signal on V-COM put
+            // the probe on PB2 over APROT_NOW_A with the A jack empty).
             None if run.is_some() => {
                 let hot = run.map_or(0, |t| now.saturating_sub(t));
-                if sentinel::aprot_trips(amps, hot) {
+                if sentinel::aprot_trips(amps, hot) && self.sent.v_free() {
                     relay_pe(0);
                     self.aprot = Some(AProt { ack: false, low_since: None });
                     self.sent.aprot_ms = hot.min(u32::MAX as u64) as u32;
@@ -5637,17 +5682,58 @@ impl Dmm {
         (matches!(self.mode, 1 | 3) || self.jack_mode()) && !self.acdc && self.fuse_job.is_none()
     }
 
-    /// V_GATE (AC mV), per result: `pk` = the node's peak estimate (mV,
-    /// |LPF| + sqrt(2) x RMS) far beyond the range = a source on V-COM, not
-    /// the open V jack of an A-jack current (sentinel MV_DRV_K).
-    /// AC+DC mV: also driven while its DC phase's last result was over the
-    /// range (`mv_dc_drv`; device 185c066: after a source went off the open
-    /// input read OL and the AC phase's results "free" while PB1 hit, a
-    /// false A-JACK).
-    #[inline(never)]
-    fn mv_vside(&mut self, now: u64, pk: f32) {
+    /// V_GATE (AC mV), per result: `dc` = |LPF|, `ac` = sqrt(2) x RMS (mV).
+    /// Driven (a source on V-COM, not the open V jack of an A-jack current):
+    /// - the node's peak estimate dc + ac far beyond the range (MV_DRV_K);
+    /// - a DC level on the node above MV_DC_DRV_MV (the row is DC-coupled;
+    ///   the 0 / 9.5 V square at 66 kHz, clipped by the mV input: 0.51 V,
+    ///   under 1.5 x 600 mV, with an RMS of ~30 mV; device 2026-10-26);
+    /// - plain AC mV: the frequency counter above sentinel::V_HF_KHZ; a
+    ///   "free" verdict is dated where the counter's evidence ends
+    ///   (`Freq::hf_t`: a whole gate's start, or the last check that found
+    ///   the gate open; none yet in this row: no verdict), so a signal that
+    ///   starts within a run is judged by counts taken after it (emulator
+    ///   acmv-hf60). Since the reciprocal gate (#43) an open input's gate
+    ///   runs 2.2 s; its result alone put A-JACK at ~2.8 s after DC V ->
+    ///   AC mV (switchtest real-ajack-pickup);
+    /// - AC+DC mV: its DC phase's last result over the range (`mv_dc_drv`;
+    ///   device 185c066: after a source went off the open input read OL and
+    ///   the AC phase's results "free" while PB1 hit, a false A-JACK).
+    ///
+    /// A one-sided level on PB1 above sentinel::PK_DC_THR and above the
+    /// node's |LPF| (the AD1 hold of this result) = the level sits on PB1,
+    /// not on the V input: a current in A, "free" whatever the above say
+    /// (device 2026-10-26, 20 mA in A, V open: the readout OL, ~50 kHz on
+    /// the open input, no A-JACK; DC mV read +139 mV there). The V-COM
+    /// cases measured put less there (66 kHz: ~28 mV against an LPF of
+    /// 0.51 V; ~5-15 V DC: -89 mV, the node clamped). An A-JACK on this
+    /// verdict is badge only (`soft`). `ac` NaN: a result over the
+    /// converter range, which gives only that verdict.
+    #[inline(never)] // .cold (link-native.x): per AC mV result
+    fn mv_vside(&mut self, now: u64, dc: f32, ac: f32) {
+        let pb1 = sentinel::pk_level(self.sent.pk.0, self.sent.pk.1);
+        let ovr = pb1 > sentinel::PK_DC_THR && pb1 as f32 > dc * sentinel::PK_CODES_PER_MV;
+        // (an A-JACK on this evidence: badge only, no danger alarm: `soft`)
+        self.sent.soft = ovr;
+        if ovr {
+            self.sent.v_side(now, false);
+            return;
+        }
+        if ac.is_nan() {
+            return;
+        }
         let lim = self.factor() * if self.range > 0 { 100.0 } else { 10.0 };
-        self.sent.v_side(now, pk > sentinel::MV_DRV_K * lim || (self.acdc && self.mv_dc_drv));
+        let drv = dc + ac > sentinel::MV_DRV_K * lim
+            || dc > sentinel::MV_DC_DRV_MV
+            || (self.acdc && self.mv_dc_drv)
+            || (!self.acdc && self.freq.f_khz > sentinel::V_HF_KHZ);
+        if drv || self.acdc {
+            self.sent.v_side(now, drv);
+        } else if self.freq.hf_ok {
+            // (dated where the counter's evidence ends: `Freq::hf_t`)
+            let t = now.saturating_sub((now as u32).wrapping_sub(self.freq.hf_t) as u64);
+            self.sent.v_side_at(now, t, false);
+        }
     }
 
     /// The probe's row is the jack check's (sentinel `jack_row`): ohm and
@@ -5685,7 +5771,7 @@ impl Dmm {
                 hy::read(0x0E, &mut b);
                 hy::write(0x25, &[self.r25]);
                 hy::write(0x27, &[sentinel::R27_OP2O_PB3]);
-                self.sent.jack_result(now, false, hy::s24(&b[0..3]), hy::s24(&b[3..6]));
+                self.sent.jack_result(now, false, hy::s24(&b[0..3]), hy::s24(&b[3..6]), f32::NEG_INFINITY);
                 self.pk_t = now;
                 self.jwin = 3;
             }
@@ -6517,7 +6603,7 @@ mod tests {
     const L: Gate = Gate::Late;
 
     fn freq0() -> Freq {
-        Freq { next: 0, src_alt: false, fresh: false, seen: [false; 2], zc: [0; 2], shown: false, last: [0.0; 2], lastd: [0.0; 2], change: [1e6; 2], f_khz: f32::NAN, duty: f32::NAN, range: 0, t0: 0, lastn: [0; 2], n: 0, prev: f32::NAN, conf: [false; 2], prov: false }
+        Freq { next: 0, src_alt: false, fresh: false, seen: [false; 2], zc: [0; 2], shown: false, last: [0.0; 2], lastd: [0.0; 2], change: [1e6; 2], f_khz: f32::NAN, duty: f32::NAN, range: 0, t0: 0, lastn: [0; 2], n: 0, prev: f32::NAN, conf: [false; 2], prov: false, hf_ok: false, hf_t: 0 }
     }
 
     #[test]

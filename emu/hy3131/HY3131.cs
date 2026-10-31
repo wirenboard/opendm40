@@ -500,10 +500,51 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         /// 3 and 5 V is INFERRED (4 V). Instantaneous (the square reads it in its high half).
         /// Default 4; "ohmboth:0" = off (PB1 alone, Pb1VjackMv).
         public double OhmBothV = 4.0;
+        /// PB1 above the comparator's window reads CMPHO and CMPLO together (CTSTA 0x70), as the
+        /// device reads every level above it: CTSTA took only 0x00 / 0x10 / 0x50 / 0x70 over ~233 000
+        /// reads, never CMPHO alone (device 40728b8); DC V's V tap read 0x70 at +5 V; RES with 20 mA
+        /// in A (V open) showed LIVE? (2026-10-26), what the jack check's both-bit rule gives for
+        /// 0x70. That a current in A reads 0x70 is INFERRED from those. Default on; "pb1cmp70:0" =
+        /// CMPHO alone (the model before).
+        public bool Pb1Cmp70 = true;
+        /// The frequency row's standing level on PB1 - PB3 (opt-in, "hzpb1:mV"; PR #55, SAD1I 00:
+        /// +2.5 mV with V-COM open, -140 mV at 10 V DC; device d8e249d's ~54 mV came with SAD1I 11).
+        public double HzPb1Mv;
+        /// A current in A with the V jack open (opt-in; device 2026-10-26, the owner's PSU 20 mA CC
+        /// into A / COM: AC V 6 V read 1.5 V, AC mV OL, Hz ~50 kHz, DC mV +139 mV). In the AC mV
+        /// role the open input carries "ailift:k" x the A jack's PB1 drop (DC mV: 139 mV / 0.95 V
+        /// = 0.146) and "ainz:mV" RMS at "ainzhz:Hz" (the supply's noise on the open input) while
+        /// the current flows. Both INFERRED (mechanism and shape unknown).
+        public double AiLiftK, AiNzMv, AiNzHz = 50000;
         /// PB1 picking up the mV clamp's current in the AC mV rows (opt-in, "mvpb1:mV per V" of the jack
         /// beyond the clamp; device 2f56ff9: the same square asserted AJACK,AD1PK_PB1 with the A jack
         /// empty; the ratio is INFERRED: 10 mV / V puts 83 mV peaks on PB1, over the 23.75 mV threshold).
         public double MvPb1Mv;
+        /// A signal on V-COM far above the AC bandwidth (opt-in; device 2026-10-26: a 66 kHz
+        /// generator, amplitude unknown, A jack empty: AC V 6 V read 1.16 mV with a DC? hint, AC mV
+        /// 600 mV 26.6 mV with AJACK,AD1PK_PB1, DC mV 600 mV OL with CMP_PB1 A-JACK / A-PROT).
+        /// "hfbw:Hz": the AC V / AC mV rows' RMS / LPF blocks see the jack's AC part scaled by
+        /// 1 / (1 + (f / Hz)^2) (the meter's AC bandwidth is about 20 kHz, -3 dB; the shape is
+        /// INFERRED); the counter and the instantaneous samples are unchanged. The pickups below
+        /// act only for a jack frequency above it. All four are INFERRED, chosen to replay the
+        /// device's alerts, not measured; 0 = off.
+        public double HfBwHz;
+        /// "hfdc:k": the DC mV node and the AC V row's V tap (the DC? window) carry k x the jack's
+        /// AC rms as a DC level (V at the jack; a rectified HF signal: the DC mV readout read OL).
+        public double HfDcK;
+        /// "hfpb1:mV per V": PB1 in the AC mV / DC mV rows carries the jack's AC part (instantaneous)
+        /// at this ratio (the A-JACK hits of AD1PK_PB1 / CMP_PB1).
+        public double HfPb1Mv;
+        /// "hfpb2:mV per V": PB2 in the DC mV row, the same (the A-PROT probe's 10 mohm node).
+        public double HfPb2Mv;
+        /// "hfnocnt:1": the AC mV row's frequency counter reads nothing for a jack above HfBwHz
+        /// (device 2026-10-26: the 66 kHz square on AC mV 600 mV was not "driven" by the counter).
+        public bool HfNoCnt;
+        /// "hfboth:p": in the DC V / DC mV rows a jack above HfBwHz makes each comparator update on
+        /// PB1 read CMPHO + CMPLO with probability p, else nothing (device 2026-10-26: the 66 kHz
+        /// square read CTSTA 0x70 and 0 in turn in DC V AUTO and DC mV; a pickup on PB1 of its own,
+        /// `hfpb1`, is replaced while the jack is above HfBwHz). INFERRED shape.
+        public double HfBoth;
         /// Continuity contact transient (opt-in, "contbump:mV", "contbumptau:ms"; owner 2026-10-26:
         /// the probes touched together in continuity raised A-JACK for ~1.5 s, A jack empty): every
         /// change of the V-COM resistor while the continuity / diode row runs puts contbump mV x
@@ -829,6 +870,91 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private float CalGain(int off) => CalConsistent ? Cal[off / 4] : 1f;
         private float CalOffs(int off) => CalConsistent ? Cal[off / 4] : 0f;
 
+        // ------------------------------------------------------------ bit pattern
+        /// A bit pattern on V-COM for the AD2 stream (serial decoding in the Wave
+        /// view, emu/decodetest.py): a watched file, first line "<bit s> <V low>
+        /// <V high> <repeat s>", then '0' / '1' per bit (others ignored); after the
+        /// last bit the line keeps its level, repeat > 0 starts it again. The AD2
+        /// sample is the source's DC node scaled by the bit's volts / max(|V low|,
+        /// |V high|) (set `vsrc:` to that maximum), averaged over the two AD2
+        /// periods before the sample with triangle weights: a sinc^2-like
+        /// decimation filter (the HY3131's AD2 filter shape is INFERRED, not
+        /// measured). AD1 and the other paths keep the plain source. Rewriting the
+        /// file (new mtime, checked every 50 ms of the model's time) loads the new
+        /// pattern from that moment.
+        public void SetBitsFile(string path)
+        {
+            bitPath = path;
+            bitMtime = DateTime.MinValue;
+            bitCheckT = double.NegativeInfinity;
+            LoadBits(lastUpdate);
+        }
+
+        private void LoadBits(double now)
+        {
+            bitCheckT = now;
+            DateTime m;
+            string txt;
+            try
+            {
+                m = System.IO.File.GetLastWriteTimeUtc(bitPath);
+                if(m == bitMtime) return;
+                txt = System.IO.File.ReadAllText(bitPath);
+            }
+            catch(Exception)
+            {
+                return;
+            }
+            var nl = txt.IndexOf('\n');
+            if(nl < 0) return;
+            var h = txt.Substring(0, nl).Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if(h.Length < 4) return;
+            var b = new List<bool>(txt.Length);
+            for(var i = nl + 1; i < txt.Length; i++)
+            {
+                if(txt[i] == '0' || txt[i] == '1') b.Add(txt[i] == '1');
+            }
+            bitMtime = m;
+            bits = b.ToArray();
+            bitSec = double.Parse(h[0], CultureInfo.InvariantCulture);
+            bitLo = double.Parse(h[1], CultureInfo.InvariantCulture);
+            bitHi = double.Parse(h[2], CultureInfo.InvariantCulture);
+            bitRepeat = double.Parse(h[3], CultureInfo.InvariantCulture);
+            bitT0 = now;
+        }
+
+        private double BitVolts(double t)
+        {
+            if(bits.Length == 0) return bitHi;
+            var dt = t - bitT0;
+            if(dt < 0) return bits[0] ? bitHi : bitLo;
+            if(bitRepeat > 0) dt %= bitRepeat;
+            var i = (long)(dt / bitSec);
+            return (i < bits.Length ? bits[i] : bits[bits.Length - 1]) ? bitHi : bitLo;
+        }
+
+        /// The pattern's share of the source node at an AD2 sample (filtered).
+        private double BitShare(double t)
+        {
+            if(t - bitCheckT > 0.05) LoadBits(t);
+            var p = Ad2Period;
+            double s = 0, w = 0;
+            for(var k = 0; k < 16; k++)
+            {
+                var x = (k + 0.5) / 16.0; // 0..1 over two periods
+                var wt = 1.0 - Math.Abs(x - 0.5) * 2.0;
+                s += wt * BitVolts(t - x * 2 * p);
+                w += wt;
+            }
+            var full = Math.Max(Math.Abs(bitLo), Math.Abs(bitHi));
+            return full > 0 ? s / w / full : 0;
+        }
+
+        private string bitPath;
+        private DateTime bitMtime;
+        private double bitCheckT = double.NegativeInfinity, bitSec = 1e-3, bitLo, bitHi = 1, bitRepeat, bitT0;
+        private bool[] bits = new bool[0];
+
         // ------------------------------------------------------------ input spec
         /// Connection spec (Dm40Frontend.Apply): what is on the jacks, plus the model options
         /// noise:, cal:, beat:. The old per-function keys (dcv:, acv:, dca:, ohm:, cap:, temp: ...)
@@ -850,7 +976,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case "swtr": SwTrMv = o.Value; break;
                 case "mvclamp": MvClampV = o.Value; break;
                 case "mvpb1": MvPb1Mv = o.Value; break;
+                case "hfbw": HfBwHz = o.Value; break;
+                case "hfdc": HfDcK = o.Value; break;
+                case "hfpb1": HfPb1Mv = o.Value; break;
+                case "hfpb2": HfPb2Mv = o.Value; break;
+                case "hfnocnt": HfNoCnt = o.Value != 0; break;
+                case "hfboth": HfBoth = o.Value; break;
                 case "contbump": ContBumpMv = o.Value; break;
+                case "pb1cmp70": Pb1Cmp70 = o.Value != 0; break;
+                case "hzpb1": HzPb1Mv = o.Value; break;
+                case "ailift": AiLiftK = o.Value; break;
+                case "ainz": AiNzMv = o.Value; break;
+                case "ainzhz": AiNzHz = o.Value; break;
                 case "contbumptau": ContBumpTau = o.Value; break;
                 case "ohmrevol": OhmRevOl = o.Value != 0; break;
                 case "ohmop1k": OhmOp1K = o.Value; break;
@@ -1381,6 +1518,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             }
             case Role.AcV: case Role.AcMv: case Role.Freq: case Role.DcV: case Role.DcMv: case Role.AcA: case Role.DcA:
+                // HfNoCnt: the AC mV row's counter does not see a jack above HfBwHz
+                if(HfNoCnt && role == Role.AcMv && HfBwHz > 0 && sigHz > HfBwHz) break;
                 SignalEdges(ac, out f, out duty, CmpHighThreshold, CmpLowThreshold);
                 break;
             }
@@ -1478,6 +1617,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             double dc, ac;
             NodeDcAc(t, out dc, out ac);
+            if(bitPath != null) return (int)Math.Round(dc * BitShare(t) * Ad2Scale());
             var w = 2 * Math.PI * sigHz * t;
             var pk = Peak(ac, sigShape);
             double s;
@@ -1495,6 +1635,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             double dc, ac;
             NodeDcAc(t, out dc, out ac);
+            if(HfBwHz > 0 && (role == Role.AcV || role == Role.AcMv) && sigHz > 0) ac /= 1 + Math.Pow(sigHz / HfBwHz, 2);
             var scale = Ad2Scale();
             dcCode = dc * scale;
             var floor = 30.0 * NoiseScale;
@@ -1592,6 +1733,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 var r = roleRange;
                 Fe.VJack(1, out jdc, out jac, out hz, out shape, out duty);
+                if((AiLiftK != 0 || AiNzMv != 0) && Fe.VOpen && Fe.RelayPa == 1)
+                {
+                    // a current in A with the V jack open (AiLiftK / AiNzMv)
+                    double idc, iac, ihz, iduty; string ish;
+                    Fe.ACurrent(out idc, out iac, out ihz, out ish, out iduty);
+                    if(idc != 0 || iac != 0)
+                    {
+                        jdc = AiLiftK * idc * Fe.ShuntR;
+                        jac = AiNzMv * 1e-3; hz = AiNzHz; shape = "sine";
+                    }
+                }
                 sigHz = hz; sigShape = shape; sigDuty = duty;
                 if(!double.IsNaN(Fe.MvHoldFor(true))) { jdc = Fe.MvHoldFor(true); jac = 0; }
                 if(MvClampV > 0) MvClamp(jdc, jac, hz, shape, duty, out jdc, out jac);
@@ -1690,6 +1842,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 double vdc, vac, vhz, vduty; string vsh;
                 Fe.VJack(0, out vdc, out vac, out vhz, out vsh, out vduty);
                 var vt = Osr1 >= 2048 ? N7(vdc + Ad1Ripple(t, vac, vhz, vsh, vduty), roleRange) / AcvK[kt] : VTapVolts(t, AcvK[kt]);
+                vt += HfDc(0) / AcvK[kt];
                 vt *= 1 + Ad1AcRowGain[Math.Min(3, roleRange)] * Ad1AcRowScale;
                 code = ig * DcQ(vt * AcvK[kt], 0x04 + 4 * kt, 0x14 + 4 * kt) / AcvK[kt] / (rg * Vref) * fs;
                 if(NoiseScale > 0) code += Gauss() * 25.0 * Math.Sqrt(32768.0 / Osr1) * NoiseScale;
@@ -1762,6 +1915,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var r = roleRange;
                 Fe.VJack(1, out jdc, out jac, out hz, out shape, out duty);
                 if(!double.IsNaN(Fe.MvHoldFor(false))) jdc = Fe.MvHoldFor(false);
+                jdc += HfDc(1);
                 var q = jdc * 1000 + vNoise * 1000 * Gauss();
                 code = DcQ(q, 0x24 + 4 * r, 0x2c + 4 * r) / (1.38889 / MvDiv[r] / 8388.606);
                 code *= (ig / rowIg) / (rg / rowRg);
@@ -2141,12 +2295,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 cmpHigh = node > CmpHighThreshold;
                 cmpLow = node < CmpLowThreshold;
+                if(Pb1Cmp70 && scmpiPb1 && cmpHigh) cmpLow = true;
                 if(role == Role.Ohm && OhmBothV > 0 && scmpiPb1)
                 {
                     // a source on V-COM overdrives the comparator (OhmBothV, device 1a11eda)
                     double dc, ac, hz, duty; string shape;
                     Fe.VJack(Fe.RelayPa, out dc, out ac, out hz, out shape, out duty);
                     if(Fe.RelayPa == 1 && Math.Abs(Wave(now, dc, ac, hz, shape, duty)) >= OhmBothV) cmpHigh = cmpLow = true;
+                }
+                if(HfBoth > 0 && scmpiPb1 && (role == Role.DcV || role == Role.DcMv) && HfBwHz > 0)
+                {
+                    // a jack above HfBwHz overdrives the comparator on PB1 now and then (HfBoth)
+                    double dc, ac, hz, duty; string shape;
+                    Fe.VJack(role == Role.DcMv ? 1 : 0, out dc, out ac, out hz, out shape, out duty);
+                    if(hz > HfBwHz && ac > 0)
+                    {
+                        var both = faultRng.NextDouble() < HfBoth;
+                        cmpHigh = cmpLow = both;
+                    }
                 }
                 var dx = now - ohmExitT;
                 if(role == Role.DcA && dx >= 0 && dx < OhmExitBoth) cmpHigh = cmpLow = true;
@@ -2280,6 +2446,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var j = Wave(t, dc, ac, hz, shape, duty);
                 v += MvPb1Mv * 1e-3 * (j - Math.Max(-MvClampV, Math.Min(MvClampV, j)));
             }
+            if(HfPb1Mv != 0 && (role == Role.AcMv || role == Role.DcMv)) v += HfPickup(t, HfPb1Mv);
+            if(HzPb1Mv != 0 && role == Role.Freq) v += HzPb1Mv * 1e-3;
             // the floating mV input's PB1 pickup after a source went off (Fe.MvHoldPb1Mv)
             if(Fe.MvHeld && Fe.MvHoldPb1Mv != 0 && (role == Role.AcMv || role == Role.DcMv)) v += Fe.MvHoldPb1Mv * 1e-3;
             return v;
@@ -2308,7 +2476,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             double dc, ac, hz, duty; string shape;
             Fe.ACurrent(out dc, out ac, out hz, out shape, out duty);
-            return Wave(t, dc, ac, hz, shape, duty) * Dm40Frontend.ShuntOhm[0];
+            var v = Wave(t, dc, ac, hz, shape, duty) * Dm40Frontend.ShuntOhm[0];
+            if(HfPb2Mv != 0 && role == Role.DcMv) v += HfPickup(t, HfPb2Mv);
+            return v;
+        }
+
+        /// The jack's (mV path) AC part above HfBwHz, instantaneous, x mvPerV mV per V (HfPb1Mv / HfPb2Mv).
+        private double HfPickup(double t, double mvPerV)
+        {
+            double dc, ac, hz, duty; string shape;
+            Fe.VJack(1, out dc, out ac, out hz, out shape, out duty);
+            if(HfBwHz <= 0 || hz <= HfBwHz) return 0;
+            return mvPerV * 1e-3 * Wave(t, 0, ac, hz, shape, duty);
+        }
+
+        /// HfDcK x the jack's AC rms above HfBwHz (V at the jack; path 0 the V divider, 1 the mV path).
+        private double HfDc(int path)
+        {
+            if(HfDcK == 0 || HfBwHz <= 0) return 0;
+            double dc, ac, hz, duty; string shape;
+            Fe.VJack(path, out dc, out ac, out hz, out shape, out duty);
+            return hz > HfBwHz ? HfDcK * ac : 0;
         }
 
         /// SENSE in the V rows: the V jack (path 0) through a divider of ratio k, instantaneous.
@@ -2858,6 +3046,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public void SetAd1(int raw) { Core.ForcedAd1 = raw; }
         public void ClearAd1() { Core.ForcedAd1 = int.MinValue; }
         public void SetAd2(int raw) { Core.ForcedAd2 = raw; }
+        /// A bit pattern on V-COM for the AD2 stream (Hy3131Core.SetBitsFile).
+        public void SetBitsFile(string path) { Core.SetBitsFile(path); }
         /// DC voltage on the V / COM input (kept for the older scripts).
         public void SetVin(double volts) { Core.ForcedAd1 = int.MinValue; Core.SetInput("vsrc:" + volts.ToString(CultureInfo.InvariantCulture)); }
         /// Input spec, see Hy3131Core.SetInput.

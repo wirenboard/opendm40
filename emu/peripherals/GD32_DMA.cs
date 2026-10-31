@@ -3,7 +3,7 @@
 // every rising edge on request input N moves ONE data unit on stream N
 // (peripheral-to-memory or memory-to-peripheral), memory-to-memory streams
 // transfer everything when enabled. NDTR counts down and reads back, HTIF/TCIF
-// are raised, circular streams reload. This replaces Renode's STM32DMA for the
+// are raised (TCIF also when software clears EN), circular streams reload. This replaces Renode's STM32DMA for the
 // DM40 because the stock firmware enables its I2C TX channel before the
 // address phase (STM32DMA would push the data at once), the stock scope and
 // opendm40's BT UART use circular streams, and the scope feeder needs to drive
@@ -188,7 +188,13 @@ namespace Antmicro.Renode.Peripherals.DMA
                         }
                         else if(!en && wasEnabled)
                         {
+                            // A stream disabled by software mid-transfer
+                            // raises its transfer-complete flag (RM0090
+                            // "DMA transfer suspension"; the DM40's GD32F4
+                            // does too: a scope ring stopped mid-lap reads
+                            // TCIF4 set, device 2026-10-26).
                             enabled = false;
+                            flags |= TCIF;
                         }
                         parent.UpdateInterrupts();
                     }

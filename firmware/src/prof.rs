@@ -74,7 +74,8 @@ pub const LABEL: usize = 14;
 /// Scope graph paint in a pass without a new frame (App::sp_tick: the
 /// budgeted trace flush continuing, badges).
 pub const PAINT: usize = 15;
-/// Spare id for ad-hoc experiments.
+/// Spare id for ad-hoc experiments. The protocol decoder (app_decode.rs)
+/// uses it for one pass's slice of a record decode.
 pub const X2: usize = 16;
 // DMM page sections (hooks in app.rs; nested inside DMM / TICK).
 /// DmmView::reading (main digits, +1 digit, aux rows, labels).
@@ -87,11 +88,14 @@ pub const DCHART: usize = 18;
 pub const FFT: usize = 19;
 /// DMM page fast bargraph (UF-30, bargraph.rs update in App::reading).
 pub const DBAR: usize = 20;
-pub const N: usize = 21;
+/// The protocol decoder: one record's whole decode (the sum of its X2
+/// slices, `add`).
+pub const DJOB: usize = 21;
+pub const N: usize = 22;
 
 const NAMES: [&str; N] = [
     "usb", "scpi", "csv", "tick", "touch", "gesture", "scope", "bt", "dmm", "s.acq", "s.frame", "s.meas", "s.mtxt",
-    "s.status", "s.labels", "s.paint", "x2", "d.read", "d.chart", "s.fft", "d.bar",
+    "s.status", "s.labels", "s.paint", "x2", "d.read", "d.chart", "s.fft", "d.bar", "dec.job",
 ];
 
 #[derive(Clone, Copy)]
@@ -245,6 +249,14 @@ pub fn exit(id: usize) {
     let p = p();
     let d = cyc().wrapping_sub(p.t0[id]);
     p.sec[id].add(us(d));
+}
+
+/// A time measured elsewhere (cycles) counted as one call of section `id`.
+pub fn add(id: usize, cycles: u32) {
+    if !ON {
+        return;
+    }
+    p().sec[id].add(us(cycles));
 }
 
 /// Back-to-back sections: section `id` ran from the previous `lap` (or the

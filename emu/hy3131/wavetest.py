@@ -420,7 +420,7 @@ try:
         before = set(cat_names())
         q('DBG:KEY 3')  # MF
         wait_ms(800)
-        q('DBG:TAP 367,40')  # Settings
+        q('DBG:TAP 294,40')  # Settings (the 4th of five 80 px MF tabs)
         wait_ms(800)
         q('DBG:TAP 154,93')  # Save CSV
         new = []
@@ -681,7 +681,7 @@ try:
     c_reset()
     q('DBG:KEY 3')  # MF
     wait_ms(800)
-    q('DBG:TAP 367,40')  # Settings
+    q('DBG:TAP 294,40')  # Settings (the 4th of five 80 px MF tabs)
     wait_ms(800)
     shot('w08b-mf-settings')
     q('DBG:TAP 154,93')  # Save CSV

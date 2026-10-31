@@ -5,6 +5,8 @@
 //! 1-2-5 steps). Needs no hardware.
 //!   tools/fft-test/run.sh
 #[allow(dead_code)]
+#[path = "../../src/pack10.rs"]
+mod pack10;
 #[path = "../../src/fft.rs"]
 mod fft;
 

@@ -152,12 +152,12 @@ The commands (`WAV:POIN`, `WAV:FORM`, `WAV:PRE?`, `WAV:DATA?`, `DIG`,
 Bluetooth ([`src/scope_wav.rs`](../src/scope_wav.rs); the scope settings are
 the meter's, shared by both transports and the screen):
 [scpi-reference.md, Scope](../../docs/manual/scpi-reference.md#scope). The
-record is `scope::CAP` = 26 624 samples. What differs per transport:
+record is up to 65 520 samples (43 008 above 25 kS/s; [ram-budget.md, The scope record](ram-budget.md#the-scope-record-raw-ring-and-coded-ring)). What differs per transport:
 
 Reading a record: `STOP` (or `SINGle` / `DIGitize` and poll `TRIG:STAT?`
 for `STOP`), `WAV:POIN MAX`, `WAV:FORM WORD`, `WAV:PRE?`, `WAV:DATA?`.
 Over USBTMC a reply longer than the 6 KiB response buffer (the full WORD
-record is `#553248` + 53 248 bytes) is streamed from the scope buffer as
+record of 65 520 samples is `#6131040` + 131 040 bytes) is streamed from the scope buffer as
 the host reads it, over as many REQUEST_DEV_DEP_MSG_IN rounds as the
 host's TransferSize needs; the main loop polls USB for it within the
 disk-READ budget per pass (2 ms, 0.5 ms while logging), so the screen and

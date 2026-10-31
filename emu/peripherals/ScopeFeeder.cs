@@ -17,6 +17,7 @@
 // firmware/src/hwtrig.rs: a rising-edge trigger captures a falling PA15) and
 // lags the crossing by about 2 us (the stock's trig_delay); both modelled.
 // SetWave(shape, hz, vpp, offset): sine | square | triangle | ramp | dc | noise.
+// SetBitsFile(path): a bit pattern from a watched file (serial decoder tests).
 //
 using System;
 using Antmicro.Renode.Core;
@@ -64,6 +65,57 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.Log(LogLevel.Info, "wave {0} {1} Hz {2} Vpp offset {3} V", shape, hz, vpp, offset);
         }
 
+        /// A bit pattern on the input (shape "bits") from a file: first line
+        /// "<bit s> <V low> <V high> <repeat s>", then '0' / '1' characters
+        /// (others ignored), each one bit long, '0' = V low, '1' = V high;
+        /// after the last bit the line stays at its level; repeat > 0 starts
+        /// the pattern again every that many seconds. The file is watched:
+        /// a rewrite (new mtime, checked every 50 ms of virtual time) loads
+        /// the new pattern from that moment, so a test can change the signal
+        /// while the emulator runs (emu/decodetest.py: UART / Modbus bits).
+        public void SetBitsFile(string path)
+        {
+            bitPath = path;
+            bitMtime = DateTime.MinValue;
+            LoadBits();
+        }
+
+        private void LoadBits()
+        {
+            DateTime m;
+            string t;
+            try
+            {
+                m = System.IO.File.GetLastWriteTimeUtc(bitPath);
+                if(m == bitMtime) return;
+                t = System.IO.File.ReadAllText(bitPath);
+            }
+            catch(Exception e)
+            {
+                this.Log(LogLevel.Warning, "bits: {0}", e.Message);
+                return;
+            }
+            var nl = t.IndexOf('\n');
+            if(nl < 0) return;
+            var h = t.Substring(0, nl).Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if(h.Length < 4) return;
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var b = new System.Collections.Generic.List<bool>(t.Length);
+            for(var i = nl + 1; i < t.Length; i++)
+            {
+                if(t[i] == '0' || t[i] == '1') b.Add(t[i] == '1');
+            }
+            bitMtime = m;
+            bits = b.ToArray();
+            bitSec = double.Parse(h[0], inv);
+            bitLo = double.Parse(h[1], inv);
+            bitHi = double.Parse(h[2], inv);
+            bitRepeat = double.Parse(h[3], inv);
+            bitT0 = Now();
+            shape = "bits";
+            this.Log(LogLevel.Info, "bits: {0} bits of {1} s from {2} s, {3} / {4} V, repeat {5} s", bits.Length, bitSec, bitT0, bitLo, bitHi, bitRepeat);
+        }
+
         public bool Comparator { get; set; } = true;
         public int Hysteresis { get; set; } = 2;
         /// Comparator output polarity: true = PA15 high while signal < level (the board).
@@ -81,6 +133,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             try
             {
+                if(bitPath != null && ++bitCheck * tickUs >= 50000)
+                {
+                    bitCheck = 0;
+                    CatchUp();
+                    LoadBits();
+                }
                 Step();
             }
             catch(Exception e)
@@ -180,6 +238,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private double Volts(double t)
         {
+            if(shape == "bits")
+            {
+                if(bits.Length == 0) return bitHi;
+                var dt = t - bitT0;
+                if(dt < 0) return bits[0] ? bitHi : bitLo;
+                if(bitRepeat > 0) dt %= bitRepeat;
+                var i = (long)(dt / bitSec);
+                var b = i < bits.Length ? bits[i] : bits[bits.Length - 1];
+                return b ? bitHi : bitLo;
+            }
             var ph = (t * hz) % 1.0;
             if(ph < 0) ph += 1.0;
             double x;
@@ -248,5 +316,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool lastAbove;
         private ushort[] block = new ushort[4096];
         private ulong lastGen, fedBase, fed, scanned;
+        private bool[] bits = new bool[0];
+        private double bitSec = 1e-3, bitLo, bitHi = 3.3, bitRepeat, bitT0;
+        private string bitPath;
+        private DateTime bitMtime;
+        private ulong bitCheck;
     }
 }

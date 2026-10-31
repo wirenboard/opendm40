@@ -34,6 +34,12 @@
 mod host;
 pub use host::mmio;
 
+#[path = "../../src/pack10.rs"]
+mod pack10;
+#[path = "../../src/cring.rs"]
+mod cring;
+#[path = "../../src/dlog.rs"]
+mod dlog;
 #[path = "../../src/ident.rs"]
 mod ident;
 #[path = "../../src/bargraph.rs"]
@@ -78,6 +84,9 @@ mod trigsoft;
 #[path = "../../src/scope_ui.rs"]
 mod scope_ui;
 mod scope_add;
+#[path = "../../src/decode.rs"]
+mod decode;
+mod decode_ui;
 mod readme;
 mod manual;
 mod stock;
@@ -1202,6 +1211,16 @@ fn main() {
     if std::env::args().nth(2).as_deref() == Some("--manual") {
         std::process::exit(if manual::run(&out) == 0 { 0 } else { 1 });
     }
+    // `main <out> --decode`: only the decoder view's scenes (decode_ui.rs).
+    if std::env::args().nth(2).as_deref() == Some("--decode") {
+        let mut ck = Checker { cases: 0, violations: 0, seen: Default::default() };
+        decode_ui::run(&mut ck, &out);
+        for (msg, (n, scene)) in &ck.seen {
+            println!("{n:6} x  {msg}   [first: {scene}]");
+        }
+        println!("cases {}, violations {}", ck.cases, ck.violations);
+        std::process::exit(if ck.violations == 0 { 0 } else { 1 });
+    }
     if std::env::args().nth(2).as_deref() == Some("--stock") {
         let dir = std::env::args().nth(3).unwrap_or_else(|| out.clone());
         std::fs::create_dir_all(&dir).unwrap();
@@ -1541,6 +1560,8 @@ fn main() {
 
     // 0c. opendm40 additions on the replica page (FFT boxes / peak, ...).
     scope_add::run(&mut ck, &out);
+    // 0d. The protocol decoder view (ui_decode.rs).
+    decode_ui::run(&mut ck, &out);
 
     // 0b. Combined view in the stock language (scope_ui meter strip, port
     // plan S7): every strip case x hold x verdict x REL x HV x REC x GEN,

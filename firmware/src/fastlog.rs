@@ -475,6 +475,16 @@ pub fn plan_bytes(dur_s: u32, hz: u32, ad2: bool) -> u32 {
     (dur_s as u64 * hz as u64 * bps as u64 + HDR_ALLOW as u64).min(u32::MAX as u64 - 1) as u32
 }
 
+/// `JOB0` as a region C template (`.rodata.cold_tpl`, link-native.x):
+/// its readers (`begin`) are region C code; a const copied there was an
+/// anonymous Job image in region B.
+#[repr(transparent)]
+struct JobTpl(Job);
+// SAFETY: read-only plain data.
+unsafe impl Sync for JobTpl {}
+#[cfg_attr(target_os = "none", link_section = ".rodata.cold_tpl")]
+static JOB0_C: JobTpl = JobTpl(JOB0);
+
 /// Start a session (main.rs, LOG:STATe ON with LOG:DEST DISK or the Record
 /// page): `bytes` = `plan_bytes` (the free space bounds it), `dur_s` = the
 /// recording length in device time (0 = until stopped / full). Err: why
@@ -487,7 +497,8 @@ pub fn begin(bytes: u32, dur_s: u32) -> Result<(), &'static str> {
         return Err("Mass storage busy");
     }
     let j = job();
-    *j = JOB0;
+    // SAFETY: plain data, no Drop.
+    unsafe { core::ptr::copy_nonoverlapping(&JOB0_C.0, j, 1) };
     // LOG:DISK? tpp: this session's probe, 0 / 0 = none (`set_probe`), not
     // a previous session's.
     TPP.store(0, core::sync::atomic::Ordering::Relaxed);

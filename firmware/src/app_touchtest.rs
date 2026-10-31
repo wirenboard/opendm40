@@ -119,6 +119,16 @@ const FL_TAP: u8 = 4;
 const FL_RAW: u8 = 8;
 const FL_CNT: u8 = 16;
 
+/// `TT0` as a region C template (`.rodata.cold_tpl`, link-native.x):
+/// its readers (`tt_open`) are region C code; a const copied there was an
+/// anonymous Tt image in region B.
+#[repr(transparent)]
+struct TtTpl(Tt);
+// SAFETY: read-only plain data.
+unsafe impl Sync for TtTpl {}
+#[cfg_attr(target_os = "none", link_section = ".rodata.cold_tpl")]
+static TT0_C: TtTpl = TtTpl(TT0);
+
 const TT0: Tt = Tt {
     cur: 0,
     frames: 0,
@@ -174,7 +184,9 @@ impl App {
             self.toast(clk.now_ms(), t, false);
             return false;
         }
-        *st() = Tt { cur: touch::log_count(), ..TT0 };
+        // SAFETY: plain data, no Drop.
+        unsafe { core::ptr::copy_nonoverlapping(&TT0_C.0, st(), 1) };
+        st().cur = touch::log_count();
         self.show(View::TouchTest, clk);
         true
     }

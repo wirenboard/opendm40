@@ -12,6 +12,8 @@
 // Writes the DLG + reference CSV of every set to $1 (if given) for tools/dlog.py.
 #![allow(dead_code)]
 
+#[path = "../../src/pack10.rs"]
+mod pack10;
 #[path = "../../src/dlog.rs"]
 mod dlog;
 #[path = "../../src/fastenc.rs"]
