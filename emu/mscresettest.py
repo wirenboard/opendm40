@@ -62,6 +62,7 @@ if A.port is None:
 print('USB/IP port %d' % A.port, flush=True)
 os.environ['USBIP_PORT'] = str(A.port)
 import usbip_client as uc  # noqa: E402
+import bootinfo  # noqa: E402
 
 SERIAL = run.emu_uid(A.port).hex().upper()
 
@@ -291,7 +292,8 @@ try:
         up = l.q('DBG:PING?')
         print('  DBG:PING? %s' % up, flush=True)
     b = l.q('DBG:BOOT?')
-    check(',NONE,' in b.split(',WDT')[0] or 'NONE' == b.split(',')[3], 'no watchdog reset (DBG:BOOT? reason %s)' % b.split(',')[3])
+    reason = bootinfo.fields(b).get('reason')
+    check(reason == 'NONE', 'no watchdog reset (DBG:BOOT? reason %s)' % reason)
 except Exception as e:
     check(False, 'the meter answers: %r' % e)
 finally:

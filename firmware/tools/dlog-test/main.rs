@@ -315,7 +315,7 @@ fn set(i: usize, n: usize) -> (&'static str, &'static [u8], Rows) {
     }
 }
 
-const HDR: &[u8] = b"# Alientek DM40A, opendm40 0.0.1, function DC V, range AUTO, started uptime 12.345 s\r\n# time_s = seconds since the start of this recording (no real-time clock); empty value = overload\r\ntime_s,value,unit,flags\r\n";
+const HDR: &[u8] = b"# Alientek DM40A, opendm40 0.0.1, function DC V, range AUTO, started uptime 12.345 s\r\n# time_s = seconds since the start of this recording (no real-time clock); empty value = overflow\r\ntime_s,value,unit,flags\r\n";
 
 /// Reference CSV (old writer), and the CSV offset after each row.
 fn reference(rows: &Rows, unit: &[u8]) -> (Vec<u8>, Vec<usize>) {

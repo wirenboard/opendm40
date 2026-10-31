@@ -41,7 +41,7 @@ OL = 9.9e37
 # READ? x it, expected DISP:BURD?, screenshot name). The source steps at virtual
 # time t; the phase starts at that step's input marker (emu/emusync.py, README "Input
 # markers": the fw uptime of the change; 2.85 s behind t with a fresh disk), its SCPI
-# goes out 0.5 s after, and it is checked from its start + 5 s (settle, autorange) to
+# goes out 0.5 s after, and it is checked from its start + 5 s (SETTLE: settle, autorange) to
 # the next phase's start - 1 s. (It was keyed on uptime t with a guessed lag of ~2 s:
 # the window's end caught the next phase's source.)
 PHASES = [
@@ -61,6 +61,10 @@ PHASES = [
     (106, 'open;vsrc:1', ['CONF:VOLT:DC'], 'OL', '0', None),
 ]
 RUN_FOR = 118
+# Settle per phase where 5 s is not enough (phase time t -> s): in AUTO coupling,
+# FETC:BURD? is +9.9E37 until the AC / DC decision, 4.5-6 s after CURR:COUP AUTO
+# in the emulator (issue #154: one run in two failed at +5 s).
+SETTLE = {90: 8.0}
 
 
 def main():
@@ -117,7 +121,7 @@ def main():
     for i, (t, _, _, want, disp, _) in enumerate(PHASES):
         if tl.start(i) is None or tl.stop(i) is None:
             continue  # a marker is missing: check_sync failed the run
-        t0 = tl.start(i) + 5.0
+        t0 = tl.start(i) + SETTLE.get(t, 5.0)
         t1 = tl.stop(i) - 1.0
         seen = [r for r in rows if t0 <= r['t'] <= t1]
         if not seen:

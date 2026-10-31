@@ -51,7 +51,8 @@
 
 #![cfg_attr(not(target_os = "none"), allow(dead_code))]
 
-use crate::calbackup::{chain_of, crc32, scratch, write_file, Source};
+use crate::calbackup::{chain_of, crc32, write_file, Source};
+use crate::diskbuf::blocks;
 use crate::msc::BlockDevice;
 use crate::persist::{self, Record, WORDS};
 
@@ -280,7 +281,7 @@ fn locate(dev: &mut dyn BlockDevice) -> Option<bool> {
 /// Read every slot's header (sequence, newest record's version / CRC).
 fn scan(dev: &mut dyn BlockDevice) {
     let s = st();
-    let [b, _, _] = scratch();
+    let [b, _, _] = blocks();
     s.saved = (0, 0);
     for k in 0..SLOTS {
         s.seq[k] = None;
@@ -344,7 +345,7 @@ pub fn pick(bkp: Option<Record>) -> Option<Record> {
     if file_first {
         let k = top.unwrap_or(0);
         let mut dev = new_dev();
-        let [b, _, _] = scratch();
+        let [b, _, _] = blocks();
         if dev.read_block(s.lba[k], b) {
             if let Some((r, q)) = record(&b[..]) {
                 s.from = From::File as u8;
@@ -411,6 +412,9 @@ impl BlockDevice for HostDev {
     fn write_block(&mut self, lba: u32, buf: &[u8]) -> bool {
         self.d().write_block(lba, buf)
     }
+    fn write_step(&mut self, lba: u32, buf: &dyn crate::wordram::BlockSrc, st: &mut crate::msc::Step) -> Option<bool> {
+        self.d().write_step(lba, buf, st)
+    }
 }
 
 /// Host test: the device `pick` / `poll` / `flush` use.
@@ -421,7 +425,7 @@ pub static mut HOST_DEV: Option<&'static mut dyn BlockDevice> = None;
 pub static HOST_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Write the backup SRAM record into the slot after the newest, sequence
-/// + 1, read back. Uses calbackup's scratch blocks 0 and 1.
+/// + 1, read back. Uses diskbuf blocks 0 and 1.
 #[inline(never)]
 fn write_slot(dev: &mut dyn BlockDevice) -> Save {
     let s = st();
@@ -436,7 +440,7 @@ fn write_slot(dev: &mut dyn BlockDevice) -> Save {
     }
     let seq = seq.wrapping_add(1);
     let k = top.map_or(0, |t| (t + 1) % SLOTS);
-    let [b, rb, _] = scratch();
+    let [b, rb, _] = blocks();
     encode(&mut b[..], version, seq, n, persist::word);
     // The copy must be the record the CRC belongs to (a save torn by a
     // reset cannot be: App::persist writes it in one go; checked anyway).
@@ -469,7 +473,7 @@ fn save_now() {
     s.save = r as u8;
 }
 
-/// The disk is held by another writer (calbackup's scratch arena included).
+/// The disk is held by another writer (the diskbuf arena included).
 #[cfg(target_os = "none")]
 #[inline(always)]
 fn disk_busy() -> bool {

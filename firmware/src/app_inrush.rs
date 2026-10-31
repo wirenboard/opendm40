@@ -623,7 +623,7 @@ impl App {
             }
             I::Thr(Some(a)) => {
                 if !(inr::THR_MIN..=inr::THR_MAX).contains(&a) {
-                    return Err("Illegal parameter value");
+                    return Err("Data out of range");
                 }
                 s.thr = a;
                 if matches!(s.cap.phase, Phase::Arming | Phase::Armed) {

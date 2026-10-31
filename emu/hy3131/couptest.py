@@ -11,6 +11,9 @@ every phase must match its expectation.
   emu/hy3131/couptest.py --list
   emu/hy3131/couptest.py --meth C v i        # on AC+DC method B / C (acdcm.rs)
 
+--meth needs an image built with `--features acdc-meth` (Cargo.toml; the
+default build refuses DBG:ACDC:METH / STAT?): pass it with --app.
+
 Results: emu/out/coup-<name>.json (+ .png of the end); the Renode log of that
 run: emu/out/coup-<name>-<port>-<pid>.log (capped by DM40_EMU_LOG_MAX_MB).
 One emulator per port; a busy port is refused.
@@ -32,7 +35,7 @@ ap.add_argument('names', nargs='*')
 ap.add_argument('--app', help='opendm40 native image (default: run.py builds HEAD)')
 ap.add_argument('--port', type=int, default=3391, help='USB/IP port (default 3391)')
 ap.add_argument('--list', action='store_true')
-ap.add_argument('--meth', choices='ABC', help='AC+DC method first (DBG:ACDC:METH, opendm40 acdcm.rs; default: the firmware\'s, A)')
+ap.add_argument('--meth', choices='ABC', help='AC+DC method first (DBG:ACDC:METH, opendm40 acdcm.rs; needs an acdc-meth build; default: the firmware\'s, A)')
 A = ap.parse_args()
 os.environ['USBIP_PORT'] = str(A.port)
 sys.path.insert(0, EMU)
@@ -189,7 +192,8 @@ SC = {
         (32, None, tie(4.776, 0.01), 're-enter on the square'),
     ], {16: 'VOLT:COUP DC', 17: 'VOLT:COUP AUTO', 32: 'VOLT:COUP DC', 33: 'VOLT:COUP AUTO'}),
 }
-EXTRA = {'tap': ['CURR:COUP?'], 'sqtie': ['DBG:ACDC:STAT?'], 'iac': ['SYST:ALER?', 'CONF?'], 'idc': ['SYST:ALER?', 'CONF?'], 'vac230': ['CONF?'], 'iacfill': ['SYST:ALER?', 'CONF?']}
+# DBG:ACDC:STAT? (the method's state, failure context only) exists in acdc-meth builds only.
+EXTRA = {'tap': ['CURR:COUP?'], 'sqtie': ['DBG:ACDC:STAT?'] if A.meth else [], 'iac': ['SYST:ALER?', 'CONF?'], 'idc': ['SYST:ALER?', 'CONF?'], 'vac230': ['CONF?'], 'iacfill': ['SYST:ALER?', 'CONF?']}
 
 
 def conf_range(d):
@@ -269,6 +273,14 @@ def run(name):
         try:
             for c in setup:
                 tm.write(c)
+            if A.meth:
+                tm.write('SYST:ERR?')
+                err = tm.read(timeout=60).decode(errors='replace').strip()
+                if err.startswith('-113'):
+                    print('RESULT %s FAIL --meth needs an image built with --features acdc-meth (%s)' % (name, err), flush=True)
+                    p.kill()
+                    p.communicate()
+                    return False
             # The actions in fw uptime, at their distance from their phase's start
             # (predicted by the clock marker; the same as the input marker will say).
             if mk.wait_clock() is None:

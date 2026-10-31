@@ -15,7 +15,7 @@
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
 SUITES="accuracy-test bargraph-test bt-scpi-test dbgsrc-test dlog-test fft-test gen-test
-logfmt-test meter-test scpi-test scpi-msg-test sinc-test touch-test trig-test
+logfmt-test meter-test scpi-test scpi-msg-test sinc-test ch2-test touch-test trig-test
 ui-render gallery-test fatren-test font-matrix stock-ui"
 # Start order: the long ones first (seconds on a GitHub runner, 2026-10-25:
 # ui-render 275, fatren-test 231, dlog-test 52, font-matrix 33, the rest < 10).

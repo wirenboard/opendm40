@@ -25,8 +25,8 @@ mod plan;
 
 #[allow(unused_imports)]
 pub use plan::{
-    clamp_freq, compute, limits, target_hz, Limits, Out, Path, Settings, Timing, Wave, AMP_MAX, AMP_MIN, F_MAX,
-    F_MIN, N_MAX, SQUARE_DAC_MAX, V_FS,
+    clamp_freq, compute, limits, loop_ticks, wrap, target_hz, Limits, Out, Path, Settings, Shape, Sync, Timing, Wave, AMP_MAX,
+    AMP_MIN, F_MAX, F_MIN, N_MAX, SQUARE_DAC_MAX, V_FS,
 };
 
 use crate::mmio::{modify32, r32, w32};
@@ -60,7 +60,128 @@ pub struct Gen {
     out_hz: f32,
 }
 
+/// The output running now (timing, shape), for the scope's GEN channel
+/// (`now`); None while off. Main loop only.
+static mut RUNNING: Option<(Timing, Shape)> = None;
+
+/// The running output's timing and shape (None: off).
+pub fn running() -> Option<(Timing, Shape)> {
+    unsafe { *core::ptr::addr_of!(RUNNING) }
+}
+
+/// Count of output (re)starts and stops: a scope record whose generator
+/// reading is of another epoch has no GEN phase (the output restarted).
+static mut EPOCH: u32 = 0;
+
+pub fn epoch() -> u32 {
+    unsafe { *core::ptr::addr_of!(EPOCH) }
+}
+
+const TIM6_CNT: u32 = TIM6 + 0x24;
+const TIM12_CNT: u32 = TIM12 + 0x24;
+const DWT_CYCCNT: u32 = 0xE000_1004;
+
+/// Where the running output is now (docs/scope-gen-channel.md): its time,
+/// ticks of the 200 MHz timer clock into its table loop (`loop_ticks`:
+/// 0 = the start of table sample 0 / PWM count 0; always below the loop
+/// length), and the DWT cycle count (= the same 200 MHz) at that instant.
+/// None while off, or when no try gave consistent reads (an interrupt
+/// between them, a DMA update in flight).
+///
+/// DAC: the DMA has moved (L - NDTR) samples into DHR; the DAC output (DOR)
+/// holds the one before the last moved (each TIM6 update copies DHR to DOR,
+/// then requests the next sample), so it is table sample L - NDTR - 2 since
+/// the update TIM6 CNT counts from. PWM: TIM12 CNT is the phase itself.
+///
+/// The reads are timed by the DWT reads around them (`reads`); nothing
+/// else runs between those (a u64 division in that window made every try
+/// fail on the device: the DAC path had no GEN phase, PR #64 device check).
+/// The first consistent try whose window is under `WIN_MAX` cycles is
+/// taken (a later one would put the instant further from the caller's next
+/// DWT read: Scope::start allows 400 cycles).
+pub fn now() -> Option<(u64, u32)> {
+    const TRIES: u32 = 16;
+    const WIN_MAX: u32 = 128;
+    let (t, _) = running()?;
+    let ps = t.psc as u64 + 1;
+    let dac = t.path == Path::Dac;
+    let mut wmin = u32::MAX;
+    for _ in 0..TRIES {
+        let (d0, n, c, n2, d1) = reads(dac);
+        let w = d1.wrapping_sub(d0);
+        wmin = wmin.min(w);
+        // DAC: no DMA move between the two NDTR reads, and not right after
+        // an update (the DMA may not have moved yet).
+        if w >= WIN_MAX || (dac && (n != n2 || (c as u64 * ps) < 8)) {
+            continue;
+        }
+        stat(true, w);
+        let g = if dac {
+            let l = t.len as u32;
+            let idx = (3 * l - (n % (l + 1)) - 2) % l;
+            idx as u64 * t.div() + c as u64 * ps
+        } else {
+            c as u64 * ps
+        };
+        return Some((g, d0.wrapping_add(w / 2)));
+    }
+    stat(false, wmin);
+    None
+}
+
+/// One try's bus reads, DWT first and last and nothing between them but
+/// the loads (no arithmetic: the window times the reads): (DWT, NDTR, CNT,
+/// NDTR, DWT). PWM: (DWT, 0, TIM12 CNT, 0, DWT).
+#[inline(never)]
+fn reads(dac: bool) -> (u32, u32, u32, u32, u32) {
+    // SAFETY: plain register reads (DWT, DMA0 stream 5, TIM6 / TIM12).
+    unsafe {
+        if dac {
+            let d0 = r32(DWT_CYCCNT);
+            let n1 = r32(S5 + 0x04);
+            let c = r32(TIM6_CNT);
+            let n2 = r32(S5 + 0x04);
+            let d1 = r32(DWT_CYCCNT);
+            (d0, n1 & 0xFFFF, c & 0xFFFF, n2 & 0xFFFF, d1)
+        } else {
+            let d0 = r32(DWT_CYCCNT);
+            let c = r32(TIM12_CNT);
+            let d1 = r32(DWT_CYCCNT);
+            (d0, 0, c & 0xFFFF, 0, d1)
+        }
+    }
+}
+
+/// `DBG:GENTRIG:STAT?`: phase readings taken, failed (`now` gave None),
+/// the last reading's window and the narrowest window of the last failed
+/// call (DWT cycles; u32::MAX = none).
+static mut STAT: [u32; 4] = [0, 0, 0, u32::MAX];
+
+fn stat(ok: bool, w: u32) {
+    // SAFETY: main loop only.
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(STAT);
+        if ok {
+            s[0] = s[0].wrapping_add(1);
+            s[2] = w;
+        } else {
+            s[1] = s[1].wrapping_add(1);
+            s[3] = w;
+        }
+    }
+}
+
+/// The counters `stat` keeps (see there).
+pub fn stats() -> [u32; 4] {
+    unsafe { *core::ptr::addr_of!(STAT) }
+}
+
 fn stop_outputs() {
+    // SAFETY: main loop only.
+    unsafe {
+        *core::ptr::addr_of_mut!(RUNNING) = None;
+        *core::ptr::addr_of_mut!(EPOCH) = epoch().wrapping_add(1);
+    }
     unsafe {
         // Timers off, DAC off, then DMA off: a TIM6 trigger with the DAC's
         // DMA request on and the stream off sets DMA underrun (DAC_SR
@@ -125,6 +246,8 @@ impl Gen {
             Path::Dac => self.dac(&s, &t),
         }
         self.real_hz = t.hz() as f32;
+        // SAFETY: main loop only (the scope reads it from the main loop).
+        unsafe { *core::ptr::addr_of_mut!(RUNNING) = Some((t, Shape::of(&s, &self.out))) };
     }
 
     fn pwm(&mut self, t: &Timing) {

@@ -1,6 +1,6 @@
 [package]
 name = "opendm40"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Replacement firmware for the Alientek DM40 (GD32F427)"
 
@@ -47,6 +47,44 @@ fatren-dry-run = []
 #   recovery-usb: our own minimal USB mass-storage disk (no LCD).
 recovery-file = []
 recovery-usb = []
+# DBG:HYSPI:SELF? / WR?, the HY3131 bus self-test and write experiment
+# (src/hyspi.rs; emu/hy3131/ad2streamtest.py). Off by default: ~2.3 KB of
+# region C (docs/native-boot.md "Region B audit #9"); without it the two
+# queries are refused (undefined header).
+dbg-hyspi = []
+# DBG:ACDC?, the AC+DC phase diagnostic text (Dmm::acdc_diag_text). Off by
+# default for the same reason (~0.8 KB of region C); refused without it.
+dbg-acdc = []
+# DBG:TOUCH? / DBG:TOUCH 0, the 160-entry touch log (src/touch.rs; 1.9 KB of
+# RAM). Off by default: without it the log keeps 16 entries, enough for the
+# touch test page (Settings > Touch test, read every pass), and the two
+# commands are refused (undefined header). Build with --features dbg-touch
+# for a touch session (docs/native-boot.md "SRAM audit").
+dbg-touch = []
+# DBG:PROF? / DBG:PROF:RESET, the main-loop profiler (src/prof.rs; 1 KB of
+# RAM and its hooks in every pass). Off by default: the hooks are empty and
+# the two commands are refused (undefined header).
+dbg-prof = []
+# More debug replies, each off by default (refused as an undefined header
+# without its feature; docs/native-boot.md "Region C audit #4"):
+# DBG:DIAG? (main.rs touch_diag: touch / loop / charge counters).
+dbg-diag = []
+# DBG:OHM6 / DBG:OHM6? (the 600 Mohm range's tuning, Dmm::ohm600_dbg).
+dbg-ohm6 = []
+# DBG:SENTinel? / DBG:SENTinel:REG? (Sentinel::diag_text, Dmm::reg_text).
+dbg-sent = []
+# DBG:SRC, the ohm-source map row (src/dbgsrc.rs, tools/srcmap.py).
+dbg-src = []
+# DBG:ACDC:METH / STAT / ZERO / R0, the AC+DC prototype methods B and C
+# (src/acdcm.rs; docs/acdc-approaches.md; ~6.6 KB of region B, 2.7 KB of
+# region C, 480 B of RAM). Off by default: AC+DC is method A (the stock
+# alternation, dmm.rs) only and the four commands are refused (undefined
+# header).
+acdc-meth = []
+# DBG:ACDC:TRACE, the AC+DC event trace (src/acdctr.rs; a 64-entry ring,
+# 1.8 KB of RAM). Off by default: the trace never records and the command is
+# refused (undefined header).
+acdc-trace = []
 # Test builds next to a sleeping owner: the buzzer never sounds (every beep,
 # the danger alarm and the power-off warning at duty 0; the continuity / diode
 # beeper's CMP pin buffer, HY3131 R20 bit 2, off; the boot key-hold cue

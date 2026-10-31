@@ -808,6 +808,7 @@ pub struct Frame {
 pub struct Touch {
     /// Detected controller; `poll()` dispatches on it.
     ctrl: Ctrl,
+    #[cfg_attr(not(feature = "dbg-diag"), allow(dead_code))]
     pub chip: [u8; 4],
     /// Raw first 7 bytes of the last frame (for debugging).
     pub raw: [u8; 7],
@@ -980,12 +981,16 @@ fn screen(p: Point) -> Point {
 // the gesture decisions (gesture.rs logs into it), for checking real-finger
 // taps on the device. Single-threaded (opendm40 has no ISRs).
 
-/// Entries kept (12 bytes each); ~6 taps with all their frames.
-pub const LOG_N: usize = 160;
+/// Entries kept (12 bytes each); ~6 taps with all their frames. Without
+/// the feature `dbg-touch` (no DBG:TOUCH?), 16: the touch test page reads
+/// the new entries every pass, one touch poll after they were written (a
+/// poll logs one frame and its event, plus the gesture decisions).
+pub const LOG_N: usize = if cfg!(feature = "dbg-touch") { 160 } else { 16 };
 
 #[derive(Clone, Copy)]
 struct LogEntry {
     /// ms since boot (low 32 bits).
+    #[cfg_attr(not(feature = "dbg-touch"), allow(dead_code))]
     t: u32,
     /// b'F' frame, b'E' debounced event, b'G' gesture.
     kind: u8,
@@ -1006,7 +1011,9 @@ struct Log {
     n: u32,
 }
 
-// TCM .bss (was .sram_bss; 2026-10-22 memory budget: SRAM is the tighter).
+// TCM .bss (16 entries). The full log of a `dbg-touch` build is in
+// .sram_bss: TCM has no 1.9 KB to spare for it next to the stack.
+#[cfg_attr(all(target_os = "none", feature = "dbg-touch"), link_section = ".sram_bss")]
 static mut LOG: Log = Log { e: [LogEntry { t: 0, kind: 0, a: 0, b: 0, c: 0, x: 0, y: 0 }; LOG_N], n: 0 };
 
 fn log_ref() -> &'static mut Log {
@@ -1024,12 +1031,12 @@ pub fn log(kind: u8, now: u64, a: u8, b: u8, c: u8, p: Point) {
     l.n = l.n.wrapping_add(1);
 }
 
-#[allow(dead_code)] // the DBG:TOUCH hook (main.rs)
+#[cfg(feature = "dbg-touch")] // the DBG:TOUCH hook (main.rs)
 pub fn log_clear() {
     log_ref().n = 0;
 }
 
-#[allow(dead_code)] // the DBG:TOUCH? hook (main.rs)
+#[cfg(feature = "dbg-touch")] // the DBG:TOUCH? hook (main.rs)
 /// The log as text, oldest first, into `out`; returns the length. First line
 /// `TOUCH,<now ms>,<entries since clear>,<entries shown>`, then one line per
 /// entry:
@@ -1093,12 +1100,14 @@ pub fn log_text(out: &mut [u8], now: u64) -> usize {
 }
 
 /// Bounded text writer for `log_text` (`full` once something did not fit).
+#[cfg(feature = "dbg-touch")]
 struct W<'a> {
     out: &'a mut [u8],
     n: usize,
     full: bool,
 }
 
+#[cfg(feature = "dbg-touch")]
 impl W<'_> {
     fn s(&mut self, b: &[u8]) {
         if self.n + b.len() <= self.out.len() {
@@ -1226,6 +1235,7 @@ impl Touch {
     ///  us u16, 8 max frame us u16, 10 last frame points, 11 probe mode,
     ///  12 edge reads, 16 level-fallback reads, 20 Goodix timer reads,
     ///  24 frames ok, 28 frames bad (0xAB), 32 NAKs, 36 HW faults (u32 each).
+    #[cfg_attr(not(feature = "dbg-diag"), allow(dead_code))]
     pub fn diag(&self) -> [u8; 40] {
         let s = &self.bus.stats;
         let mut d = [0u8; 40];

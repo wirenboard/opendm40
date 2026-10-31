@@ -67,7 +67,7 @@ ap.add_argument('--dmm', default='vsrc:0,ac=1.0,f=50', help='DMM jack input (emu
 ap.add_argument('--shots', help='directory for PNG screenshots')
 ap.add_argument('--mips', default='200')
 ap.add_argument('--no-region-c', action='store_true', help='without the region C hooks')
-ap.add_argument('--case', choices=['volt', 'current', 'dcv', 'fullv', 'fulla'], default='volt',
+ap.add_argument('--case', choices=['volt', 'current', 'dcv', 'fullv', 'fulla', 'csvtb'], default='volt',
                 help='current: --dmm defaults to a 10 mA DC + 40 Hz square on A-COM; the AC A row is '
                      'DC-coupled: FREQ? 40 Hz, VAVG? = the DC part, values in A. dcv: 0.2 V DC + 1 V rms '
                      '50 Hz; MF -> Wave from DC V AUTO (DC mV, the AC mV row) clips and autoranges to 6 V '
@@ -76,7 +76,10 @@ ap.add_argument('--case', choices=['volt', 'current', 'dcv', 'fullv', 'fulla'], 
                      'again at 2 ms/div: the ring never overflows at a DC V entry. fullv / fulla: a sine of '
                      '+-96.7 %% of the range (5.8 V peak on AC V 6 V, 58 mA peak on AC mA 60 mA) at the '
                      'full-scale step (1.5 V/div, 15 mA/div) fits the 8 divisions: WAV:DATA? in volts / amps '
-                     'inside the grid and across >= 90 %% of it, VPP; a screen-only V/div - and AUTO back')
+                     'inside the grid and across >= 90 %% of it, VPP; a screen-only V/div - and AUTO back. '
+                     'csvtb: STOP at 20 ms/div (4800 S/s), 2 ms/div while stopped (the stopped zoom), Save CSV: '
+                     'the CSV header names the record\'s timebase (20ms/div) with its 4.80 kS/s (device: '
+                     'SCOP006.CSV said 2ms/div)')
 A = ap.parse_args()
 if A.case == 'current' and A.dmm == ap.get_default('dmm'):
     A.dmm = 'isrc:0.010,ac=0.02,f=40,shape=square'
@@ -264,7 +267,7 @@ try:
         dc = f('READ?')
         q('DBG:KEY 3')
         wait_ms(600)
-        q('DBG:TAP 237,259')
+        q('DBG:TAP 298,259')
         wait_ms(3000)
         shot('c01-wave-current')
         check(ints(q('DBG:ISR?'))[1] == 1, 'the stream runs (A function)')
@@ -290,7 +293,7 @@ try:
         print('  DC V AUTO before: FUNC? %s READ? %s CONF? %s' % (q('FUNC?'), q('READ?'), q('CONF?')))
         q('DBG:KEY 3')
         wait_ms(600)
-        q('DBG:TAP 237,259')
+        q('DBG:TAP 298,259')
         wait_ms(6000)  # entry, the clip, the range step (a self-cal each)
         shot('d01-wave-dcv')
         e = ints(q('DBG:ISR?'))
@@ -352,7 +355,7 @@ try:
         print('  %s: CONF? %s READ? %s' % (conf, q('CONF?'), q('READ?')))
         q('DBG:KEY 3')
         wait_ms(600)
-        q('DBG:TAP 237,259')
+        q('DBG:TAP 298,259')
         wait_ms(3000)
         check(ints(q('DBG:ISR?'))[1] == 1, 'the stream runs')
         q('TIM:SCAL 0.01')
@@ -400,6 +403,47 @@ try:
         wait_ms(2500)
         check(ints(q('DBG:ISR?'))[1] == 0, 'MENU: the stream stopped')
 
+    def csvtb_case():
+        q('CONF:VOLT:AC')
+        wait_ms(4500)
+        q('DBG:KEY 3')  # MF -> the V range page -> Wave
+        wait_ms(600)
+        q('DBG:TAP 237,259')
+        wait_ms(2500)
+        q('TIM:SCAL 0.02')
+        wait_ms(3000)
+        check(ints(q('DBG:ISR?'))[1] == 1 and f('ACQ:SRAT?') < 5000, 'wave view at 20 ms/div (ACQ:SRAT? %s)' % q('ACQ:SRAT?'))
+        q('STOP')
+        wait_ms(800)
+        q('TIM:SCAL 0.002')  # stopped: the stored record zoomed, the stream restarts at 38400
+        wait_ms(2500)
+        before = set(cat_names())
+        q('DBG:KEY 3')  # MF
+        wait_ms(800)
+        q('DBG:TAP 367,40')  # Settings
+        wait_ms(800)
+        q('DBG:TAP 154,93')  # Save CSV
+        new = []
+        for _ in range(30):
+            wait_ms(1000)
+            new = sorted(n for n in set(cat_names()) - before if n.upper().startswith('SCOP') and n.upper().endswith('.DLG'))
+            if new:
+                break
+        check(bool(new), 'Save CSV wrote %s' % (new or 'nothing'))
+        if not new:
+            return
+        r = q('MMEM:DATA? "%s",0' % new[-1].replace('.DLG', '.CSV').replace('.dlg', '.csv'), raw=True)
+        nd = int(r[1:2])
+        head = r[2 + nd:2 + nd + int(r[2:2 + nd])].decode(errors='replace')
+        line = [x for x in head.split('\r\n') if x.startswith('# timebase')]
+        print('  %s' % (line[0] if line else head[:300]))
+        ok = bool(line) and line[0].startswith('# timebase 20ms/div') and 'sample rate 4.80kS/s' in line[0]
+        check(ok, 'the header names the record\'s timebase with its rate (20ms/div, 4.80kS/s)')
+        q('RUN')
+        wait_ms(1000)
+        q('DBG:KEY 0')
+        wait_ms(2500)
+
     print('*IDN?', q('*IDN?'))
     isr0 = ints(q('DBG:ISR?'))
     check(isr0[0] == 1, 'DBG:ISR? feature = 1 (an ad2-isr build)')
@@ -411,6 +455,9 @@ try:
         raise Done
     if A.case in ('fullv', 'fulla'):
         full_case(A.case == 'fulla')
+        raise Done
+    if A.case == 'csvtb':
+        csvtb_case()
         raise Done
     q('CONF:VOLT:AC')
     wait_ms(4500)
@@ -426,7 +473,7 @@ try:
     q('DBG:KEY 3')
     wait_ms(600)
     shot('w01-range-page')
-    q('DBG:TAP 237,259')
+    q('DBG:TAP 298,259')
     wait_ms(2500)
     shot('w02-wave-10ms')
     isr = ints(q('DBG:ISR?'))
@@ -447,8 +494,11 @@ try:
         if tb in (0.005, 0.05):
             shot('w03-wave-%s' % name)
 
+    # DBG:PROF? only in a build with the feature dbg-prof (else -113).
+    q('DBG:PROF?')
+    has_prof = not q('SYST:ERR?').startswith('-113')
     POLL = ['ACQ:SRAT?', 'SCOP:MEAS:FREQ?', 'SCOP:MEAS:VPP?', 'TRIG:STAT?', 'WAV:POIN?', 'WAV:FORM?',
-            'CHAN1:OFFS?', 'CHAN1:SCAL?', 'TIM:SCAL?', 'WAV:PRE?', 'WAV:DATA?', 'DBG:PROF?',
+            'CHAN1:OFFS?', 'CHAN1:SCAL?', 'TIM:SCAL?', 'WAV:PRE?', 'WAV:DATA?'] + ['DBG:PROF?'] * has_prof + [
             # fast_scpi (device c92b605: region C, late 1 at 76800), and the
             # model / identity (calibration record 0x080C0168, slow bank:
             # cached at boot).
@@ -738,7 +788,7 @@ try:
     ib = ints(q('DBG:ISR?'))
     v = q('DBG:VIEW?')
     print('  badge exit at 2 ms/div: DBG:VIEW? %s, DBG:ISR? %s' % (v, ib[:14]))
-    check(ib[1] == 0 and v.startswith('Oscilloscope') and v.endswith(',0'), 'source badge DMM -> MCX: the Wave view closed (%s)' % v)
+    check(ib[1] == 0 and v.startswith('Oscilloscope') and v.split(',')[2:3] == ['0'], 'source badge DMM -> MCX: the Wave view closed (%s)' % v)
     check(ib[13] == ia[13] and ib[4] == ia[4] and ib[9] == ia[9] and ib[8] == ia[8],
           'badge exit at 38400: no forced stop, late entry, overrun or frame timeout (forced %d -> %d, late %d -> %d)'
           % (ia[13], ib[13], ia[4], ib[4]))

@@ -6,6 +6,9 @@
 // 0x36 MADCTL, 0x3A COLMOD, 0xD3 ID read (0x009488), 0x11/0x29 and the rest
 // as no-ops with parameters. GRAM is the physical 320x480 panel; Screenshot
 // writes it rotated to the 480x320 landscape view the user sees.
+// `Trace` logs every RAM write burst (window, start / end virtual time,
+// run-length coded pixels) for emu/lcdtrace.py: the frames the panel shows
+// while a screen is drawn.
 //
 using System;
 using System.IO;
@@ -185,6 +188,79 @@ namespace Antmicro.Renode.Peripherals.Video
             if(everyFrames > 0) Directory.CreateDirectory(dir);
         }
 
+        /// Log every RAMWR burst to `path` (empty = stop). Record: "W", f64 t0,
+        /// f64 t1 (virtual s: the RAMWR command, the next command), u16 xs xe
+        /// ys ye (controller column / page window), u8 MADCTL, u32 runs, then
+        /// runs x (u32 count, u16 RGB565). emu/lcdtrace.py replays it.
+        public void Trace(string path)
+        {
+            TraceFlush();
+            traceOut?.Dispose();
+            traceOut = null;
+            if(!string.IsNullOrEmpty(path))
+            {
+                traceOut = new BinaryWriter(new BufferedStream(File.Create(path), 1 << 20));
+            }
+            this.Log(LogLevel.Info, "trace {0} at t={1}", string.IsNullOrEmpty(path) ? "off" : path, machine.ElapsedVirtualTime.TimeElapsed);
+        }
+
+        private double TraceNow()
+        {
+            if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
+            return machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds;
+        }
+
+        private void TraceFlush()
+        {
+            if(traceOut == null || !traceOpen)
+            {
+                return;
+            }
+            traceOpen = false;
+            if(traceRunVal >= 0)
+            {
+                traceRuns.Add(((uint)traceRunN, (ushort)traceRunVal));
+            }
+            var w = traceOut;
+            w.Write((byte)'W');
+            w.Write(traceT0);
+            w.Write(TraceNow());
+            w.Write((ushort)traceWin[0]); w.Write((ushort)traceWin[1]);
+            w.Write((ushort)traceWin[2]); w.Write((ushort)traceWin[3]);
+            w.Write(traceWinMad);
+            w.Write((uint)traceRuns.Count);
+            foreach(var r in traceRuns)
+            {
+                w.Write(r.Item1); w.Write(r.Item2);
+            }
+            traceRuns.Clear();
+            w.Flush();
+        }
+
+        private void TracePixel(ushort v)
+        {
+            if(v == traceRunVal)
+            {
+                traceRunN++;
+                return;
+            }
+            if(traceRunVal >= 0)
+            {
+                traceRuns.Add(((uint)traceRunN, (ushort)traceRunVal));
+            }
+            traceRunVal = v;
+            traceRunN = 1;
+        }
+
+        private BinaryWriter traceOut;
+        private bool traceOpen;
+        private double traceT0;
+        private readonly int[] traceWin = new int[4];
+        private byte traceWinMad;
+        private int traceRunVal = -1;
+        private long traceRunN;
+        private readonly System.Collections.Generic.List<(uint, ushort)> traceRuns = new System.Collections.Generic.List<(uint, ushort)>();
+
         public int Rotation { get; set; } = 3;
         public ulong PixelsWritten { get; private set; }
         public ulong Frames { get; private set; }
@@ -201,6 +277,19 @@ namespace Antmicro.Renode.Peripherals.Video
                 this.Log(LogLevel.Info, "first commands: 0x{0:X2} at t={1}", c, machine.ElapsedVirtualTime.TimeElapsed);
             }
             cmd = c; argc = 0; readIdx = 0;
+            if(traceOut != null)
+            {
+                TraceFlush();
+                if(c == 0x2C || c == 0x3C)
+                {
+                    traceOpen = true;
+                    traceT0 = TraceNow();
+                    traceWin[0] = xs; traceWin[1] = xe; traceWin[2] = ys; traceWin[3] = ye;
+                    traceWinMad = madctl;
+                    traceRunVal = -1;
+                    traceRunN = 0;
+                }
+            }
             switch(c)
             {
             case 0x2C: // RAMWR
@@ -299,6 +388,10 @@ namespace Antmicro.Renode.Peripherals.Video
                 gram[i] = v;
             }
             PixelsWritten++;
+            if(traceOpen)
+            {
+                TracePixel(v);
+            }
             Advance();
         }
 

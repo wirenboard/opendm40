@@ -1,0 +1,19 @@
+open r0 Vx +1.047536 (sd  92.1 uV) Vfb +1.047907 (sd   2.4 uV) drop  +0.3704 mV R  28280.899 M
+open r1 Vx +1.048627 (sd 2700.7 uV) Vfb +1.047902 (sd   3.6 uV) drop  -0.7254 mV R -14455.091 M
+open r2 Vx +1.047428 (sd  35.6 uV) Vfb +1.047905 (sd   0.8 uV) drop  +0.4774 mV R  21940.761 M
+open r3 Vx +1.047451 (sd  19.8 uV) Vfb +1.047902 (sd   1.7 uV) drop  +0.4513 mV R  23207.600 M
+open r4 Vx +1.047404 (sd  14.1 uV) Vfb +1.047898 (sd   2.1 uV) drop  +0.4942 mV R  21191.808 M
+open: drop mean +0.2136 mV sd 471.4 uV; Vx mean +1.047689
+0,"No error"
+r1M r0 Vx +0.094623 (sd  80.0 uV) Vfb +1.047907 (sd   6.6 uV) drop +953.2848 mV R      0.993 M
+r1M r1 Vx +0.094788 (sd  27.4 uV) Vfb +1.047905 (sd   4.5 uV) drop +953.1164 mV R      0.995 M
+r1M r2 Vx +0.094791 (sd   5.8 uV) Vfb +1.047906 (sd   5.7 uV) drop +953.1149 mV R      0.995 M
+r1M r3 Vx +0.094788 (sd  10.2 uV) Vfb +1.047902 (sd   2.6 uV) drop +953.1142 mV R      0.995 M
+r1M: drop mean +953.1576 mV sd 73.5 uV; Vx mean +0.094748
+0,"No error"
+r5M6 r0 Vx +0.374831 (sd  20.8 uV) Vfb +1.047899 (sd   7.0 uV) drop +673.0677 mV R      5.569 M
+r5M6 r1 Vx +0.374868 (sd 150.7 uV) Vfb +1.047907 (sd   5.7 uV) drop +673.0393 mV R      5.570 M
+r5M6 r2 Vx +0.375849 (sd 2139.8 uV) Vfb +1.047905 (sd   5.6 uV) drop +672.0556 mV R      5.593 M
+r5M6 r3 Vx +0.374767 (sd  46.1 uV) Vfb +1.047908 (sd   4.9 uV) drop +673.1412 mV R      5.567 M
+r5M6: drop mean +672.8260 mV sd 446.3 uV; Vx mean +0.375079
+0,"No error"

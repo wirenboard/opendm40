@@ -503,6 +503,8 @@ impl Producer {
 
 pub struct Logger {
     active: bool,
+    /// DWT count at the main-loop producer's begin (`begin_cyc`).
+    begin_cyc: u32,
     osr: u8,
     /// LOG:CHOP OFF. Stored inverted so that the all-zero `new()` (see
     /// `init_in_place`) is the chopped default.
@@ -576,6 +578,7 @@ impl Logger {
     pub const fn new() -> Self {
         Logger {
             active: false,
+            begin_cyc: 0,
             osr: 0,
             nochop: false,
             ad2: false,
@@ -846,6 +849,7 @@ impl Logger {
             hy::set_ad1_osr(self.osr, self.chop());
         }
         self.prod.begin(period_ns);
+        self.begin_cyc = self.prod.last_cyc;
         self.active = true;
         self.isr_sess = false;
         #[cfg(feature = "ad2-isr")]
@@ -900,6 +904,16 @@ impl Logger {
     /// The running (or last) session is the wave view's.
     pub fn wave(&self) -> bool {
         self.wave
+    }
+
+    /// DWT count at the running session's begin (the stamps' zero): the
+    /// stream ISR's producer, else the main-loop one.
+    pub fn begin_cyc(&self) -> u32 {
+        #[cfg(feature = "ad2-isr")]
+        if self.isr {
+            return isr::begin_cyc();
+        }
+        self.begin_cyc
     }
 
     /// A host (LOG:STATe ON) session runs: the GUI is frozen for it.
@@ -1401,6 +1415,13 @@ pub mod isr {
     /// the Pll's statistics words (DBG:ISR?, u32 loads) only.
     #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
     static mut PROD: Producer = Producer::new();
+    /// DWT count at the session's begin: the stamps (`ts_us`) count from
+    /// it (`Logger::begin_cyc`; the scope's DMM CH2 aligns by it).
+    static mut BEGIN_CYC: u32 = 0;
+
+    pub fn begin_cyc() -> u32 {
+        unsafe { *core::ptr::addr_of!(BEGIN_CYC) }
+    }
     #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
     static mut PLL: Pll = Pll::idle();
     static mut RINGP: *const Ring = core::ptr::null();
@@ -1562,6 +1583,7 @@ pub mod isr {
             (*core::ptr::addr_of_mut!(TRG)).gen = 0;
             let p = &mut *core::ptr::addr_of_mut!(PROD);
             p.begin(prod.period_ns);
+            *core::ptr::addr_of_mut!(BEGIN_CYC) = p.last_cyc;
             *core::ptr::addr_of_mut!(RINGP) = ring;
             let pll = &mut *core::ptr::addr_of_mut!(PLL);
             let dma = !ad1 && hy::stream::use_dma();
@@ -2514,6 +2536,22 @@ mod tests {
 /// one, so the stream ISR is the producer.
 pub mod wave {
     use super::*;
+
+    /// Pop every buffered sample (oldest first) with its stamp (us since
+    /// the session's begin, `Logger::begin_cyc`) into `f`; the count.
+    pub fn drain_ts(f: &mut dyn FnMut(u32, i32)) -> u32 {
+        let ring = &RING;
+        let t = ring.tail.load(Relaxed);
+        let n = ring.head.load(Acquire).wrapping_sub(t);
+        let base = ring.buf.get() as *const Rec;
+        for i in 0..n {
+            // SAFETY: below the Acquire-loaded head (Logger::drain).
+            let r = unsafe { base.add(t.wrapping_add(i) as usize & (CAP - 1)).read_volatile() };
+            f(r.ts_us, r.raw);
+        }
+        ring.tail.store(t.wrapping_add(n), Release);
+        n
+    }
 
     /// Pop every buffered sample (oldest first) into `f`; the count.
     pub fn drain(f: &mut dyn FnMut(i32)) -> u32 {

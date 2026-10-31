@@ -48,8 +48,8 @@ POINTS = [
 ]
 # DMM page buttons (src/app.rs tap): REL twice (on, off), the history row.
 BUTTONS = [
-    ('REL button (on)', 440, 224, (402, 205, 479, 242)),
-    ('REL button (off)', 440, 224, (402, 205, 479, 242)),
+    ('REL button (on)', 440, 224, (402, 205, 479, 240)),
+    ('REL button (off)', 440, 224, (402, 205, 479, 240)),
     ('history row, left', 60, 162, (0, 153, 399, 171)),
     ('history row, right', 340, 162, (0, 153, 399, 171)),
 ]

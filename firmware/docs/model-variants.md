@@ -23,7 +23,7 @@ One byte: **calibration struct byte 0 = internal flash `0x080C0168`**
 | Record | `0x080C0000`, 800 bytes: `u16 crc`, `u16 ~crc`, `u32 version = 1`, data |
 | CRC | CRC-16 poly 0x8005, init 0xFFFF, MSB-first, no final XOR ([`stock/dm40fw.py`](../../stock/dm40fw.py) `crc16`), over record bytes 4..0x31F, stored little-endian at +0 with the complement at +2. This unit: `c7 8a 38 75` = 0x8AC7 / 0x7538 |
 | Model | byte `+0x168`: 0 DM40A, 1 DM40B, 2 DM40C; BT cmd 00 clamps it to 2 (bt_meas_v2_6.h); a clamp for the FACTOR / OVER tables is unknown (not traced) |
-| Bad CRC / version | the stock uses the calibration defaults (flash `0x0804C45C`, byte 0 = `00`) -> DM40A. Emulator check: byte set to 2 without fixing the CRC -> the stock shows the DM40A ranges. opendm40 (0.2.5 on): the same, the record is treated as erased (dmm.rs `load_record`, `DBG:BOOT?` `CALREC,BADCRC`) |
+| Bad CRC / version | the stock uses the calibration defaults (flash `0x0804C45C`, byte 0 = `00`) -> DM40A. Emulator check: byte set to 2 without fixing the CRC -> the stock shows the DM40A ranges. opendm40 (0.2.5 on): the same, the record is treated as erased (dmm.rs `load_record`, `DBG:BOOT?` `calrec_ok` 0) |
 | Writer | only the factory menu "import factor.bin" (whole 800-byte record from the USB disk, CRC and version checked). Nothing else in the firmware writes it |
 
 Not involved:
@@ -61,7 +61,7 @@ Everything else (scope, generator, UI layout, calibration use) is the same.
 * Flash dump of 2026-10-13 (`flash_08000000_1MB.bin`, not in the repo):
   `0x080C0168` = `00`, record CRC valid -> **DM40A**.
 * Device, 2026-10-22, read-only: `CALIB.BIN` (the opendm40 safety copy of
-  `0x080C0000`, `dm40scpi.py get CALIB.BIN`; DBG:BOOT? shows `CALBK` with no
+  `0x080C0000`, `dm40scpi.py get CALIB.BIN`; DBG:BOOT? shows the safety copy with no
   difference against the flash) is byte-identical to the dump's 800-byte
   record: model byte `00`; `*IDN?` names DM40A.
 * Most owners in the chat have a DM40C ([user-feedback.md](user-feedback.md)).

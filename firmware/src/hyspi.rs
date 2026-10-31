@@ -1,4 +1,4 @@
-//! HY3131 bus self-test (DBG only; hy3131.rs has the bus,
+//! HY3131 bus self-test (DBG only, --features dbg-hyspi; hy3131.rs has the bus,
 //! docs/dmm-input-scope-feasibility.md section 8).
 //!
 //!   DBG:HYSPI:SELF? n[,div[,cpha]]   (cpha 1: data phase with CKPH = 1,
@@ -16,6 +16,7 @@
 //!       Reply: div,n,bad_r1,bad_r23,bad_w1,signbad,us_r1,us_r6,us_r23,us_w1,
 //!       stable,ref (us = mean per frame, DWT, incl. CS; ref = R1F..R35 in
 //!       hex, live bytes as "..").
+#![cfg_attr(not(feature = "dbg-hyspi"), allow(dead_code))]
 
 use crate::hy3131 as hy;
 use crate::mmio::r32;

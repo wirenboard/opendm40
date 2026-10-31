@@ -228,7 +228,9 @@ struct Mir {
     written: bool,
     ms: u32,
 }
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+// Backup SRAM (.bkp_bss, link-native.x; CPU only, zeroed at reset;
+// docs/native-boot.md "Extra RAM areas").
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut MIR: Mir = Mir { data: 0, cb: 0, cl: [0; MIR_NCL], status: 0, written: false, ms: 0 };
 /// The mirror equals the flash (checked or written at this boot) and is
 /// served; cleared for good by a failed SPI read.
@@ -286,9 +288,10 @@ struct Tab {
     left_out: u16,
 }
 
-/// NOLOAD SRAM (.dmabuf): written by `init` before READY is set; TCM is kept
+/// Backup SRAM (.bkp_bss, link-native.x; CPU only, docs/native-boot.md
+/// "Extra RAM areas"): written by `init` before READY is set; TCM is kept
 /// for the stack.
-#[cfg_attr(target_os = "none", link_section = ".dmabuf")]
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut STATE: core::mem::MaybeUninit<State> = core::mem::MaybeUninit::uninit();
 #[cfg_attr(target_os = "none", link_section = ".dmabuf")]
 static mut TAB: core::mem::MaybeUninit<Tab> = core::mem::MaybeUninit::uninit();
@@ -736,10 +739,6 @@ fn at_cluster(t: &Tab, c: u32) -> Option<&VF> {
 
 // --- read cursors ------------------------------------------------------------
 
-/// The CSV generator of the last DLG read (key: SPI start, size), ~0.7 KiB
-/// of .bss; a BMP's chain cursor likewise.
-static mut CSV_CUR: dlog::Slot<(u16, u32)> = dlog::Slot::new();
-
 #[inline(always)]
 fn rd_cyc() -> u32 {
     #[cfg(target_os = "none")]
@@ -748,17 +747,10 @@ fn rd_cyc() -> u32 {
     return 0;
 }
 
-/// The second CSV cursor (`file_read`; SRAM, all zero = empty) and the
-/// least recently used one; a cursor at most this far before a read goes on
-/// from there.
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
-static mut CSV_CUR2: dlog::Slot<(u16, u32)> = dlog::Slot::new();
-static mut CSV_LRU: u8 = 0;
-const CUR_NEAR: u32 = 1 << 20;
-
 /// Read-path statistics (DBG:VDISK:RD?): read_block calls, their cycles
-/// (total / 1024, max), CSV generator opens.
-pub static RD: [core::sync::atomic::AtomicU32; 4] = [const { core::sync::atomic::AtomicU32::new(0) }; 4];
+/// (total / 1024, max). A BMP's chain cursor (the CSV generators: dlog.rs
+/// `csv_gen`).
+pub static RD: [core::sync::atomic::AtomicU32; 3] = [const { core::sync::atomic::AtomicU32::new(0) }; 3];
 static mut BMP_KEY: (u16, u32) = (0, 0);
 static mut BMP_CUR: core::mem::MaybeUninit<FatFile<FnRaw>> = core::mem::MaybeUninit::uninit();
 
@@ -767,19 +759,6 @@ fn geo() -> Option<(FnRaw, Geo)> {
     let mut d = dlog::disk();
     let g = dlog::geometry(&mut d)?;
     Some((d, g))
-}
-
-/// How far cursor `c` is behind `off` when it holds file `key` (within
-/// CUR_NEAR). A fn, not a closure in `file_read`: a closure's section name
-/// carries this module's path, so the .cold rule put it in region C (device
-/// d8e249d: DBG:ISR? lat_pc = `file_read::{closure#0}`, max_lat 9 us while a
-/// host read the volume during an AD2 19200 stream).
-#[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
-fn near(c: &dlog::Slot<(u16, u32)>, key: (u16, u32), off: u32) -> Option<u32> {
-    match c.peek() {
-        Some((k, p)) if k == key && p <= off && off - p < CUR_NEAR => Some(off - p),
-        _ => None,
-    }
 }
 
 /// Bytes `off..` of table file `e` into `buf` (zeros on a read error).
@@ -800,27 +779,8 @@ fn file_read(e: &VF, off: u32, buf: &mut [u8]) {
         }
         return;
     }
-    // Two cursors: a host that reads two places in turn (an indexer at a
-    // file's head while a copy runs further on) keeps one each. The one
-    // just behind `off` (within CUR_NEAR) of this file, else the one used
-    // least recently (reopened for another file).
-    let slots = unsafe { [&mut *core::ptr::addr_of_mut!(CSV_CUR), &mut *core::ptr::addr_of_mut!(CSV_CUR2)] };
-    let lru = unsafe { &mut *core::ptr::addr_of_mut!(CSV_LRU) };
-    let i = match (near(slots[0], key, off), near(slots[1], key, off)) {
-        (Some(a), Some(b)) => (b < a) as usize,
-        (Some(_), None) => 0,
-        (None, Some(_)) => 1,
-        (None, None) => *lru as usize,
-    };
-    *lru = (i == 0) as u8; // the other one is now the least recent
-    let [c0, c1] = slots;
-    let cur = if i == 0 { c0 } else { c1 };
-    let open = || {
-        RD[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let (d, g) = geo()?;
-        Gen::open(FatFile::new(d, g, e.src as u32, e.ssize), e.ssize)
-    };
-    if let Some(g) = cur.get(key, open) {
+    // The CSV generators are shared with MMEM:DATA? (dlog.rs `csv_gen`).
+    if let Some(g) = dlog::csv_gen(key, off) {
         g.read(off, buf);
     }
 }
@@ -1363,41 +1323,13 @@ fn readme(base: usize, out: &mut [u8]) -> u32 {
     let mut w = W { b: out, base, n: 0 };
     w.s(b"DM40 (opendm40 ");
     w.s(VERSION.as_bytes());
-    w.s(b") - USB disk generated by the meter.\r\n\r\n");
-    w.s(b"LOGS\\    LOGnnn.CSV   DMM recordings (swipe down on the DMM page)\r\n");
-    w.s(b"SCOPE\\   SCOPnnn.CSV  scope records (Save on the scope page)\r\n");
-    w.s(b"SHOTS\\   Snnn.BMP     screenshots (three-finger swipe down)\r\n");
-    w.s(b"INFO\\    calibration, boot data, UID, option bytes, OTP, boot\r\n");
-    w.s(b"         loader images and FIRMWARE.BIN (the running firmware as\r\n");
-    w.s(b"         an update file); BACKUP.TXT tells what each one is.\r\n");
-    w.s(b"DEBUG\\   SPIFLASH.BIN: raw image of the 16 MiB SPI flash (the\r\n");
-    w.s(b"         meter's internal FAT16 storage).\r\n\r\n");
-    w.s(b"The files are stored on the meter in a compact form and converted\r\n");
-    w.s(b"when read.\r\n\r\n");
-    w.s(b"Mode (meter: Settings 3/3, \"USB disk\"):\r\n");
-    w.s(b"Files live (default, read-only): recordings and screenshots saved\r\n");
-    w.s(b"while the disk is mounted appear at once (refresh the folder, F5).\r\n");
-    w.s(b"PC can edit: delete files and copy a firmware file (below); new files\r\n");
-    w.s(b"then appear after an eject / re-plug. A mode change applies at the\r\n");
-    w.s(b"next USB plug; power-on starts in Files live.\r\n");
-    w.s(b"\r\n");
-    w.s(b"Delete (PC can edit): a file deleted in LOGS, SCOPE or SHOTS here is\r\n");
-    w.s(b"deleted on the meter. One moved to the trash is deleted at the eject,\r\n");
-    w.s(b"unless taken out of the trash before (the trash itself is not kept).\r\n");
-    w.s(b"In any mode: on the meter (Gallery), or over USB/SCPI: MMEM:DEL.\r\n");
-    w.s(b"Other files copied here are not kept; INFO and DEBUG are read-only.\r\n");
-    w.s(b"\r\n");
-    w.s(b"Firmware update (PC can edit): copy the update file here under any\r\n");
-    w.s(b"dm40*.bin name, e.g. dm40_opendm40_v");
-    w.s(VERSION.as_bytes());
-    w.s(b".bin. The meter checks it and\r\n");
-    w.s(b"asks \"Install it now?\": Yes restarts into the vendor loader, which\r\n");
-    w.s(b"installs it; No discards it. In any mode: tools/reload.sh (opendm40\r\n");
-    w.s(b"repository: DBG:UPLOAD + DBG:UPDATE over USBTMC).\r\n");
-    w.s(b"If the meter does not start: from off, hold the power key ~4 s until\r\n");
-    w.s(b"the beep and 0.5 s more. The vendor loader's update screen shows its\r\n");
-    w.s(b"own USB disk: copy the update file there (any dm40*.bin name;\r\n");
-    w.s(b"INFO\\FIRMWARE.BIN = the running firmware) and press \"update\".\r\n");
+    w.s(b") USB disk\r\n\r\n");
+    w.s(b"LOGS\\   DMM recordings (CSV)\r\n");
+    w.s(b"SCOPE\\  scope records (CSV)\r\n");
+    w.s(b"SHOTS\\  screenshots (BMP)\r\n");
+    w.s(b"INFO\\   calibration, chip data, FIRMWARE.BIN (read-only)\r\n");
+    w.s(b"DEBUG\\  SPIFLASH.BIN, the internal storage (read-only)\r\n\r\n");
+    w.s(b"Manual: https://github.com/opendm40/opendm40/blob/main/docs/manual/README.md\r\n");
     debug_assert!(w.n + 2 <= README_LEN);
     while w.n + 2 < README_LEN {
         w.c(b' ');
@@ -1509,7 +1441,7 @@ fn describe(st: &State, base: usize, out: &mut [u8]) -> usize {
             w.s(b"reinstall it: tools/reload.sh --image FIRMWARE.BIN, or copy it as\r\n");
             w.s(b"dm40_opendm40_v");
             w.s(VERSION.as_bytes());
-            w.s(b".bin to the vendor loader's own USB disk (see README.TXT).\r\n");
+            w.s(b".bin to the vendor loader's own USB disk (see the manual).\r\n");
         }
         None => w.s(b"; no FIRMWARE.BIN (no valid loader record at 08008000).\r\n"),
     }

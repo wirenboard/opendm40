@@ -36,6 +36,8 @@ DC part against the source with the device's rule (0.05 % + 5 digits) in
 two windows: the device script's (1..4 s after the step) and the late one
 (4..8.5 s). The model's internal zero sits 15 codes off on 60 V
 ("agndz:", HY3131.cs AgndZeroCodes), as the device's.
+Needs an image built with `--features acdc-meth` (firmware/Cargo.toml): the
+default build has method A only and refuses DBG:ACDC:METH / STAT?.
 Results: emu/out/acdcmeth-<meth>[-e8<x>]-p<port>.json, the table on stdout. Exit 1 when a
 method misses its accuracy bound (CHECK below) in a phase.
 """
@@ -52,7 +54,7 @@ EMU = os.path.dirname(HERE)
 ROOT = os.path.dirname(EMU)
 OUT = os.path.join(EMU, 'out')
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument('--app', help='opendm40 native image')
+ap.add_argument('--app', help='opendm40 native image (built with --features acdc-meth)')
 ap.add_argument('--port', type=int, default=18110, help='first USB/IP port (one per method)')
 ap.add_argument('--meths', default='A,B,C,B~')
 ap.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
@@ -174,6 +176,10 @@ def run(meth, port, res):
         try:
             m = meth[0]
             tm.write('DBG:ACDC:METH %s' % m)
+            tm.write('SYST:ERR?')
+            err = tm.read(timeout=60).decode(errors='replace').strip()
+            if err.startswith('-113'):
+                raise RuntimeError('the image needs --features acdc-meth (%s)' % err)
             tm.write('VOLT:COUP ACDC')
             while p.poll() is None:
                 row = {}

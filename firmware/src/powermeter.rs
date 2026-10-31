@@ -125,7 +125,7 @@ pub const RING_N: usize = 16;
 /// stock AC A. AC coupling: a part below its floor reads 0 and PF / S / Q
 /// are "--" (NaN, SCPI 9.91E37); f also "--" when the channel the counter
 /// watches is below. AC+DC: the part is left out of the totals (Q 0 when
-/// either is).
+/// either is); PF "--" when S is at the noise level.
 pub const FLOOR_V: f32 = AUTO_FLOOR_V[1];
 pub const FLOOR_I: f32 = 0.005;
 /// RMS noise assumed on an AC part above its floor, fractions of the range
@@ -843,7 +843,8 @@ pub fn totals(p_ac: f32, v_ac: f32, v_dc: f32, i_ac: f32, i_dc: f32, r: f32) -> 
     let v = sqrt(v2.max(0.0));
     let s = v * i;
     // |P| can exceed S by the noise of the separate statistics: PF clamped.
-    let pf = if s > 0.0 { (p / s).clamp(-1.0, 1.0) } else { 0.0 };
+    // S 0: no PF (NaN, not 0 = "purely reactive"; #109).
+    let pf = if s > 0.0 { (p / s).clamp(-1.0, 1.0) } else { f32::NAN };
     let q = sqrt((s * s - p * p).max(0.0));
     (p, s, q, pf, v, i)
 }
@@ -1187,6 +1188,11 @@ impl Dmm {
             } else if !(v_ok && i_ok) || q < qn {
                 q = 0.0;
             }
+            // S at the noise level (no current, or no voltage): PF has no
+            // value (AC+DC; AC has it from the floors above; #109).
+            if !(s > qn) {
+                pf = f32::NAN;
+            }
         }
         // The counter watches the V tap, or the current (PB4) when the tap
         // has no window: "--" when that channel's AC part is below its floor.
@@ -1273,7 +1279,9 @@ impl Dmm {
     /// values stayed up to ~4 s): the new coupling's layout and units,
     /// every measured value NaN ("--"); the energy, the time and the
     /// settings as they are.
-    #[inline(never)] // .cold (link-native.x): once per coupling change
+    /// Also the combined view's strip before the first reading
+    /// (`App::pw_strip_wait`, #108): region B.
+    #[inline(never)]
     pub fn pw_pending(&self) -> (Reading, PowerVals) {
         let n = f32::NAN;
         let pv = PowerVals {
@@ -2306,6 +2314,9 @@ mod tests {
         // Reversed current: P < 0, PF -1.
         let (p, _, _, pf, _, _) = totals(0.0, 0.0, 12.0, 0.0, -2.0, 0.0);
         assert!(close(p, -24.0, 1e-6) && close(pf, -1.0, 1e-6));
+        // No current (#109): S 0, Q 0, PF none (not 0 = "purely reactive").
+        let (p, s, q, pf, v, _) = totals(0.0, 0.0, 5.0, 0.0, 0.0, 0.0);
+        assert!(p == 0.0 && s == 0.0 && q == 0.0 && pf.is_nan() && close(v, 5.0, 1e-6));
         // Burden: 5 V source, 0.4 A, R_path 0.6 ohm (DC, wiring 1): the
         // load sees 5 - 0.24 = 4.76 V and takes 1.904 W; the meter 0.096 W.
         let (p, s, _, pf, v, i) = totals(0.0, 0.0, 5.0, 0.0, 0.4, 0.6);

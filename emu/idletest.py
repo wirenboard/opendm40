@@ -16,6 +16,8 @@ DBG:IDLE 20000 sets a 20 s power-off time (instead of the Shutdown setting,
   bt    a SCPI line over Bluetooth (run.py --bt-port) every 4 s, no USB:
         the meter stays on;
   msc   a USB disk READ(10) every 4 s, no SCPI: the meter stays on;
+  inrush  the inrush page armed (INR:STAT ON, INR:COND? ARMED), then nothing
+        for 60 s: the meter stays on, still armed (#144); INR:STAT OFF after;
   off   nothing for 30 s: the meter is off (USBTMC no longer answers). Runs
         last (the meter stays off).
 "On" is checked with a USBTMC *IDN? after the case; the emulator's virtual
@@ -36,7 +38,7 @@ ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDe
 ap.add_argument('--app', required=True, help='opendm40 native ELF / image')
 ap.add_argument('--port', type=int, default=None, help='USB/IP port (default: a free one, run.free_port)')
 ap.add_argument('--bt-port', type=int, default=None, help='Bluetooth passthrough port (default: a free one)')
-ap.add_argument('--cases', default='usb,bt,msc,off')
+ap.add_argument('--cases', default='usb,bt,msc,inrush,off')
 ap.add_argument('--keep', type=float, default=40.0, help='seconds of each keep-on case (default 40)')
 A = ap.parse_args()
 sys.path.insert(0, HERE)
@@ -146,6 +148,26 @@ try:
             s.close()
         elif case == 'msc':
             keep(l, 'msc', lambda: l.m.read(0, 0, 1, cap[1]))
+        elif case == 'inrush':
+            l.t.write('INR:STAT ON')
+            end = time.time() + 60
+            while l.q('INR:COND?') != 'ARMED' and time.time() < end:
+                time.sleep(1)
+            l.t.write('DBG:IDLE %d' % OFF_MS)
+            t0 = l.uptime()
+            # Twice the off case's wait: the armed stream slows the emulator
+            # (23 s of virtual time in 30 s).
+            time.sleep(2 * (OFF_MS / 1000 + 10))
+            try:
+                up = l.uptime()
+            except OSError as e:
+                check(False, 'inrush: the meter answers after %d s armed without traffic (%r)' % (2 * (OFF_MS / 1000 + 10), e))
+                continue
+            check(up - t0 > OFF_MS + 5000, 'inrush: armed %d ms without traffic > the %d ms power-off time + 5 s'
+                  % (up - t0, OFF_MS))
+            c = l.q('INR:COND?')
+            check(c == 'ARMED', 'inrush: the meter answers, INR:COND? %s' % c)
+            l.t.write('INR:STAT OFF')
         elif case == 'off':
             l.t.write('DBG:IDLE %d' % OFF_MS)
             time.sleep(OFF_MS / 1000 + 10)

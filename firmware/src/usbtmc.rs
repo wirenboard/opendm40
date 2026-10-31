@@ -293,6 +293,12 @@ impl<'a, B: UsbBus> Usbtmc<'a, B> {
         self.ext.is_some() && (self.rsp_ready || self.tx_len != 0)
     }
 
+    /// A response transfer the host asked for is going out (any reply,
+    /// streamed or not): main.rs polls on while it does.
+    pub fn sending(&self) -> bool {
+        self.tx_len != 0
+    }
+
     /// Progress of a streamed response: bytes handed to the IN endpoint so
     /// far (rises while the host reads; main.rs `STREAM_STALL_MS`).
     pub fn stream_pos(&self) -> usize {

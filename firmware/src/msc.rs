@@ -108,12 +108,16 @@ pub trait BlockDevice {
         false
     }
     /// `write_block` spread over several calls, for a caller that must not
-    /// stall the main loop (screenshot.rs). Call again with the same `lba`,
-    /// `buf` and `st` (starting from `Step::default()`) until it returns
-    /// Some(ok). Default: the whole write at once.
-    fn write_step(&mut self, lba: u32, buf: &[u8], st: &mut Step) -> Option<bool> {
+    /// stall the main loop (screenshot.rs, csvlog.rs). Call again with the
+    /// same `lba`, `buf` and `st` (starting from `Step::default()`) until it
+    /// returns Some(ok). `buf` is a byte slice or a word-only RAM (wordram.rs
+    /// `BlockSrc`). Default: the whole write at once, from a byte slice only.
+    fn write_step(&mut self, lba: u32, buf: &dyn crate::wordram::BlockSrc, st: &mut Step) -> Option<bool> {
         let _ = st;
-        Some(self.write_block(lba, buf))
+        match buf.bytes() {
+            Some(b) => Some(self.write_block(lba, b)),
+            None => Some(false),
+        }
     }
 }
 

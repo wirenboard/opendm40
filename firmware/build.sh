@@ -82,7 +82,7 @@ rm -f $TDIR/regiona2.warn $TDIR/regionb.warn $TDIR/regionc.warn
 "$OBJCOPY" -O binary --gap-fill=0xff "$ELF" "$BODY"
 python3 ../stock/dm40fw.py pack --pad "$BODY" "$OUT"
 python3 - "$BODY" "$ELF" "$TDIR" <<'PY'
-import os, struct, subprocess, sys
+import os, re, struct, subprocess, sys
 body = open(sys.argv[1], 'rb').read()
 BASE, MARK, END = 0x08004000, 0x08008000, 0x080A0000
 end = BASE + len(body)
@@ -116,6 +116,19 @@ print("  region C free    = %d bytes (.cold below 0x080A0000; link fails below 4
 if cfree < 8192:
     open(sys.argv[3] + '/regionc.warn', 'w').write('%d\n' % cfree)
 print("  SRAM free        = %d bytes (above .sram_bss; >= 8 KiB)" % (0x20030000 - syms['__sram_bss_end']))
+# The extra RAM areas (link-native.x: CPU-only buffers; the link fails when
+# one overflows): backup SRAM after the settings record up to its sequence
+# words, the USBHS FIFO RAM.
+print("  backup SRAM free = %d bytes (.bkp_bss 0x%08x..0x%08x; record ends 0x%08x, limit 0x40024fe8)"
+      % (0x40024FE8 - syms['__bkp_bss_end'], syms['__bkp_bss_start'], syms['__bkp_bss_end'], syms['__bkp_record_end']))
+print("  USBHS RAM free   = %d bytes (.usbhs_bss 0x%08x..0x%08x, limit 0x40061000)"
+      % (0x40061000 - syms['__usbhs_bss_end'], syms['__usbhs_bss_start'], syms['__usbhs_bss_end']))
+# The USBHS FIFO RAM writes a byte or halfword store into the whole word
+# (src/wordram.rs): only wordram.rs `usbhs_static!` (a WordRam, word access
+# only) may place anything there.
+place = [os.path.join(d, f)[4:] for d, _, fs in os.walk('src') for f in fs if f.endswith('.rs')
+         and re.search(r'link_section\s*=\s*"\.usbhs_bss', open(os.path.join(d, f)).read())]
+assert place == ['wordram.rs'], '.usbhs_bss placed outside wordram.rs usbhs_static!: %s' % place
 print("  word0 initial SP = 0x%08x (loader only; reset sets 0x10010000)" % sp)
 print("  word1 reset      = 0x%08x" % entry)
 print("  region A end     = 0x%08x (shim + vectors, limit 0x%08x)" % (syms['__region_a_end'], MARK))
@@ -130,6 +143,53 @@ assert gap == b'\xff' * 16, 'marker gap is not 0xFF'
 assert pad == b'\xff' * len(pad), 'padding between region A2 and region B is not 0xFF'
 assert body[:4] == struct.pack('<I', 0x2002F7F8)
 assert BASE <= entry - 1 < MARK and entry & 1, 'reset vector not in region A (thumb)'
+# gen::reads (the GEN channel's timed register reads, gen.rs): loads only
+# between its DWT reads. A call or a division there (a u64 modulo did) puts
+# every DAC-path reading over its window on the device (PR #64).
+od = os.environ['DM40_LLVMBIN'] + '/llvm-objdump'
+rd = [k for k in syms if '3gen5reads' in k]
+assert rd, 'gen::reads not found (inline(never) dropped?)'
+dis = subprocess.run([od, '-d', '--no-show-raw-insn', '--disassemble-symbols=' + rd[0], sys.argv[2]],
+                     capture_output=True, text=True).stdout
+ops = [m.group(1) for m in re.finditer(r'^\s*[0-9a-f]+:\s*\t(\S+)', dis, re.M)]
+bad = [o for o in ops if o in ('bl', 'blx', 'udiv', 'sdiv')]
+assert ops and not bad, 'gen::reads: %s between the timed reads' % bad
+# The AD2 stream ISR and everything it calls hold no address in the extra RAM
+# areas (link-native.x .bkp_bss / .usbhs_bss: ~5-cycle loads on AHB1, CPU-only
+# buffers of the main loop). A literal-pool word or a movw/movt pair in range
+# fails the build.
+if 'ad2_stream_irq' in syms:
+    dis = subprocess.run([od, '-d', '--no-show-raw-insn', sys.argv[2]], capture_output=True, text=True).stdout
+    funcs, cur = {}, None
+    for l in dis.split('\n'):
+        m = re.match(r'^[0-9a-f]{8} <(.*)>:$', l)
+        if m:
+            cur = funcs.setdefault(m.group(1), [set(), set(), {}])
+            continue
+        if cur is None:
+            continue
+        m = re.search(r'\.word\s+0x([0-9a-f]+)', l)
+        if m:
+            cur[0].add(int(m.group(1), 16))
+        m = re.search(r'\b(?:bl|b\.w|b)\s+0x[0-9a-f]+ <([^+>]*)', l)
+        if m:
+            cur[1].add(m.group(1))
+        m = re.search(r'\bmov([wt])\s+(\w+), #0x([0-9a-f]+)', l)
+        if m and m.group(1) == 'w':
+            cur[2][m.group(2)] = int(m.group(3), 16)
+        elif m and m.group(2) in cur[2]:
+            cur[0].add(int(m.group(3), 16) << 16 | cur[2][m.group(2)])
+    seen, todo = set(), ['ad2_stream_irq']
+    while todo:
+        f = todo.pop()
+        if f in seen or f not in funcs:
+            continue
+        seen.add(f)
+        todo.extend(funcs[f][1])
+    xr = [(syms['__bkp_bss_start'], 0x40024FE8), (0x40060000, 0x40061000)]
+    hits = ['%s: 0x%08x' % (f, w) for f in sorted(seen) for w in funcs[f][0] if any(a <= w < b for a, b in xr)]
+    assert len(seen) > 1 and not hits, 'the AD2 stream ISR reaches the extra RAM areas: %s' % hits
+    print("  AD2 stream ISR   = %d functions, no extra-RAM address" % len(seen))
 PY
 python3 ../stock/dm40fw.py info "$OUT"
 # The FS-loader mis-decodes a short last 128-byte block whose key position is

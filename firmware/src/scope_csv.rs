@@ -70,7 +70,9 @@ struct Plan {
     cb: usize,
 }
 
-#[cfg_attr(target_os = "none", link_section = ".dmabuf")]
+// Backup SRAM (.bkp_bss, link-native.x; CPU only, zeroed at reset;
+// docs/native-boot.md "Extra RAM areas").
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut PLAN: Plan = Plan {
     mode: [0; crate::dlog::SBLK_MAX],
     len: [0; crate::dlog::SBLK_MAX],

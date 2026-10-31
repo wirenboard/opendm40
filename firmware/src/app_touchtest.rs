@@ -143,7 +143,9 @@ const TT0: Tt = Tt {
     fit: None,
 };
 
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+// Backup SRAM (.bkp_bss, link-native.x; CPU only, zeroed at reset;
+// docs/native-boot.md "Extra RAM areas").
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut TT: Tt = TT0;
 
 fn st() -> &'static mut Tt {

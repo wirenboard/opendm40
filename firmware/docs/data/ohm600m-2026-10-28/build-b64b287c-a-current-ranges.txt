@@ -1,0 +1,17 @@
+Alientek,DM40A,1E6830202422B30736313039,opendm40 0.4.0 Multimeter,1,0 LIVE
+CONF:RES 600E6   RANG +6.000000E+08  alerts {'LIVE': 40}  last F,MΩ,+3.209457E+07,0,MANU
+CONF:RES 60E6    RANG +6.000000E+07  alerts {'LIVE': 40}  last F,MΩ,+3.159820E+07,0,MANU
+CONF:RES 600     RANG +6.000000E+02  alerts {'LIVE': 40}  last F,Ω,+9.90000000E+37,0,MANU
+CONF:RES         RANG +6.000000E+07  alerts {'LIVE': 40}  last F,MΩ,+3.171014E+07,0,AUTO
+Traceback (most recent call last):
+  File "<stdin>", line 6, in <module>
+  File "/home/boger/work/board/alientek-dm40/firmware/tools/dm40scpi.py", line 105, in query
+    return self.l.query(line).decode(errors='replace').strip()
+           ~~~~~~~~~~~~^^^^^^
+  File "/home/boger/work/board/alientek-dm40/firmware/tools/dm40dbg.py", line 173, in query
+    self.write(cmd)
+    ~~~~~~~~~~^^^^^
+  File "/home/boger/work/board/alientek-dm40/firmware/tools/dm40dbg.py", line 147, in write
+    os.write(self.fd, cmd.encode() + b'\n')
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe

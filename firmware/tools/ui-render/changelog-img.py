@@ -71,10 +71,33 @@ def single(name, src, crop):
     save(im, name)
 
 
+def side(name, parts):
+    """Pictures (image, crop, caption) side by side, top-aligned."""
+    cs = [im.crop(c) for im, c, _ in parts]
+    f = ImageFont.truetype(BOLD, 16)
+    w = sum(c.size[0] for c in cs) + 10 * (len(cs) + 1)
+    h = max(c.size[1] for c in cs)
+    im = Image.new('RGB', (w, h + 40), WHITE)
+    d = ImageDraw.Draw(im)
+    x = 10
+    for c, (_, _, t) in zip(cs, parts):
+        d.text((x, 8), t, font=f, fill=DARK)
+        im.paste(c, (x, 32))
+        d.rectangle((x - 1, 31, x + c.size[0], 32 + c.size[1]), outline=GREY)
+        x += c.size[0] + 10
+    save(im, name)
+
+
 BODY = (0, 34, 480, 178)  # below the status bar: the reading and the bargraph
-pair('accuracy', at(prev, 'dmm-bar'), now('dmm-acc'), BODY)
-pair('ohm-60', at(prev, 'range-ohm'), now('range-ohm'), (0, 40, 480, 140))
-pair('tb-list', at(prev, 'scope-tb-list'), now('scope-tb-list'), (60, 20, 220, 215))
-pair('hz', at(prev, 'dmm-hz'), now('dmm-hz'), BODY)
-single('splash', m2('splash'), (90, 70, 390, 250))
-single('negative-ohm', m2('a22-acc-ohm-neg'), BODY)
+if tag == 'v0.3.0':
+    pair('accuracy', at(prev, 'dmm-bar'), now('dmm-acc'), BODY)
+    pair('ohm-60', at(prev, 'range-ohm'), now('range-ohm'), (0, 40, 480, 140))
+    pair('tb-list', at(prev, 'scope-tb-list'), now('scope-tb-list'), (60, 20, 220, 215))
+    pair('hz', at(prev, 'dmm-hz'), now('dmm-hz'), BODY)
+    single('splash', m2('splash'), (90, 70, 390, 250))
+    single('negative-ohm', m2('a22-acc-ohm-neg'), BODY)
+elif tag == 'v0.4.0':
+    side('ohm-600m', [(now('range-ohm-600m'), (0, 40, 480, 182), 'Range page'),
+                      (now('dmm-ohm-600m'), (0, 0, 480, 172), 'Reading')])
+    pair('record-button', at(prev, 'range-a'), now('range-a'), (0, 0, 480, 290))
+    pair('cont-short', at(prev, 'dmm-cont'), now('dmm-cont'), BODY)

@@ -53,6 +53,7 @@ ap.add_argument('--cases', default='page,cal')
 A = ap.parse_args()
 sys.path.insert(0, HERE)
 import run  # noqa: E402
+import bootinfo  # noqa: E402
 if A.port is None:
     A.port = run.free_port(65200, 65300)
 print('USB/IP port %d' % A.port, flush=True)
@@ -374,7 +375,7 @@ def case_cal():
         # The settings file: saved within ~7 s of the change (2 s + 5 s).
         ln.wait_up(int((t_save + 10.0) * 1000))
         b = ln.q('DBG:BOOT?')
-        print('  boot 1: %s' % b[b.find('SETTINGS'):], flush=True)
+        print('  boot 1: %s' % ','.join(bootinfo.settings(b)), flush=True)
         ln.w('DBG:RESET')
         ln.close()
         time.sleep(3)
@@ -386,7 +387,7 @@ def case_cal():
             except Exception:
                 ln.close()
                 time.sleep(2)
-        s = b[b.find('SETTINGS'):].split(',')
+        s = bootinfo.settings(b)
         print('  after DBG:RESET: %s' % ','.join(s), flush=True)
         check(len(s) > 1 and s[1] == 'BKP', 'after DBG:RESET: the settings from the backup SRAM')
         cal_near(cal_of(ln.q('DBG:TOUCH:CAL?')), want, 'after DBG:RESET')
@@ -422,7 +423,7 @@ def case_cal():
     try:
         ln = Link()
         b = ln.q('DBG:BOOT?')
-        s = b[b.find('SETTINGS'):].split(',')
+        s = bootinfo.settings(b)
         print('  boot 2: %s' % ','.join(s), flush=True)
         check(len(s) > 1 and s[1] == 'FILE', 'after the power-off: the settings from the file')
         cal_near(cal_of(ln.q('DBG:TOUCH:CAL?')), want, 'after the power-off')

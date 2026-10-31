@@ -60,7 +60,7 @@
 //!   * No host writes this disk in the native build (USB exports the
 //!     generated volume, vdisk.rs); csvlog::delete_on refuses while busy or
 //!     for the file being recorded.
-//!   * calbackup::scratch() (3 x 4 KiB) is the block buffer: [0] data,
+//!   * diskbuf::blocks() (3 x 4 KiB) is the block buffer: [0] data,
 //!     [1] FAT 1. Only used inside one `poll` while the disk is free, never
 //!     kept across passes (screenshot.rs, csvlog commits and the SCPI
 //!     catalog use it between our passes).
@@ -69,8 +69,8 @@
 
 use core::sync::atomic::Ordering::Relaxed;
 
-use crate::calbackup;
 use crate::csvlog::{self, GErr, Kind};
+use crate::diskbuf;
 use crate::dlog::{self, Src as _};
 use crate::fatren::{le16, le32, parse_bpb, Vol};
 use crate::gesture::Gesture;
@@ -182,7 +182,7 @@ fn disk() -> &'static mut crate::spiflash::SpiFlash {
     d.get_or_insert_with(crate::spiflash::SpiFlash::new)
 }
 
-/// Block I/O of one poll: scratch[0] = data block, scratch[1] = FAT 1 block,
+/// Block I/O of one poll: blocks()[0] = data block, blocks()[1] = FAT 1 block,
 /// tags valid for this poll only.
 struct Io<'a> {
     disk: &'a mut dyn BlockDevice,
@@ -195,7 +195,7 @@ struct Io<'a> {
 
 impl<'a> Io<'a> {
     fn new(disk: &'a mut dyn BlockDevice, v: Vol) -> Self {
-        let [data, fat, _] = calbackup::scratch();
+        let [data, fat, _] = diskbuf::blocks();
         Io { disk, v, data, fat, dtag: NONE, ftag: NONE }
     }
 
@@ -1641,7 +1641,7 @@ impl Gallery {
         let r = csvlog::list_on(disk, &mut []);
         let st = match r {
             Ok(c) => {
-                let buf = &mut calbackup::scratch()[0];
+                let buf = &mut diskbuf::blocks()[0];
                 self.v = if disk.read_block(0, &mut buf[..]) { parse_bpb(&buf[..], disk.block_count()) } else { None };
                 // The count of what the gallery shows (S*.BMP, LOG*.DLG: the
                 // directories `scan` reads): csvlog's catalog also counts
@@ -1801,6 +1801,8 @@ impl Gallery {
         crate::wdt::kick_if_feeding();
         let r = match r {
             Ok(()) => Ok(()),
+            // The file being recorded (csvlog::delete_on): retrying cannot help.
+            Err(GErr::Busy) if csvlog::recording_name() == Some(self.cur.name) => Err(("Cannot delete", "Stop the recording")),
             Err(GErr::Busy) => Err(("Cannot delete", "Disk busy, try again")),
             Err(GErr::NotFound) => Err(("Cannot delete", "File not found")),
             Err(_) => Err(("Cannot delete", "Delete failed")),
@@ -2078,6 +2080,8 @@ impl Gallery {
     fn begin_b(&mut self) {
         let j = &mut self.job;
         let c = j.csv;
+        // The recording in progress: only its committed part is read.
+        let none = if csvlog::recording_name() == Some(j.ent.name) { "Recording" } else { "No data" };
         let mut func = Tb::new();
         func.bytes(if c.fl > 0 { &c.func[..c.fl as usize] } else { b"Log" });
         let mut rows = Tb::new();
@@ -2097,7 +2101,7 @@ impl Gallery {
                 small(rect(px + 4, py + 3, 132, 14), func.str(), FG, PANEL, 1);
                 small(rect(px + 4, py + 3, 132, 14), dur.str(), FG, PANEL, 4);
                 if c.vals == 0 {
-                    small(rect(px, py + 38, TH_W as i16, 14), "No data", DIM, PANEL, 8);
+                    small(rect(px, py + 38, TH_W as i16, 14), none, DIM, PANEL, 8);
                     small(rect(px + 4, py + 70, 132, 14), rows.str(), DIM, PANEL, 1);
                     return self.finish();
                 }
@@ -2131,7 +2135,7 @@ impl Gallery {
                 sf::rbox(rect(CHART.0, CHART.1, CHART.2, CHART.3), 6, PANEL, M_BG);
                 let (px, py, pw, ph) = PLOT;
                 if c.vals == 0 {
-                    sf::glyphs(sf::TEXT22, rect(px, py, pw, ph), "No data", DIM, PANEL, 8, 0);
+                    sf::glyphs(sf::TEXT22, rect(px, py, pw, ph), none, DIM, PANEL, 8, 0);
                     return self.finish();
                 }
                 for k in 0..3 {
@@ -2389,6 +2393,12 @@ impl Gallery {
             Mode::View => "view",
             Mode::Dialog => "dialog",
         }
+    }
+
+    /// The info box's message and the current file's 8.3 name (tests).
+    #[cfg(test)]
+    pub fn test_info_cur(&self) -> (Option<&'static str>, [u8; 11]) {
+        (if let Dlg::Info(_, m) = self.dlg { Some(m) } else { None }, self.cur.name)
     }
 
     #[cfg(test)]

@@ -138,18 +138,54 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             SendToUart(Encoding.ASCII.GetBytes(text));
         }
 
+        /// Module -> firmware byte time in virtual microseconds (115200 8N1 =
+        /// 86.8 us; 0 = all at once, the model before #123). Each byte is a
+        /// timed action, so the emulation quantum may stretch it (inferred).
+        /// Only this direction is paced: the firmware's bytes leave at once.
+        public int RxByteUs { get; set; } = 87;
+
         /// Injection goes through a timed action so that a monitor command (also
         /// one issued while the emulation is paused) never blocks on the UART's
-        /// receive path; the bytes arrive once the emulation runs.
+        /// receive path; the bytes arrive once the emulation runs, one per
+        /// RxByteUs (a 1.5 kB burst takes 130 ms, as on the wire).
         private void SendToUart(byte[] bytes)
         {
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(1), _ =>
+            lock(rxQueue)
             {
                 foreach(var b in bytes)
                 {
-                    uart.WriteChar(b);
+                    rxQueue.Enqueue(b);
                 }
-            });
+                if(rxPumping)
+                {
+                    return;
+                }
+                rxPumping = true;
+            }
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(1), RxPump);
+        }
+
+        private void RxPump(TimeInterval _)
+        {
+            while(true)
+            {
+                byte b;
+                lock(rxQueue)
+                {
+                    if(rxQueue.Count == 0)
+                    {
+                        rxPumping = false;
+                        return;
+                    }
+                    b = rxQueue.Dequeue();
+                }
+                uart.WriteChar(b);
+                if(RxByteUs > 0)
+                {
+                    machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)RxByteUs), RxPump);
+                    return;
+                }
+            }
         }
 
         // ---- firmware -> module ----
@@ -358,6 +394,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IGPIOReceiver connPort;
         private readonly int connPin;
         private readonly List<byte> line = new List<byte>();
+        private readonly Queue<byte> rxQueue = new Queue<byte>();
+        private bool rxPumping;
         private readonly List<byte> txLine = new List<byte>();
         private bool inAt;
         private byte prevTx = (byte)'\n';

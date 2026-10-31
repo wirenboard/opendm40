@@ -155,6 +155,10 @@ pub fn set_pinch_mode(m: u8) {
 /// what the frame was captured with: the base of every preview.
 struct Cache {
     seg: [(i16, i16); 400],
+    /// The GEN trace's and the DMM CH2's rows per engine column
+    /// (docs/scope-gen-channel.md).
+    gseg: [(i16, i16); 400],
+    c2seg: [(i16, i16); 400],
     valid: bool,
     pos: i32,
     hpos: i32,
@@ -171,6 +175,8 @@ struct Cache {
 #[cfg_attr(target_os = "none", link_section = ".dmabuf")]
 static mut CACHE: Cache = Cache {
     seg: [su::EMPTY; 400],
+    gseg: [su::EMPTY; 400],
+    c2seg: [su::EMPTY; 400],
     valid: false,
     pos: 0,
     hpos: 200,
@@ -191,6 +197,8 @@ pub(super) fn sp_init() {
     let c = cache();
     for i in 0..400 {
         c.seg[i] = su::EMPTY;
+        c.gseg[i] = su::EMPTY;
+        c.c2seg[i] = su::EMPTY;
     }
     for i in 0..399 {
         c.ps_a[i] = su::EMPTY;
@@ -203,6 +211,7 @@ pub(super) fn sp_init() {
     c.tb = 13;
     c.ps_t = 0;
     su::init();
+    crate::scope_ch2::init();
 }
 
 /// AUTO-set state (stock mode 4).
@@ -257,25 +266,25 @@ impl Math {
 }
 
 /// The spectrum job and result: 4 KB, TCM .bss (all-zero `Fft::new`). Its
-/// 8 KiB work buffer is lent by the disk scratch arena (calbackup.rs
+/// 8 KiB work buffer is lent by the disk buffer arena (calbackup.rs
 /// `fft_work`).
 static mut FFT: crate::fft::Fft = crate::fft::Fft::new();
 /// A frame was dropped because a disk job held the work buffer: ask for it
 /// again (a stopped scope re-emits its record) once the buffer is back.
 static mut FFT_RETRY: bool = false;
-const _: () = assert!(crate::calbackup::FFT_WORK == crate::fft::N);
+const _: () = assert!(crate::diskbuf::FFT_WORK == crate::fft::N);
 
 fn fft() -> &'static mut crate::fft::Fft {
     unsafe { &mut *core::ptr::addr_of_mut!(FFT) }
 }
 
-/// The FFT work buffer (calbackup.rs `fft_work`: the disk scratch arena;
+/// The FFT work buffer (diskbuf.rs `fft_work`: the disk buffer arena;
 /// `fresh` = a new job's load). None while a disk job holds it, or a disk
 /// user wrote it since the load: the job in flight, if any, is dropped (the
 /// last result stays) and the frame is asked again.
 #[inline(always)]
 fn fft_work(fresh: bool) -> Option<&'static mut crate::fft::Work> {
-    let w = crate::calbackup::fft_work(fresh);
+    let w = crate::diskbuf::fft_work(fresh);
     if w.is_none() {
         fft().abort();
         unsafe { FFT_RETRY = true };
@@ -350,6 +359,9 @@ pub(super) struct Sp {
     /// page (timebase, flash).
     list: Option<ListTouch>,
     tb_drawn: (u8, bool),
+    /// The REC mark's blink phase drawn while the page is covered (a popup
+    /// leaves the top bar visible); None = not drawn since it was covered.
+    rec_drawn: Option<bool>,
     /// UF-08: the press is on the cursor tab; the selection before the
     /// cursor tab turned the cursors on. UF-09: the last plain tap.
     cur_press: bool,
@@ -413,6 +425,7 @@ impl Sp {
             entries: 0,
             list: None,
             tb_drawn: (255, false),
+            rec_drawn: None,
             cur_press: false,
             presel: false,
             cur_saved: None,
@@ -515,8 +528,10 @@ impl App {
             guide: now < sp.guide_until || sp.touch.is_some_and(|t| t.hit || t.moving),
             xcur: if self.cur.x_on { Some([self.cur.x[0] as i16, self.cur.x[1] as i16]) } else { None },
             ycur: if self.cur.y_on { Some([self.cur.y[0] as i16, self.cur.y[1] as i16]) } else { None },
-            battery: self.power.bars.min(5),
-            charging: self.power.charging(),
+            battery: self.power.shown_bars(now / 1000 & 1 == 1),
+            charging: self.power.on_charger(),
+            usb: self.usb_host,
+            bt: self.bt_on && self.power.bt_connected(),
             roll: self.scope.rolling(),
             record,
             // Combined view: the strip's GEN badge shows it instead.
@@ -546,8 +561,17 @@ impl App {
                 su::SRC_MCX
             },
             amps,
-            wvdiv: if wave { self.scope.vdiv() } else { 0.0 },
+            // The V/div text from the value (fmt_div) also off the Wave
+            // view: `vdiv`'s label is wrong with a x2 / x5 ... probe (#133).
+            wvdiv: self.scope.vdiv(),
             ch1_txt: if wave { self.wave_func_label() } else { "" },
+            // Both scope views (the combined view's strip badge no longer
+            // shows REC: one look everywhere).
+            rec: crate::csvlog::active(),
+            rec_dim: su::rec_blink(now),
+            rec_unit: su::rec_unit(self.rec_func),
+            tsrc: if wave { scope::TSRC_CH1 } else { s.tsrc },
+            ch2_txt: self.ch2_label(true),
         }
     }
 
@@ -621,13 +645,24 @@ impl App {
         if self.sp.covered() {
             return;
         }
-        let Some(r) = self.shown_reading() else {
-            su::meter_strip(&su::StripData::EMPTY);
-            return;
+        let r = match self.shown_reading() {
+            Some(r) => r,
+            // The power meter before its first reading (#108).
+            None if self.dmm.pw.on => self.pw_strip_wait(),
+            None => {
+                su::meter_strip(&su::StripData::EMPTY);
+                return;
+            }
         };
         let (hold, lim) = (self.meter.hold_state(), self.meter.verdict());
-        let mut d = ui::strip_data(&r, hold, lim, self.meter.rel_active(), self.hv_level, self.strip_alt, self.dmm_view.label, crate::csvlog::active());
+        let mut d = ui::strip_data(&r, hold, lim, self.meter.rel_active(), self.hv_level, self.strip_alt, self.dmm_view.label);
         ui::strip_acc(&mut d, &r, self.acc_ctx());
+        if self.dmm_view.short != 0 && r.alert == crate::sentinel::Alert::None {
+            // The beeper indicator (`beep_ind`): the badge and the value green.
+            d.badge = if self.dmm_view.short == 1 { "SHORT" } else { "BEEP" };
+            d.badge_col = ui::SHORT_BG;
+            d.short = true;
+        }
         if self.gen.s.on {
             let mut b = su::Buf::new();
             su::fmt_hz(&mut b, self.gen.actual_hz());
@@ -646,9 +681,22 @@ impl App {
     /// The page from the cached frame and the model (all of it after
     /// `su::invalidate`, the graph after `su::uncover`).
     fn sp_draw_page(&mut self) {
-        self.sp.bubble_dirty = self.sp.bubble;
+        self.sp_prepare();
+        self.sp_draw_widgets();
+    }
+
+    /// The page's graph rows from the cached frame (no drawing).
+    pub(super) fn sp_prepare(&mut self) {
+        // An open popup's box is drawn last: the graph leaves it alone.
+        su::graph().set_hole_at(su::H_POPUP, su::popup_box(self.sp.popup));
         self.sp_render();
         self.sp_math();
+    }
+
+    /// The page from the graph rows and the model: the same pixels on
+    /// every call after `su::invalidate` (App::repaint_strips).
+    pub(super) fn sp_draw_widgets(&mut self) {
+        self.sp.bubble_dirty = self.sp.bubble;
         self.sp_update(self.now);
         self.sp_cells();
         if self.view == View::DmmScope {
@@ -802,6 +850,8 @@ impl App {
         c.hpos = s.hpos;
         c.range = s.range;
         c.tb = s.tb;
+        self.sp_gen_frame(f);
+        self.ch2_rows(f, &mut c.c2seg);
         self.sp_math_frame(f);
         self.sp_render();
     }
@@ -838,6 +888,11 @@ impl App {
         for j in 0..399 {
             let (a, b) = preview_rows(c, j as i32, d_pos, hpos, ky, kx, zr);
             g.tr[j] = if a > b { su::EMPTY } else { (su::trace_fy(h, a as i32), su::trace_fy(h, b as i32)) };
+            // The GEN / CH2 traces only as captured (no preview mapping).
+            let still = d_pos == 0 && hpos == c.hpos && ky == 1.0 && kx == 1.0;
+            let fy = |(a, b): (i16, i16)| if a > b || !still { su::EMPTY } else { (su::trace_fy(h, a as i32), su::trace_fy(h, b as i32)) };
+            g.gn[j] = fy(c.gseg[j]);
+            g.c2[j] = fy(c.c2seg[j]);
             let (pa, pb) = (c.ps_a[j], c.ps_b[j]);
             let (lo, hi) = (pa.0.min(pb.0), pa.1.max(pb.1));
             g.ps[j] = if lo > hi || d_pos != 0 || hpos != c.hpos || ky != 1.0 || kx != 1.0 {
@@ -875,15 +930,13 @@ impl App {
         let amps = wave && self.scope.wave_scale_now().amps;
         let unit = if amps { "A" } else { "V" };
         let mut v = su::Buf::new();
-        if wave {
-            su::fmt_div(&mut v, self.scope.vdiv(), unit);
-        } else {
-            su::vdiv_text(&mut v, vdiv_idx(s.range, s.probe));
-        }
+        // From the value: the label table index (vdiv_idx) is wrong with
+        // a x2 / x5 ... probe (#133).
+        su::fmt_div(&mut v, self.scope.vdiv(), unit);
         let mut sr = su::Buf::new();
         su::fmt_hz(&mut sr, fs as f32);
         let sr = sr.as_str();
-        h.s("# timebase ").s(su::TB_LABELS[s.tb.min(29)]).s("/div, ").s(v.as_str()).s("/div, ");
+        h.s("# timebase ").s(su::TB_LABELS[self.scope.record_tb().min(29)]).s("/div, ").s(v.as_str()).s("/div, ");
         if wave {
             // Source DMM: the HY3131 AD2 stream of the DMM row (app_wave.rs).
             h.s("source DMM ").s(self.wave_func_label()).s(" (AD2, isolated jacks)");
@@ -968,6 +1021,39 @@ impl App {
     /// record around the frame (now, while its samples are still in the
     /// record; `step` finishes it over the next passes), ABS maps the shown
     /// columns.
+    /// The GEN trace of frame `f` (`Cache::gseg`): the generator's volts
+    /// over each column's samples, from the stored record's generator
+    /// phase (scope `gen_sync`), on CH1's scale. Nothing for a roll /
+    /// zoomed-out frame (columns, no samples) or a record without the
+    /// phase.
+    fn sp_gen_frame(&mut self, f: &scope::Frame) {
+        let c = cache();
+        c.gseg = [su::EMPTY; 400];
+        if !self.scope.gen_trace || f.data.len() < 2 {
+            return;
+        }
+        let Some(g) = self.scope.gen_sync() else { return };
+        let rec = self.scope.record();
+        let off = (f.data.as_ptr() as usize).wrapping_sub(rec.as_ptr() as usize) / 2;
+        if off + f.data.len() > rec.len() {
+            return;
+        }
+        let n = f.data.len();
+        let row = |v: f32| self.scope.row_of_volts(v).clamp(-30000.0, 30000.0) as i16;
+        for i in 0..scope::COLS {
+            let (a, b) = if n >= scope::COLS {
+                ((i * n / scope::COLS) as f64, ((i + 1) * n / scope::COLS).max(i * n / scope::COLS + 1) as f64)
+            } else {
+                // Fewer samples than columns: the column's own time span.
+                let k = (n - 1) as f64 / (scope::COLS - 1) as f64;
+                (i as f64 * k, (i as f64 + 1.0) * k)
+            };
+            let (lo, hi) = g.span(off as f64 + a, off as f64 + b);
+            let (r1, r2) = (row(lo), row(hi));
+            c.gseg[i] = (r1.min(r2), r1.max(r2));
+        }
+    }
+
     fn sp_math_frame(&mut self, f: &scope::Frame) {
         let m = self.sp.math;
         if !m.on {
@@ -1028,7 +1114,7 @@ impl App {
     /// One slice of the spectrum job (every pass on the page): a finished
     /// spectrum is drawn.
     fn sp_math_step(&mut self) {
-        if unsafe { FFT_RETRY } && crate::calbackup::fft_free() {
+        if unsafe { FFT_RETRY } && crate::diskbuf::fft_free() {
             unsafe { FFT_RETRY = false };
             self.scope_invalidate();
         }
@@ -1231,17 +1317,27 @@ impl App {
             }
         }
         if self.sp_covered() {
-            // The timebase list leaves the top bar visible: its badge
-            // follows the picks.
-            if matches!(self.sp.popup, su::Popup::Tb(_)) && !self.redraw {
+            // Popups leave the top bar visible: the timebase badge follows
+            // the list's picks and ends its flash (also after a host's
+            // change, #82).
+            if self.sp.popup != su::Popup::None && !self.redraw {
                 let m = self.sp_model(now);
                 if self.sp.tb_drawn != (m.tb, m.tb_flash) {
                     self.sp.tb_drawn = (m.tb, m.tb_flash);
                     su::tb_badge(&m);
                 }
             }
+            // The REC mark keeps blinking above a popup.
+            if crate::csvlog::active() && !self.redraw {
+                let dim = su::rec_blink(now);
+                if self.sp.rec_drawn != Some(dim) {
+                    self.sp.rec_drawn = Some(dim);
+                    su::rec_mark_blink(su::SRC_BADGE, su::C_BAR, !dim, su::rec_unit(self.rec_func));
+                }
+            }
             return;
         }
+        self.sp.rec_drawn = None;
         self.sp_update(now);
     }
 
@@ -1997,7 +2093,7 @@ impl App {
             su::fmt_div(&mut b, self.wave_step_vdiv(p.i), if self.scope.wave_scale_now().amps { "A" } else { "V" });
             b.push("/div");
         } else {
-            su::vdiv_text(&mut b, vdiv_idx(p.i, self.scope.s.probe));
+            su::fmt_div(&mut b, scope::VDIV[p.i.min(9)] * self.scope.s.probe, "V");
             b.push("/div");
         }
         let t = sf::Ink::new(sf::SC_F16, BUBBLE, b.as_str(), 8, 0);
@@ -2119,10 +2215,16 @@ impl App {
             pcond: s.pcond,
             pwidth: s.pwidth,
             runt_v: self.scope.runt_volts(),
+            tsrc: s.tsrc,
+            gen_trace: self.scope.gen_trace,
+            ch2_on: self.ch2.on,
+            ch2_vdiv: self.ch2_label(false),
         }
     }
 
     fn sp_popup_draw(&mut self) {
+        // The box's fills wait for its widgets (lcd.rs "deferred fills").
+        crate::lcd::defer_start();
         let v = self.sp_popvals();
         su::draw_popup(self.sp.popup, &v);
     }
@@ -2133,6 +2235,7 @@ impl App {
         self.sp.popup = p;
         self.sp.list = None;
         self.sp.tb_drawn = (255, false);
+        self.sp.rec_drawn = None;
         if !self.redraw {
             // The CH1 / math pill label shows the open popup (0x7bef).
             let m = self.sp_model(self.now);
@@ -2177,6 +2280,7 @@ impl App {
         // menu "Screenshot" closes it first) after SHOT_SETTLE_MS.
         self.scope_invalidate();
         self.repaint_at = self.now;
+        crate::lcd::defer_start();
         let m = self.sp_model(self.now);
         su::uncover(&m, u & 1 != 0, u & 2 != 0);
         self.sp_draw_page();
@@ -2246,15 +2350,29 @@ impl App {
                 let (x, y) = (p.x as i16, p.y as i16);
                 let had_press = self.sp.pressed_cell.take().is_some();
                 match self.sp.popup {
-                    su::Popup::Mf(t) => self.sp_mf_tap(clk, t, su::mf_hit(t, &v, x, y), now),
-                    su::Popup::Ch1(t) => self.sp_side_tap(false, t, su::side_hit(false, t, &v, x, y), now),
+                    // A toast from the tap (CH2 refused, "Generator is
+                    // off", ...) waits for the popup's repaint (`toast_hold`).
+                    su::Popup::Mf(t) => {
+                        self.toast_hold = true;
+                        self.sp_mf_tap(clk, t, su::mf_hit(t, &v, x, y), now);
+                        self.sp_toast_release(now);
+                    }
+                    su::Popup::Ch1(t) => {
+                        self.toast_hold = true;
+                        self.sp_side_tap(false, t, su::side_hit(false, t, &v, x, y), now);
+                        self.sp_toast_release(now);
+                    }
                     su::Popup::Math(_) if su::panel_hit(p.x, p.y) == Some(4) => {
                         // Stock: the math label with its popup open = math off.
                         self.sp.math.on = false;
                         self.sp_math_changed(false);
                         self.sp_popup_close();
                     }
-                    su::Popup::Math(t) => self.sp_side_tap(true, t, su::side_hit(true, t, &v, x, y), now),
+                    su::Popup::Math(t) => {
+                        self.toast_hold = true;
+                        self.sp_side_tap(true, t, su::side_hit(true, t, &v, x, y), now);
+                        self.sp_toast_release(now);
+                    }
                     su::Popup::Tb(i) => match su::tb_hit(i, x, y) {
                         su::TbHit::Close => self.sp_popup_close(),
                         su::TbHit::Row(r) => self.sp_tb_pick(r, now),
@@ -2343,6 +2461,15 @@ impl App {
         su::mf_display_values(&v);
     }
 
+    /// End of a popup tap (`toast_hold`): its toast now, over the popup
+    /// drawn again.
+    fn sp_toast_release(&mut self, now: u64) {
+        self.toast_hold = false;
+        if self.toast_later_n != 0 && !self.overlay.is_some_and(|o| o.modal()) {
+            self.toast_later_show(now);
+        }
+    }
+
     fn sp_mf_tap(&mut self, clk: &mut Clock, tab: u8, h: su::MfHit, now: u64) {
         let mut st = self.scope.s;
         match h {
@@ -2353,9 +2480,21 @@ impl App {
             su::MfHit::Outside | su::MfHit::Inside | su::MfHit::Bright | su::MfHit::Grid => return,
             su::MfHit::Tab(t) => {
                 if t != tab {
-                    // A shorter page: the page under the old box comes back.
+                    let old = su::popup_box(self.sp.popup);
                     self.sp.popup = su::Popup::Mf(t);
-                    self.redraw = true;
+                    let new = su::popup_box(self.sp.popup);
+                    if let (View::Scope, Some(o), Some(n)) = (self.view, old, new) {
+                        // The new box, then the graph rows the old one
+                        // covered and the new one does not.
+                        self.sp_popup_draw();
+                        let m = self.sp_model(now);
+                        su::regraph_rows(&m, n, n.y + n.h, o.y + o.h);
+                    } else {
+                        // The combined view (its popups cover the meter
+                        // strip): the whole page, the graph skipping the
+                        // new box (sp_draw_page).
+                        self.redraw = true;
+                    }
                 }
                 return;
             }
@@ -2406,6 +2545,26 @@ impl App {
                 }
                 self.scope_set(st, now);
                 // The page height is the same, the rows below change.
+            }
+            su::MfHit::TSrc(t) => {
+                st.tsrc = t.min(1);
+                self.scope_set(st, now);
+                if st.tsrc == scope::TSRC_GEN && !self.gen.s.on {
+                    self.toast(now, "Generator is off", false);
+                }
+            }
+            su::MfHit::Ch2(on) => {
+                self.ch2_set(clk, on);
+            }
+            su::MfHit::Ch2Step(up) => {
+                self.ch2_step(up, now);
+            }
+            su::MfHit::GenTrace(on) => {
+                self.scope.gen_trace = on;
+                // The next record is taken without the comparator (or
+                // with it again): restart the acquisition.
+                self.scope_set(st, now);
+                self.scope_invalidate();
             }
             su::MfHit::PCond(c) => {
                 st.pcond = c.min(2);
@@ -2737,7 +2896,13 @@ impl App {
         // The MCX settings (the wave view's trigger is not persisted).
         let s = &self.scope.mcx_settings();
         let dr = scope::Settings::DEFAULT.runt_row;
-        p[3] = (s.ttype as u32 & 3) | (s.pcond as u32 & 3) << 2 | ((s.runt_row - dr) as i16 as u16 as u32) << 16;
+        // Bits 4 / 5: the trigger source GEN, the GEN trace shown.
+        p[3] = (s.ttype as u32 & 3)
+            | (s.pcond as u32 & 3) << 2
+            | (s.tsrc as u32 & 1) << 4
+            | (self.scope.gen_trace as u32) << 5
+            | (self.ch2.on as u32) << 6
+            | ((s.runt_row - dr) as i16 as u16 as u32) << 16;
         p[4] = if s.pwidth == scope::Settings::DEFAULT.pwidth { 0 } else { s.pwidth.to_bits() };
     }
 
@@ -2762,6 +2927,10 @@ impl App {
         let dd = scope::Settings::DEFAULT;
         st.ttype = (p[3] & 3).min(2) as u8;
         st.pcond = (p[3] >> 2 & 3).min(2) as u8;
+        st.tsrc = (p[3] >> 4 & 1) as u8;
+        self.scope.gen_trace = p[3] >> 5 & 1 != 0;
+        self.ch2.on = p[3] >> 6 & 1 != 0;
+        self.scope.ch2_on = self.ch2.on;
         st.runt_row = dd.runt_row + (p[3] >> 16) as u16 as i16 as i32;
         st.pwidth = if p[4] == 0 { dd.pwidth } else { f32::from_bits(p[4]) };
         self.scope.apply(st, 0);
@@ -2793,7 +2962,9 @@ const AS_P2_MAX: u8 = 3;
 /// AUTO-set decision log (DBG:GEST? after "|AUTO"): per record phase (1
 /// amplitude, 3 period, 2 final; 5 = re-measure at the result range, 4 =
 /// the result), timebase, range, min /
-/// max code, rising crossings, period (phase 4: Cycl) in us.
+/// max code, rising crossings, period (phase 4: Cycl) in us. SRAM, not the
+/// TCM: the stack's headroom.
+#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
 static mut AS_LOG: [(u8, u8, u8, u16, u16, u16, f32); 16] = [(0, 0, 0, 0, 0, 0, 0.0); 16];
 static mut AS_LOG_N: usize = 0;
 

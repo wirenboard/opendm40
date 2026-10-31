@@ -19,11 +19,14 @@ i16 descent }; D = { u8 *bits, entry *tab, u32 n, u8 fmt }; class A entry (12 B)
 
 Emitted storage (docs/fonts.md; the drawn pixels stay the stock ones, checked
 here by decoding every glyph back and by tools/font-matrix): glyphs from
-U+2E80 up (CJK, full-width) are dropped; a 4 bpp glyph becomes row-major
-nibble runs (rle_glyph), a 1 bpp glyph keeps only its ink rows (crop_glyph);
+U+2E80 up (CJK, full-width) are dropped; a 4 bpp glyph becomes Huffman-coded
+row tokens (huf_build / huf_encode, tables HUF_CNT / HUF_SYM shared by all 4 bpp
+fonts), a 1 bpp glyph keeps only its ink rows (crop_glyph);
 one blob per font as a named array in section .rodata.fonts.<NAME>_B, 10-byte
 entries E(code, off, w, h, adv, yoff, t, ih) in .rodata.fonts.<NAME>_E.
 """
+import collections
+import heapq
 import os
 import struct
 import sys
@@ -89,78 +92,197 @@ def pixels(data, w, h, four):
     return [15 if data[p >> 3] & (0x80 >> (p & 7)) else 0 for p in range(w * h)]
 
 
-def pack_nibbles(nib):
-    if len(nib) % 2:
-        nib = nib + [0]
-    return bytes((nib[i] << 4) | nib[i + 1] for i in range(0, len(nib), 2))
+# ---- 4 bpp glyphs: row tokens, static canonical Huffman (docs/fonts.md) ----
+#
+# Each row of a glyph is a sequence of tokens that never crosses the row end:
+#   L(v)    one pixel of coverage v = 1..14;
+#   F0(n), F15(n)  n pixels of 0 / 15;
+#   C(E)    as a row's first token only: the whole row is the row above again.
+# A run length n is a class (CLS_LO / CLS_EB: 1..6, 7-8, 9-12, 13-20, 21-36,
+# 37-68) plus CLS_EB extra bits, or class EOL = up to the end of the row.
+# One byte per symbol: kind << 4 | v (L) or class (runs). Every token is one
+# Huffman code from the table of its context, then the extra bits, MSB first;
+# a glyph starts at a byte boundary. Context: the previous token's kind in
+# the row (S = row start, L, F0, F15). docs/fonts.md has the measured
+# alternatives (contexts by the pixel above with partial row copies).
+# The encoder parses each row optimally (dynamic programming on the code
+# lengths) and alternates parse and Huffman construction a few times; the
+# tables are shared by all 4 bpp fonts.
+CLS_LO = (1, 2, 3, 4, 5, 6, 7, 9, 13, 21, 37)
+CLS_EB = (0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5)
+EOL = 11
+K_L, K_F0, K_F15, K_C = 0, 1, 2, 3
+HUF_ITERS = 6
+NCTX = 4
 
 
-def rle_glyph(px, w, h):
-    """4 bpp glyph -> row-major nibble RLE (stockfont.rs `Cur`), MSB nibble
-    first, byte-aligned per glyph. Tokens: 1..14 = one pixel of that
-    coverage; 0|15 then n: n = 0..13 -> n + 1 pixels of 0|15, n = 14 -> two
-    more nibbles L: 15 + L pixels (15..270); 0 then 15, k (at a row start
-    only): the previous literal row again k + 1 times. No run crosses a row."""
-    rows = [[px[x * h + y] for x in range(w)] for y in range(h)]
+def cls_of(n):
+    assert 1 <= n <= CLS_LO[-1] + (1 << CLS_EB[-1]) - 1, n
+    i = len(CLS_LO) - 1
+    while CLS_LO[i] > n:
+        i -= 1
+    return i
+
+
+def huf_parse_row(r, p, cost):
+    """Cheapest token list of row r (p = the row above or None) under
+    cost(ctx, sym): [(ctx, sym, nextra, extra, n)]. ctx = the previous
+    token's kind in the row: 0 row start, 1 + K_L / K_F0 / K_F15."""
+    w = len(r)
+    run = [0] * (w + 1)
+    for x in range(w - 1, -1, -1):
+        run[x] = 1 + (run[x + 1] if x + 1 < w and r[x + 1] == r[x] else 0)
+    cp = [0] * (w + 1)
+    if p is not None:
+        for x in range(w - 1, -1, -1):
+            cp[x] = 1 + cp[x + 1] if r[x] == p[x] else 0
+    best = [dict() for _ in range(w + 1)]
+    best[0][0] = (0, None)
+    for x in range(w):
+        v = r[x]
+        for pk, (c0, _) in sorted(best[x].items()):
+            cx = pk
+            cands = []
+            if 1 <= v <= 14:
+                cands.append((K_L << 4 | v, 0, 0, 1, 1 + K_L))
+            runs = []
+            if v == 0:
+                runs.append((K_F0, run[x]))
+            if v == 15:
+                runs.append((K_F15, run[x]))
+            if x == 0 and p is not None and cp[0] == w:
+                cands.append((K_C << 4 | EOL, 0, 0, w, 1 + K_C))
+            for kind, m in runs:
+                for n in range(1, min(m, 68) + 1):
+                    if x + n == w:
+                        cands.append((kind << 4 | EOL, 0, 0, n, 1 + kind))
+                    c = cls_of(n)
+                    cands.append((kind << 4 | c, CLS_EB[c], n - CLS_LO[c], n, 1 + kind))
+            for s, ne, ev, n, k in cands:
+                c = c0 + cost(cx, s) + ne
+                nb = best[x + n]
+                if k not in nb or c < nb[k][0]:
+                    nb[k] = (c, (x, pk, cx, s, ne, ev, n))
+    k = min(sorted(best[w]), key=lambda kk: best[w][kk][0])
     out = []
-    prev = None
-    y = 0
-    while y < h:
-        r = rows[y]
-        if prev is not None and r == prev:
-            k = 0
-            while y + k + 1 < h and rows[y + k + 1] == prev and k < 15:
-                k += 1
-            out += [0, 15, k]
-            y += k + 1
-            continue
-        i = 0
-        while i < w:
-            v = r[i]
-            if v in (0, 15):
-                j = i
-                while j < w and r[j] == v and j - i < 270:
-                    j += 1
-                L = j - i
-                out += [v, L - 1] if L <= 14 else [v, 14, (L - 15) >> 4, (L - 15) & 15]
-                i = j
-            else:
-                out.append(v)
-                i += 1
-        prev = r
-        y += 1
-    return pack_nibbles(out)
+    x = w
+    while x > 0:
+        _, (px, pk, cx, s, ne, ev, n) = best[x][k]
+        out.append((cx, s, ne, ev, n))
+        x, k = px, pk
+    return out[::-1]
 
 
-def unrle_glyph(b, w, h):
-    nib = [(c >> 4, c & 15)[k] for c in b for k in (0, 1)]
-    pos = 0
+def huf_lengths(freq):
+    """Huffman code lengths {sym: len} of one context (deterministic ties)."""
+    items = sorted(freq.items())
+    if len(items) == 1:
+        return {items[0][0]: 1}
+    heap = [(f, i, [s]) for i, (s, f) in enumerate(items)]
+    heapq.heapify(heap)
+    L = {s: 0 for s, _ in items}
+    cnt = len(heap)
+    while len(heap) > 1:
+        f1, _, a = heapq.heappop(heap)
+        f2, _, b = heapq.heappop(heap)
+        for s in a + b:
+            L[s] += 1
+        heapq.heappush(heap, (f1 + f2, cnt, a + b))
+        cnt += 1
+    return L
+
+
+def huf_canon(lens):
+    """Canonical codes {sym: (code, len)}: by length, then symbol byte."""
+    code, prev, out = 0, 0, {}
+    for s in sorted(lens, key=lambda s: (lens[s], s)):
+        code <<= lens[s] - prev
+        prev = lens[s]
+        out[s] = (code, prev)
+        code += 1
+    return out
+
+
+def huf_build(glyphs):
+    """glyphs: [(w, h, px column-major)] -> (token lists, per-context
+    {sym: len}). Alternates the optimal parse and the code lengths."""
+    rows = [[[px[x * h + y] for x in range(w)] for y in range(h)] for w, h, px in glyphs]
+    lens = None
+    for _ in range(HUF_ITERS):
+        if lens is None:
+            cost = lambda cx, s: 1 if (s >> 4) in (K_F0, K_C) else 4
+        else:
+            cost = lambda cx, s: lens[cx].get(s, 20)
+        toks = [[t for y, r in enumerate(g) for t in huf_parse_row(r, g[y - 1] if y else None, cost)] for g in rows]
+        freq = [collections.Counter() for _ in range(NCTX)]
+        for gt in toks:
+            for cx, s, _, _, _ in gt:
+                freq[cx][s] += 1
+        lens = [huf_lengths(f) if f else {} for f in freq]
+    return toks, lens
+
+
+def huf_encode(toks, codes):
+    bits = []
+    for cx, s, ne, ev, _ in toks:
+        c, n = codes[cx][s]
+        bits += [(c >> (n - 1 - i)) & 1 for i in range(n)]
+        bits += [(ev >> (ne - 1 - i)) & 1 for i in range(ne)]
+    out = bytearray((len(bits) + 7) // 8)
+    for i, b in enumerate(bits):
+        out[i >> 3] |= b << (7 - (i & 7))
+    return bytes(out), len(bits)
+
+
+def huf_decode(b, w, h, cnt, syms):
+    """Mirror of stockfont.rs `Glyph::token` (canonical decode from the
+    per-length counts): the glyph's pixels, column-major."""
+    pos = [0]
+
+    def bit():
+        v = (b[pos[0] >> 3] >> (7 - (pos[0] & 7))) & 1 if (pos[0] >> 3) < len(b) else 0
+        pos[0] += 1
+        return v
+
     rows = []
-    src = None
-    while len(rows) < h:
-        if nib[pos] == 0 and nib[pos + 1] == 15:
-            rows += [rows[src]] * (nib[pos + 2] + 1)
-            pos += 3
-            continue
+    for y in range(h):
+        p = rows[-1] if rows else None
         r = []
+        pk = 0
         while len(r) < w:
-            v = nib[pos]
-            if v in (0, 15):
-                n = nib[pos + 1]
-                if n == 14:
-                    L = 15 + (nib[pos + 2] << 4 | nib[pos + 3])
-                    pos += 4
-                else:
-                    L = n + 1
-                    pos += 2
-                r += [v] * L
+            x = len(r)
+            cx = pk
+            code = first = idx = 0
+            for l in range(len(cnt[cx])):
+                code |= bit()
+                c = cnt[cx][l]
+                if code - first < c:
+                    s = syms[cx][idx + code - first]
+                    break
+                idx += c
+                first = (first + c) << 1
+                code <<= 1
             else:
-                r.append(v)
-                pos += 1
-        src = len(rows)
+                raise AssertionError('bad code')
+            kind, c = s >> 4, s & 15
+            if kind == K_L:
+                r.append(c)
+            else:
+                if c == EOL:
+                    n = w - x
+                else:
+                    e = 0
+                    for _ in range(CLS_EB[c]):
+                        e = e << 1 | bit()
+                    n = CLS_LO[c] + e
+                assert x + n <= w and (kind != K_C or (x == 0 and c == EOL))
+                if kind == K_C:
+                    r += p
+                else:
+                    r += [0 if kind == K_F0 else 15] * n
+            pk = 1 + kind
         rows.append(r)
-    assert len(rows) == h
-    return [rows[y][x] for x in range(w) for y in range(h)]
+    return [rows[y][x] for x in range(w) for y in range(h)], pos[0]
 
 
 def crop_glyph(px, w, h):
@@ -291,8 +413,23 @@ def main():
         ('SC_BATT', 0x0806BD44, lambda: load(0x0806BD44)),                    # battery
         ('SC_F16', 0x0804F260, lambda: load(0x080534C4)),                     # 16 px popup ASCII (wrapper)
     ]]
-    for name, a, src in fonts:
-        line_h, descent, four, gl, cls = src()
+    loaded = [(name, a, src()) for name, a, src in fonts]
+    # The 4 bpp glyphs of every font, in emit order: one token parse and one
+    # set of Huffman tables for all of them.
+    four_gl = [(gw, gh, pixels(data, gw, gh, True)) for _, _, (_, _, four, gl, _) in loaded if four
+               for (code, gw, gh, adv, yoff, data) in gl if code < CJK_FROM]
+    toks, lens = huf_build(four_gl)
+    codes = [huf_canon(ls) for ls in lens]
+    maxl = max(max(ls.values()) for ls in lens if ls)
+    # Every token (code + extra bits) fits the decoder's 25-bit window.
+    assert maxl + max(CLS_EB) <= 25, maxl
+    cnt = [[sum(1 for s in ls if ls[s] == l + 1) for l in range(maxl)] for ls in lens]
+    syms = [sorted(ls, key=lambda s: (ls[s], s)) for ls in lens]
+    four_toks = iter(toks)
+    ntok = sum(len(gt) for gt in toks)
+    short = [sum(1 for gt in toks for cx, s, _, _, _ in gt if lens[cx][s] <= k) * 100.0 / ntok for k in range(1, maxl + 1)]
+    huf_bytes = sum(len(c) + len(s) for c, s in zip(cnt, syms))
+    for name, a, (line_h, descent, four, gl, cls) in loaded:
         bpp = 4 if four else 1
         blob = bytearray()
         entries = []
@@ -303,8 +440,11 @@ def main():
                 continue
             px = pixels(data, gw, gh, four)
             if four:
-                enc = rle_glyph(px, gw, gh)
-                assert unrle_glyph(enc, gw, gh) == px, (name, code)
+                enc, nbits = huf_encode(next(four_toks), codes)
+                # Cur keeps glyph-relative bit positions in a u16.
+                assert nbits < 0x10000, (name, code)
+                dec, used = huf_decode(enc, gw, gh, cnt, syms)
+                assert dec == px and used == nbits, (name, code)
                 t, ih = 0, gh
             else:
                 enc, t, ih = crop_glyph(px, gw, gh)
@@ -351,8 +491,38 @@ def main():
             out.append(';')
         # Emit the FontData.
         out.append('pub static %s_FD: FontData = FontData{line_h:%d,descent:%d,fmt:%s,entries:&%s_E,blob:&%s_B};'
-                   % (name, line_h, descent, 'RLE4' if four else 'BIT1', name, name))
+                   % (name, line_h, descent, 'HUF' if four else 'BIT1', name, name))
         out.append('')
+
+    # The Huffman tables of the 4 bpp glyphs (docs/fonts.md): per context the
+    # number of codes of each length 1..HUF_MAXL and the symbols in code order.
+    out.append('/// Longest Huffman code, bits.')
+    out.append('pub const HUF_MAXL: usize = %d;' % maxl)
+    cc = codes[0].get(K_C << 4 | EOL)
+    out.append('/// Code of C(E) (the row above again) at a row start, in its')
+    out.append('/// HUF_COPY_LEN low bits (0: none).')
+    out.append('pub const HUF_COPY_CODE: u32 = %d;' % (cc[0] if cc else 0))
+    out.append('pub const HUF_COPY_LEN: u32 = %d;' % (cc[1] if cc else 0))
+    out.append('/// Codes per length 1..HUF_MAXL, per context.')
+    out.append('#[link_section = ".rodata.fonts.HUF_CNT"]')
+    out.append('pub static HUF_CNT: [[u8; HUF_MAXL]; %d] = [' % len(cnt))
+    for c in cnt:
+        out.append('    [%s],' % ', '.join(str(v) for v in c))
+    out.append('];')
+    soff = [0]
+    for sy in syms:
+        soff.append(soff[-1] + len(sy))
+    out.append('/// First symbol of each context in HUF_SYM.')
+    out.append('#[link_section = ".rodata.fonts.HUF_SOFF"]')
+    out.append('pub static HUF_SOFF: [u16; %d] = [%s];' % (len(soff), ', '.join(str(v) for v in soff)))
+    out.append('/// Symbols (kind << 4 | coverage or length class), canonical code order.')
+    out.append('#[link_section = ".rodata.fonts.HUF_SYM"]')
+    out.append('pub static HUF_SYM: [u8; %d] = [' % soff[-1])
+    for sy in syms:
+        if sy:
+            out.append('    %s,' % ', '.join('0x%02X' % v for v in sy))
+    out.append('];')
+    out.append('')
 
     # Address -> embedded FontData dispatch, so stockfont::Font can stay keyed
     # by the original stock flash address (no call site changes).
@@ -371,6 +541,9 @@ def main():
     # Self-check report.
     print('fonts: %d  glyphs: %d  blob bytes: %d (raw %d; dropped %d CJK glyphs, %d raw bytes)'
           % (len(fonts), total_glyphs, total_blob, raw_total[0], dropped[0], dropped[1]))
+    print('4 bpp: %d contexts, max code %d bits, tables %d bytes (counts + symbols + offsets)'
+          % (len(cnt), maxl, huf_bytes + 2 * len(soff)))
+    print('  %d tokens; share with a code of <= k bits: %s' % (ntok, ' '.join('%d:%.1f%%' % (k + 1, v) for k, v in enumerate(short))))
     for (name, cls, bpp, lh, desc, n, nb) in summary:
         print('  %-9s class %-2s %dbpp line_h=%-3d descent=%-2d glyphs=%-4d blob=%d'
               % (name, cls, bpp, lh, desc, n, nb))

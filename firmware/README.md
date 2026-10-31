@@ -13,6 +13,7 @@ tools/reload.sh               # build, upload over USBTMC, install, check
 tools/ui-render/run.sh OUT    # render every screen to PNG + layout check
 tools/scpi-doc-check/run.sh   # SCPI parser vs docs/manual/scpi-reference.md
 tools/linkcheck.py ..         # every relative link and #anchor in the *.md files
+tools/doc-lang-check.sh origin/main  # English and Russian README/manual in step
 ../emu/run.py fwrs --run-for 4 --shot out.png   # run opendm40 in the emulator
 ```
 
@@ -98,8 +99,9 @@ python3 tools/dm40dbg.py recover             # DESTRUCTIVE: into the vendor upda
 
 **Watchdog.** The main loop feeds it while it runs. A hang, a panic (magenta
 bar at the bottom) or `DBG:RELEASE` resets the meter after ~20 s and opendm40
-reboots once; a second one within 60 s enters recovery (the loader update
-screen). Details: [native-boot.md, Normal native mode](docs/native-boot.md#normal-native-mode).
+reboots, every time (no automatic entry into the loader; the crash count is in
+`DBG:BOOT?`). `dm40dbg.py loader` (`DBG:LOADER`) opens the vendor loader with
+the marker kept: a power cycle boots opendm40 again. Details: [native-boot.md, Normal native mode](docs/native-boot.md#normal-native-mode).
 
 **Bring-up failures** show as red squares at the top left (`fail` in
 [`src/main.rs`](src/main.rs)): slot 0 = PLLSAI (the 48 MHz USB clock) not
@@ -167,11 +169,28 @@ and pull request to `main`; a push that changes only documentation (Markdown, `d
 |---|---|
 | Build | `build.sh --locked` (stack, region and update-file checks fail it), [`tools/build-variants`](tools/build-variants/run.sh); the image and `SHA256SUMS` as a workflow artifact |
 | Host tests | [`tools/ci-tests.sh`](tools/ci-tests.sh): the host suites listed in the script, `JOBS` at a time (default: the CPU count; each suite's log printed whole after all finish); `stock-ui` decodes [`dm40_v_2_6.bin`](../stock/vendor/dm40_v_2_6.bin) first |
-| Doc checks | [`tools/linkcheck.py`](tools/linkcheck.py), [`tools/scpi-doc-check`](tools/scpi-doc-check/run.sh) |
+| Doc checks | [`tools/linkcheck.py`](tools/linkcheck.py), [`tools/scpi-doc-check`](tools/scpi-doc-check/run.sh), [`tools/doc-lang-check.sh`](tools/doc-lang-check.sh) (the English and Russian README and manual: same headings and images; on a pull request both languages changed, see [AGENTS.md](../AGENTS.md)) |
 | Version | [`tools/version-check.sh`](tools/version-check.sh): fails when the firmware changed since the last `v*` tag but the version did not; on a pull request [`tools/pr-version-check.sh`](tools/pr-version-check.sh) also fails when the PR changes the firmware without raising the version above `main`'s |
 
 The emulator tests ([emu/README.md](../emu/README.md)) are not in CI: they
 need a flash dump of a meter.
+
+### PR builds
+
+On a pull request the Build job sets `DM40_VERSION_SUFFIX=-pr<N>.<head commit>`
+([`build.rs`](build.rs), [`tools/fw-version.sh`](tools/fw-version.sh)): the
+version becomes e.g. `0.3.2-pr148.1a2b3c4`, the file
+`dm40_opendm40_v0.3.2-pr148.1a2b3c4.bin`, the artifact the same name without
+`.bin`. Pushes, releases and local builds keep the plain version. After CI,
+[`pr-build.yml`](../.github/workflows/pr-build.yml) (`workflow_run`, with
+write permission, never runs PR code) runs
+[`tools/pr-build.sh`](tools/pr-build.sh) `publish`: the `.bin` goes to the
+prerelease [`pr-builds`](https://github.com/opendm40/opendm40/releases/tag/pr-builds)
+(one file per PR, the previous one deleted), and one comment per PR links it
+with its SHA-256 and commits. On close (`pull_request_target`, no checkout of
+the PR) `remove` deletes the PR's file. The `pr-builds` tag is not a `v*` tag:
+the release workflow and the version checks skip it. These jobs run from
+`main` only; by hand: `gh workflow run pr-build.yml -f run_id=<CI run id>`.
 
 ### Releasing
 
@@ -216,7 +235,7 @@ feature, in the same commit.
 | Path | What |
 |---|---|
 | [`src/`](src) | The firmware (crate `opendm40`) |
-| [`tools/`](tools) | Host tools ([`dm40dbg.py`](tools/dm40dbg.py) USB debug link, [`dm40scpi.py`](tools/dm40scpi.py) SCPI client, [`dm40bt_scpi.py`](tools/dm40bt_scpi.py), [`reload.sh`](tools/reload.sh), [`dlog.py`](tools/dlog.py), font and table generators) and the host test suites (`tools/*/run.sh`) |
+| [`tools/`](tools) | Host tools ([`dm40dbg.py`](tools/dm40dbg.py) USB debug link, [`dm40scpi.py`](tools/dm40scpi.py) SCPI client, [`dm40bt_scpi.py`](tools/dm40bt_scpi.py), [`reload.sh`](tools/reload.sh), [`dlog.py`](tools/dlog.py), [`c2meter.py`](tools/c2meter.py) (Alientek C2 USB tester over BLE), font and table generators) and the host test suites (`tools/*/run.sh`) |
 | [`docs/`](docs) | Firmware docs, see [Documentation](#documentation) |
 | [`ref/`](ref) | Reference screenshot of the stock firmware |
 | [`vendor/usbd-storage/`](vendor/usbd-storage) | usbd-storage 3.0.0 with the DM40 patches ([`Cargo.toml`](Cargo.toml)) |
@@ -230,8 +249,9 @@ records, hardware, history): [docs/README.md](../docs/README.md).
 Host tests: `tools/*/run.sh`, one suite per directory in [`tools/`](tools)
 (for example [`fatren-test`](tools/fatren-test), [`scpi-test`](tools/scpi-test),
 [`touch-test`](tools/touch-test), [`ui-render`](tools/ui-render)), and
-[`tools/linkcheck.py`](tools/linkcheck.py) and
-[`tools/scpi-doc-check`](tools/scpi-doc-check/run.sh) for the docs. The
+[`tools/linkcheck.py`](tools/linkcheck.py),
+[`tools/scpi-doc-check`](tools/scpi-doc-check/run.sh) and
+[`tools/doc-lang-check.sh`](tools/doc-lang-check.sh) for the docs. The
 emulator tests: [emu/README.md](../emu/README.md).
 
 ### Stock-firmware analysis (private)

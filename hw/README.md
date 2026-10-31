@@ -211,6 +211,25 @@ updates.
   ([`lcd.rs`](../firmware/src/lcd.rs)). The ID register 0xD3 reads `00 94 88` on this unit.
 - Backlight: PA6 AF9 = TIM13_CH1, 20 kHz PWM ([`board.rs`](../firmware/src/board.rs)).
 - Panel: 3.5" IPS 480 x 320 (review). The panel's FPC pinout is unknown.
+- Tearing-effect output (TE): whether it reaches an MCU pin is unknown;
+  *inferred* not wired. The stock init sequence has no TEON (0x35) and the
+  stock drawing has no tearing control (`stock/re/analysis/lcd_buzzer_v2_6.h`,
+  `gui_render_v2_6.h`); neither firmware configures a pin for it. The only
+  candidates are the pins no code is known to use: PA3, PB13, PC1, PC15
+  ([Pin table](#pin-table)). `DBG:TE?` ([`lcd.rs`](../firmware/src/lcd.rs)
+  `te_probe`) counts the level changes of those four pins for 100 ms each
+  with TE off, on in mode 0 (V-blank) and on in mode 1 (V- and H-blank),
+  then sends TEOFF; it only reads the pins. A pin that changes only while
+  TE is on (~60 Hz in mode 0, much faster in mode 1) is TE; floating pins
+  can change in all three phases. Not run on a device yet.
+- If TE is wired: with opendm40's MADCTL (MV = 1) the panel scans along
+  our x axis (*inferred*; the scan direction is not checked), so writes
+  synced to TE would have to go in vertical bands (columns of the
+  landscape screen), not in the full-width strips of
+  [`lcd.rs`](../firmware/src/lcd.rs) "strip rendering". Those strips
+  write every pixel once in its final colour, so without TE a refresh
+  during a page change shows the new page above a seam and the
+  old page below it.
 
 ## Touch panel and touch keys
 
@@ -299,12 +318,15 @@ bootloader and the FS-loader before the application runs.
    then press "update" on the screen.
 5. Remove the short.
 
-Untested: the exact timing, i.e. whether the short must be in place at power-on
-(as written above) or also works when applied during a reset, and how long
-it must be held.
+Untested: whether the short also works when applied during a reset. It must
+hold through both polls: the ROM's 1000 reads, then the FS-loader's
+(about 0.5 s each in the emulator; any high read launches the application).
 
-Software ways to the same screen while opendm40 runs (`DBG:UPDATE`, the key-hold
-recovery, the double-hang rule) are in [the manual, Reach the update loader](../docs/manual/README.md#reach-the-update-loader).
+opendm40 does the same in software: `DBG:LOADER` and the power-key hold at
+power-on drive PA2 low and lock the pin before jumping to the bootloader
+([native-boot.md, PA2 entry](../firmware/docs/native-boot.md#pa2-entry-bootloader_pa2)).
+The short is needed only when opendm40 hangs before its shim reads the key;
+the user steps are in [the manual, Reach the update loader](../docs/manual/README.md#reach-the-update-loader).
 
 ## USB
 
@@ -503,7 +525,12 @@ section 4 (sentinels) and 3 (power meter).
   CMPLO. *Inferred* reading: CMPHO = node above VRH, CMPLO = node above VRL,
   ACPO (bit 6) a latch set above VRH and reset below VRL; 0x70 = above the
   window, 0x50 = inside coming from above, 0x10 = inside coming from below,
-  0x00 = below. It fits DC V's V-tap window (+1 V: 0x10, +5 V: 0x70).
+  0x00 = below. It fits DC V's V-tap window (+1 V: 0x10, +5 V: 0x70). It
+  does not fit PB1 (2026-10-27): with PB1 at ~2 mV (AD1, below) the PB1
+  comparator reads 0x00 in the ±20.8 / 41.7 / 62.5 mV windows (R21 0xdd /
+  0xcc / 0xbb), and 0x10 with nothing connected whenever the low threshold
+  is AGNDN4..6 (0xaa, 0x99, 0x88, 0xba); AGNDP4..6 over AGNDN3 (0xab, 0x9b,
+  0x8b) read 0x00. What the bits mean is *unknown*.
 - **Both bits in one read (0x70)** also mark an overdriven comparator: on
   PB1 in the ohm rows with 5 V or 10 V DC or the 0 / 9.5 V square on V-COM
   (1 V and 3 V: no hit), on DC V's V tap with a steady 5 V, and on SENSE in
@@ -522,11 +549,39 @@ section 4 (sentinels) and 3 (power meter).
   - frequency: the AD1 peak on PB1 - PB3 (the AC rows' settings) stands at
     ~+41 100 codes (~54 mV) with 0..2 V or nothing on V-COM, ~3 100 at 5 V,
     -850 at 10 V (d8e249d); the row leaves the input divider open (R2C / R2D
-    0);
+    0). That row also keeps R33 SAD1I = 11 (AD1 on the temperature sensor
+    inputs), so these codes are *inferred* not to be PB1: with SAD1I = 00
+    PB1 - PB3 reads 2.5 mV at rest and -59 / -89 mV at 3 / 3.7 V (table
+    below);
   - DC V 60 / 600 / 1000 V: the comparator on PB1 tripped for as long as
     10 V was on V-COM, never on 6 V at 1 V (f80524f). Those rows drive the
     power bus from OP3 (R2F SMODE 0100, PS6 + PS8 closed); the 6 V row leaves
-    it off.
+    it off. With that comparator row back (`DBG:SENT:VAR 4`) CTSTA reads 0x50
+    at every R21 from ±20.8 to ±417 mV, also with V-COM open, while AD1 reads
+    PB1 at 2.1 mV up to 3.7 V (2026-10-27): the trip is not PB1 pickup.
+- **PB1 with AD1** (2026-10-27, A jack open, manual ranges; AD1 on PB1 -
+  PB3, then PB1 - AGND, IG 0.9, REFO / AGND, SAD1I = 00, in the row the
+  function runs; branch `exp/pb1-meas`, `DBG:SENT:PB1?`). mV, PB1 - PB3 /
+  PB1 - AGND, by the V-COM DC level (>1389 = AD1 at its limit):
+
+  | row | V-COM off | 1 V | 3 V | 3.7 V | 5 V | 10 V |
+  |---|---|---|---|---|---|---|
+  | DC V 6 V | 2.2 / 2.2 | 2.2 / 2.2 | 2.2 / 2.2 | 2.2 / 2.2 | 2.2 / 2.2 | 2.2 / 2.2 |
+  | DC V 60 / 600 / 1000 V | 2.1 / 2.1 | 2.1 / 2.1 | 2.1 / 2.1 | 2.1 / 2.1 | 2.1 / 2.1 | 2.1 / 2.1 |
+  | DC mV 600 / 60 mV | 2.2 / 2.2 | 2.2 / 2.2 | 4.1 / 11.7 | 67 / 240 | 350 / 652 | 1015 / >1389 |
+  | AC V 6 / 60 V | 1.4..3.0 | 1.4..3.0 | 1.4..3.0 | 1.4..3.0 | 1.4..2.7 | 1.4..1.5 |
+  | AC mV 600 mV | 1.5 / 1.7 | 1.4 / 2.6 | -48 / 109 | -74 / 170 | -94 / 235 | -112 / 358 |
+  | ohm 600 Ω | 2.2 / 2.2 | 2.2 / 2.2 | 2.5 / 2.4 | 4.1 / 4.0 | 238 / 353 | 961 / 1289 |
+  | ohm 6 kΩ | 2.2 / 2.2 | 2.2 / 2.2 | 2.3 / 2.8 | -23 / 155 | 191 / 538 | 818 / 1332 |
+  | ohm 60 MΩ | 2.2 / 2.2 | 2.2 / 2.2 | 4.6 / 12.7 | 62 / 264 | 357 / 698 | 1000 / >1389 |
+  | temperature (TC) | 2.2 / 2.2 | 2.2 / 2.2 | -0.7 / 6.2 | 48 / 174 | 319 / 550 | 999 / 1340 |
+  | Hz | 2.5 / 1.8 | 1.8 / 1.8 | -59 / 64 | -89 / 108 | -116 / 164 | -140 / 291 |
+  | capacitance (AUTO) | 2.1 / 2.0 | 2.1 / 2.0 | -42 / 5.0 | 3.8 / 4.5 | -148 / 11 | -242 / 22 |
+
+  The difference of the two is PB3 - AGND: it follows the input too (Hz at
+  10 V: +431 mV, DC mV at 5 V: +302 mV). The ohm, DC mV and temperature
+  rows read 0x70 on the PB1 comparator at 5 and 10 V with R21 0xdd, 0xcc,
+  0xbb and 0x8b alike; DC V 6 V reads 0x00 at 10 V.
 - **OP1's chopper** (OP1CHOP = 10, 2 kHz in the stock AC V row, with AD1 off)
   starts when AD1 is turned on in that row: a 2 kHz square of OP1's offset
   (x10 in 6 V) at OP1O -> PB4 put a constant ~37 mV RMS floor on AC V 6 V
@@ -609,8 +664,8 @@ sections by commit ("f80524f", "d8e249d", "519fb8a", "469f354", "6bc494a",
   2-pin connector "VBAT" (photo). Runtime 10..15 h (chat reports; review:
   12 h DMM / 10 h scope).
 - Charger: [TP4056](datasheets/toppower-tp4056-cn.pdf), linear, from USB VBUS. Charging takes ~2 h 35 min (chat
-  report [#16625](https://t.me/S2084K/16625)). Status: PB10 / PB11 inputs (meaning guessed; the two RE
-  headers disagree, see [Unknowns](#unknowns)).
+  report [#16625](https://t.me/S2084K/16625)). Status: PB10 = input power present, PB11 = STDBY
+  (*inferred*, see the pin table and [Unknowns](#unknowns) 5).
 - Battery voltage: PC5 = ADC0 channel 15, 1:2 divider, 3.0 V reference
   assumed: Vbat = raw * 3.0 / 4096 * 2. Firmware powers off below ~3.31 V.
   ([`firmware/src/power.rs`](../firmware/src/power.rs), `stock/re/analysis/dmm_v2_6.h`); the divider ratio is
@@ -650,8 +705,8 @@ opendm40 or stock code that drives the pin.
 | PA13 / PA14 | SWD (pads "D" / "C") | io | debug header |
 | PA15 | TIM2_CH1 (AF1): scope trigger comparator (stock) | in | stock, [`hwtrig.rs`](../firmware/src/hwtrig.rs) |
 | PB0..PB9 | [3PA1030](datasheets/3peak-3pa1030-reva1.pdf) data D0..D9 | in | [`scope.rs`](../firmware/src/scope.rs) |
-| PB10 | charge status / control (meaning *inferred*) | in / od | stock code, `stock/re/analysis/dmm_v2_6.h`, [`power.rs`](../firmware/src/power.rs) |
-| PB11 | charge status (meaning *inferred*) | in, pull-up | stock code, `stock/re/analysis/dmm_v2_6.h`, [`power.rs`](../firmware/src/power.rs) |
+| PB10 | charger input power present: 1 against the MCU pull-down with USB power, 0 within ~8 ms of a USB power cut. Driven low, the charge stops; released, the charger goes to standby until the next replug (above ~4.1 V); a charger input (CE or TEMP, *inferred*). The stock pulses it low ~10 ms per 2 s on USB power below 80..85 % for its battery reading (Unknowns 5) | in (stock: od, released) | device 2026-10-29 (`DBG:CHG?`, `DBG:CHG:LOG?`), stock code (`FUN_0800b5f6`, `FUN_08023b04`), [`power.rs`](../firmware/src/power.rs) |
+| PB11 | TP4056 STDBY (*inferred*): 0 against the pull-up when charged on USB power, 1 without input power and for 3.5..4.5 s after USB power returns (a new cycle on a full battery) | in, pull-up | device 2026-10-29, stock code (`FUN_0800b5f6`), [`power.rs`](../firmware/src/power.rs) |
 | PB12 | generator path select, 1 = PWM, 0 = DAC | out | [`gen.rs`](../firmware/src/gen.rs) |
 | PB14 | TIM12_CH1 (AF9) generator square | out | [`gen.rs`](../firmware/src/gen.rs) |
 | PB15 | scope 4051 select bit | out | [`scope.rs`](../firmware/src/scope.rs) |
@@ -717,9 +772,34 @@ header's RX pad), PB13, PC1, PC15. Whether they are connected is unknown.
 4. The MCU crystal: 25 MHz by the PLL read-back and the photo, 26 MHz in the
    community BOM (jebem, EEVblog thread, after mydigit.cn). The 25 MHz value
    is the one the running firmware depends on.
-5. Charge status pins: `stock/re/analysis/dmm_v2_6.h` says the stock shows the charging icon
-   when PB10 = 1 and PB11 = 0; `stock/re/analysis/bt_meas_v2_6.h` and [`firmware/src/power.rs`](../firmware/src/power.rs) use
-   PB10 = 1 and PB11 = 1 for "charging". Both are guesses about the meaning.
+5. Charge status pins. Measured (2026-10-29, battery 4.23 V): PB10 follows USB power; PB11 is low
+   when charged, high without input power and during a charge cycle. *Inferred*: PB11 = STDBY (the
+   only TP4056 pin that fits all states), PB10 = a charger input tied to VIN (CE or TEMP; PROG would
+   not hold 1 against the pull-down in standby), the CHRG pin on no MCU pin. The stock shows charging
+   when PB10 = PB11 = 1 (`FUN_0800b776`, `FUN_08023840`). It drives PB10 low below 85 % (a signed
+   integer compare of the float fraction, `0x08023b36`..`0x08023b3c`); low PB10 releases STDBY on the
+   device.
+   Measured while charging (2026-10-29, after ~2 h on battery; battery ADC while charging ~4.20 V):
+   PB10 low stops the charge at once (battery 4.205 -> 4.14 V, PB11 stays 1; USB current 0.166 A,
+   the meter's own load); released, the charger goes to standby (PB11 = 0) and does not charge again
+   until the next USB replug (battery 4.11..4.13 V, above its recharge threshold). Twice, same result.
+   At a full battery (C2, [`c2meter.py`](../firmware/tools/c2meter.py)) PB10 low or released makes no
+   difference to the USB current (0.1966 / 0.1963 A). USB current right after a replug, as the battery
+   drained (15 min blocks on battery): 0.36, 0.48, 0.56, 0.67, 0.70 A, the meter's own ~0.17..0.20 A
+   included. *Inferred*: PB10 is the charger's CE (or TEMP) line; a low pulse ends a charge cycle
+   above the recharge threshold.
+   Stock code (disassembly; the only PB10 users are the init `0x0800af60` and the battery task): two
+   timers alternate, `0x08023bae` (pins) and `0x08023aac` (battery). Every 2 s the pins task reads
+   PB10 / PB11 (PB10 released) and drives PB10 low (push-pull, BC) when PB10 reads 1 and the battery
+   fraction (Vbat - 3.3) / 0.9 from the last battery read is below 0.85 on a 0 -> 1 edge of PB10
+   (plug-in), or below 0.80 otherwise (`cmp` of the float bits as signed integers + `bge` = skip at
+   >= 0.85 / 0.80, `0x08023b36`, `0x08023b62`). 10 ms later the battery task reads the ADC and then
+   releases PB10 (open drain high). So PB10 is low for ~10 ms per 2 s, only on USB power below 80..85 %,
+   and the battery is read during that pulse. *Inferred* purpose: a battery reading without the charge
+   current, below the level (~4.06 V) where the charger restarts after the pulse; above it a pulse would
+   end the charge (measured above). opendm40 never drives PB10: its charger runs the plain TP4056 cycle
+   (charges to termination after a replug, measured); its battery reading on USB power includes the
+   charge current's rise.
 6. The fuse's breaking capacity and time curve (the manual gives 10 A, ceramic, one fuse).
    The 47 ohm resistor's exact power rating (MELF 0207 by size, series unknown).
 7. PC7's function in the frequency mode; the [HY3131](datasheets/hycon-hy3131-datasheet-v10.pdf) CNT pin source; how the
@@ -730,7 +810,7 @@ header's RX pad), PB13, PC1, PC15. Whether they are connected is unknown.
 10. The regulators and the power path parts in [charger-tp4056-and-power.jpg](photos/charger-tp4056-and-power.jpg).
 11. The debug headers' VCC pads: ~3.1 V while on, not the MCU supply
     directly; what sits between them is not traced.
-12. LCD panel FPC pinout; touch panel vendor beyond the controller ID.
+12. LCD panel FPC pinout (whether the ILI9488 TE output reaches an MCU pin: [LCD](#lcd)); touch panel vendor beyond the controller ID.
 13. Exact HY3131 wiring (ohm reference resistors, divider taps, shunt nodes):
     inferred from the stock scaling only ([`emu/hy3131/RESEARCH.md`](../emu/hy3131/RESEARCH.md) 8.5).
 14. [MAX6190](https://www.analog.com/media/en/technical-documentation/data-sheets/MAX6190-MAX6198.pdf) placement: the BOM post says the reference sits outside the

@@ -58,6 +58,10 @@ extern "C" {
     static mut __bss_end: u32;
     static mut __sram_bss_start: u32;
     static mut __sram_bss_end: u32;
+    static mut __bkp_bss_start: u32;
+    static mut __bkp_bss_end: u32;
+    static mut __usbhs_bss_start: u32;
+    static mut __usbhs_bss_end: u32;
     static mut __sdata: u32;
     static mut __edata: u32;
     static __sidata: u32;
@@ -110,6 +114,32 @@ unsafe fn zero_sram_bss() {
     }
 }
 
+/// RCU_AHB1EN.USBHSEN: the clock of the unused USBHS core, whose 4 KiB FIFO
+/// RAM at 0x40060000 holds `.usbhs_bss` (docs/native-boot.md "Extra RAM areas").
+const RCU_AHB1EN: u32 = 0x4002_3830;
+const USBHSEN: u32 = 1 << 29;
+
+/// The extra RAM areas (link-native.x `.bkp_bss`, `.usbhs_bss`): clocks on,
+/// then zeroed. Every boot, before anything uses them: the RCU is reset with
+/// the core, the backup SRAM keeps the previous image's bytes over a reset
+/// and an update, and the FIFO RAM holds random bytes after power-up. Only
+/// `__bkp_bss_*` is written: the settings record below it and the sequence /
+/// boot words above it are untouched (link-native.x asserts).
+unsafe fn extra_ram_init() {
+    boot::bkp_enable(); // PMU clock, BKPWEN, BKPSRAM clock (as persist::init)
+    mmio::modify32(RCU_AHB1EN, 0, USBHSEN);
+    let _ = mmio::r32(RCU_AHB1EN); // the clock is on before the first access
+    for (mut p, end) in [
+        (core::ptr::addr_of_mut!(__bkp_bss_start), core::ptr::addr_of_mut!(__bkp_bss_end)),
+        (core::ptr::addr_of_mut!(__usbhs_bss_start), core::ptr::addr_of_mut!(__usbhs_bss_end)),
+    ] {
+        while p < end {
+            p.write_volatile(0);
+            p = p.add(1);
+        }
+    }
+}
+
 /// (deepest stack use so far, stack size) in bytes: the first word above
 /// __bss_end that is no longer the paint. Stack = __bss_end .. _stack_top
 /// (TCM); used == size means it reached .bss (overflow).
@@ -123,157 +153,52 @@ pub fn stack_use() -> (u32, u32) {
     (top - a, top - lo)
 }
 
-/// Extra DBG:BOOT? fields, appended by boot::put_info (one call at its end):
-/// `,STAGED,<n>,CALBK,<status>,<written>,<conflict>,<differs>,STACK,<used>,<size>,CALMS,<ms>,SPICLK,<div>,<check>`.
-/// STAGED: fatren's dm40*.bin left because their header is not the marker.
-/// CALBK = the write-once calibration safety copy on the SPI disk
-/// (calbackup.rs): status NOTRUN NOMEDIUM BADBPB SAFECOPY_PRESENT (all three
-/// files there, nothing written) SAFECOPY_WRITTEN (the missing ones written)
-/// NOSPACE ERROR; written / conflict / differs: decimal bit masks, bit i =
-/// file i of calbackup::FILES (0 CALIB, 1 BOOTDATA, 2 UID); conflict = the
-/// name is a directory / label; differs = a present copy no longer equals the
-/// flash (kept: write-once); used/size: stack high-water mark / stack bytes;
-/// CALMS: duration of calbackup::boot in ms (200 MHz cycles; 12.5x low at
-/// 16 MHz); SPICLK:
-/// SPI-flash divider in use (4 / 16) and the boot self-check's verdict
-/// (spiflash::ClockCheck: OK FORCED NOCHIP NOSIG DIFF1 DIFF2 NOTRUN);
-/// then FATDIR (fatdir.rs), CALREC (the calibration record's CRC, dmm.rs
-/// `load_record`), SETTINGS (`put_settings`) and BOOTMS / MAINMS
-/// (`put_times`).
-pub fn put_extra(s: &mut crate::scpi::Scpi) {
-    use crate::calbackup::Status as C;
+/// The rest of DBG:BOOT? (boot.rs `put_info`, words 26..56):
+///   26 calbackup status (`calbackup::Status` order)  27 written
+///   28 conflict  29 differs (bit i = file i of calbackup::FILES: CALIB,
+///   BOOTDATA, UID)  30 calbackup ms  31 stack used  32 stack size (bytes)
+///   33 SPI-flash divider (4 / 16)  34 its boot check (`ClockCheck`)
+///   35..37 fatdir ok / created / failed  38 calibration record CRC ok (1 / 0)
+///   39 settings from (`setfile::From`)  40 slot  41 seq  42 the file at
+///   boot (`FileState`)  43 the last save (`Save`)  44 saves this boot
+///   45 the newest slot's seq  46..53 boot phases in ms (board, fatren,
+///   calbk, fatdir, setfile, mirror, vdisk, refresh)  54..56 main's clock in
+///   ms at the end of App::new, of the first frame, of the touch reset.
+/// The ms are DWT at 200 MHz: 12.5x low on IRC16M.
+pub fn boot_words() -> [u32; 31] {
     let r = crate::calbackup::result();
     let (used, size) = stack_use();
-    let vals = [crate::fatren::result().staged as u32, 0, r.written as u32, r.conflict as u32, r.differs as u32, 0, used, size, 0, r.ms];
-    for (i, v) in vals.iter().enumerate() {
-        if i == 0 {
-            s.put_bytes(b",STAGED,");
-        }
-        if i == 1 {
-            s.put_bytes(match r.status {
-                C::NotRun => b"CALBK,NOTRUN" as &[u8],
-                C::NoMedium => b"CALBK,NOMEDIUM",
-                C::BadBpb => b"CALBK,BADBPB",
-                C::Present => b"CALBK,SAFECOPY_PRESENT",
-                C::Written => b"CALBK,SAFECOPY_WRITTEN",
-                C::NoSpace => b"CALBK,NOSPACE",
-                C::Error => b"CALBK,ERROR",
-            });
-        } else if i == 5 {
-            s.put_bytes(b"STACK");
-        } else if i == 8 {
-            s.put_bytes(b"CALMS");
-        } else {
-            let mut t = [0u8; 10];
-            let mut n = t.len();
-            let mut v = *v;
-            loop {
-                n -= 1;
-                t[n] = b'0' + (v % 10) as u8;
-                v /= 10;
-                if v == 0 {
-                    break;
-                }
-            }
-            s.put_bytes(&t[n..]);
-        }
-        if i + 1 < vals.len() {
-            s.put_bytes(b",");
-        }
-    }
-    // SPI-flash clock: divider in use and the boot self-check's verdict
-    // (spiflash::clock_check: OK = /4 verified, else /16 and why).
     let (div, why) = crate::spiflash::clock();
-    s.put_bytes(if div == 4 { b",SPICLK,4," } else { b",SPICLK,16," });
-    s.put_bytes(why.name());
-    // FATDIR,<ok>,<created>,<failed>: fatdir::boot (LOGS / SHOTS / SCOPE on
-    // the SPI disk), bit i = fatdir::DIRS[i].
     let f = crate::fatdir::boot_result();
-    s.put_bytes(b",FATDIR,");
-    for (i, v) in [f.ok, f.created, f.failed].iter().enumerate() {
-        s.put_bytes(&[b'0' + v / 10 % 10, b'0' + v % 10][(*v < 10) as usize..]);
-        if i < 2 {
-            s.put_bytes(b",");
-        }
-    }
-    // CALREC,<OK|BADCRC>: the calibration record's CRC at start-up
-    // (dmm.rs load_record; BADCRC = every calibration value at its default).
-    s.put_bytes(if crate::dmm::rec_crc_ok_at_boot() { b",CALREC,OK" } else { b",CALREC,BADCRC" });
-    put_settings(s);
-    put_times(s);
-}
-
-/// `,BOOTMS,<board>,<fatren>,<calbk>,<fatdir>,<setfile>,<mirror>,<vdisk>,<refresh>,MAINMS,<app>,<frame>,<touch>`:
-/// the boot phases in ms (`PHASE`). BOOTMS: each phase's own duration
-/// (board = board::init + the splash; vdisk and refresh run after the
-/// first frame, `before_usb`). MAINMS: main's clock at the end of
-/// App::new, of the first frame and of the touch reset (0 = not reached).
-/// DWT at 200 MHz: 12.5x low on IRC16M, as CALMS.
-fn put_times(s: &mut crate::scpi::Scpi) {
-    s.put_bytes(b",BOOTMS");
+    let (from, slot, seq, file, save, saves, top) = crate::setfile::info();
+    let mut w = [
+        r.status as u32,
+        r.written as u32,
+        r.conflict as u32,
+        r.differs as u32,
+        r.ms,
+        used,
+        size,
+        div as u32,
+        why as u32,
+        f.ok as u32,
+        f.created as u32,
+        f.failed as u32,
+        crate::dmm::rec_crc_ok_at_boot() as u32,
+        from as u32,
+        slot as u32,
+        seq,
+        file as u32,
+        save as u32,
+        saves,
+        top,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
     for (i, p) in PHASE.iter().enumerate().skip(1) {
         let v = p.load(Ordering::Relaxed);
-        if i == 9 {
-            s.put_bytes(b",MAINMS");
-        }
-        s.put_bytes(b",");
-        put_dec(s, if i <= 8 { v / 200_000 } else { v });
+        w[19 + i] = if i <= 8 { v / 200_000 } else { v };
     }
-}
-
-/// `,SETTINGS,<from>,<slot>,<seq>,SETFILE,<state>,SAVE,<status>,<saves>,<seq>`
-/// (setfile.rs): where this boot's settings came from (BKP = the backup
-/// SRAM, FILE = `_SETTING.BIN` slot <slot>, DEFAULTS; <seq> its sequence
-/// number, BKP: the one the backup SRAM continues, 0 = none), the file at
-/// boot (PRESENT CREATED NOFILE ERROR NOTRUN), the last save (NONE OK
-/// DEFERRED BADRECORD ERROR NOFILE), saves this boot and the newest slot's
-/// sequence.
-fn put_settings(s: &mut crate::scpi::Scpi) {
-    use crate::setfile::{FileState as F, From, Save};
-    let (from, slot, seq, file, save, saves, top) = crate::setfile::info();
-    s.put_bytes(match from {
-        From::Bkp => b",SETTINGS,BKP,-," as &[u8],
-        From::File => b",SETTINGS,FILE,",
-        From::Defaults => b",SETTINGS,DEFAULTS,-,",
-        From::NotRun => b",SETTINGS,NOTRUN,-,",
-    });
-    if from == From::File {
-        put_dec(s, slot as u32);
-        s.put_bytes(b",");
-    }
-    put_dec(s, seq);
-    s.put_bytes(match file {
-        F::Present => b",SETFILE,PRESENT,SAVE," as &[u8],
-        F::Created => b",SETFILE,CREATED,SAVE,",
-        F::NoFile => b",SETFILE,NOFILE,SAVE,",
-        F::Error => b",SETFILE,ERROR,SAVE,",
-        F::NotRun => b",SETFILE,NOTRUN,SAVE,",
-    });
-    s.put_bytes(match save {
-        Save::None => b"NONE," as &[u8],
-        Save::Ok => b"OK,",
-        Save::Deferred => b"DEFERRED,",
-        Save::BadRecord => b"BADRECORD,",
-        Save::Error => b"ERROR,",
-        Save::NoFile => b"NOFILE,",
-    });
-    put_dec(s, saves);
-    s.put_bytes(b",");
-    put_dec(s, top);
-}
-
-fn put_dec(s: &mut crate::scpi::Scpi, mut v: u32) {
-    let mut t = [0u8; 10];
-    let mut n = t.len();
-    loop {
-        n -= 1;
-        t[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    s.put_bytes(&t[n..]);
+    w
 }
 
 /// Board bring-up + fatren + calibration backup, then opendm40 main (normal mode).
@@ -283,7 +208,7 @@ fn normal(_info: &BootInfo, dry: bool) -> ! {
 }
 
 /// Everything before main(), in its own never-inlined frame so the SPI-disk
-/// block buffers (fatren ~9 KiB, calbackup ~2 KiB + scratch, each in its own
+/// block buffers (fatren ~9 KiB, calbackup ~2 KiB + the diskbuf arena, each in its own
 /// never-inlined function too) are popped before main()'s 26 KiB frame is
 /// pushed (review 2026-10-13 B1).
 #[inline(never)]
@@ -366,6 +291,7 @@ pub fn before_usb() {
 /// Called by the shim (src/shim.rs) with the decision.
 pub unsafe fn start(info: BootInfo) -> ! {
     init_ram();
+    extra_ram_init();
     // The serial number (USB iSerial, SCSI VPD 0x80, *IDN?) for both modes.
     crate::uid::init();
     boot::set_info(info);

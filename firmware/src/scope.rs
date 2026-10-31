@@ -180,7 +180,7 @@ pub enum TrigMode {
     Single,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Settings {
     pub run: bool,
     pub tb: usize,
@@ -207,12 +207,50 @@ pub struct Settings {
     pub pwidth: f32,
     /// Runt: the second level (row, like trig_row).
     pub runt_row: i32,
+    /// Trigger source (TSRC_*): CH1, or the generator's output computed
+    /// from its timers (docs/scope-gen-channel.md; edge only, MCX only).
+    pub tsrc: u8,
+}
+
+/// `Settings::tsrc` values.
+pub const TSRC_CH1: u8 = 0;
+pub const TSRC_GEN: u8 = 1;
+pub const TSRC_NAMES: [&str; 2] = ["CH1", "GEN"];
+
+/// Ticks of the 200 MHz timer clock the generator's output reaches the
+/// MCX samples later than its timers say (DAC settling, the output and
+/// input stages, the ADC pipeline): taken off the GEN phase of every
+/// sample. Default: `DBG:GENTRIG:LAG 188` (37 ticks, 185 ns), measured on
+/// the PWM path with the generator looped back to CH1 (PR #64 device
+/// check); the DAC path's own lag is not measured yet
+/// (docs/scope-gen-channel.md "Device check").
+pub const GEN_LAG_DEFAULT: i32 = 37;
+static GEN_LAG: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(GEN_LAG_DEFAULT);
+
+pub fn gen_lag() -> i32 {
+    GEN_LAG.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_gen_lag(ticks: i32) {
+    GEN_LAG.store(ticks.clamp(-1_000_000, 1_000_000), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Longest busy-wait (DWT cycles, 1 ms) for the generator's phase before
+/// a linear record whose window is shorter than a generator period
+/// (`gen_ready`).
+const GEN_SPIN: u32 = 200_000;
+const DWT_CYCCNT: u32 = 0xE000_1004;
+
+/// Round to the nearest integer (f64, no std; |x| < 2^52).
+fn round_f64(x: f64) -> f64 {
+    let t = (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64;
+    t as f64
 }
 
 impl Settings {
     /// Stock defaults: 200 us/div, 1 V/div, DC, rising, Auto, level row 105.
     pub const DEFAULT: Settings =
-        Settings { run: true, tb: 13, range: 6, ac: false, trig_row: 105, pos: 0, rising: true, mode: TrigMode::Auto, probe: 1.0, hpos: 200, ttype: 0, pcond: 0, pwidth: 1e-3, runt_row: 70 };
+        Settings { run: true, tb: 13, range: 6, ac: false, trig_row: 105, pos: 0, rising: true, mode: TrigMode::Auto, probe: 1.0, hpos: 200, ttype: 0, pcond: 0, pwidth: 1e-3, runt_row: 70, tsrc: TSRC_CH1 };
 }
 
 /// A finished frame: the visible window of the record, or (roll mode, empty
@@ -281,6 +319,9 @@ pub struct Scope {
     stored_trig: Option<usize>,
     stored_anchor: usize,
     stored_fs: u32,
+    /// Timebase the stored record was captured at (a stopped zoom changes
+    /// `s.tb` only): the scope CSV header's.
+    stored_tb: u8,
     /// Hardware range the stored codes were captured with (the code -> volts
     /// gain); the current range only sets the display scale while stopped.
     stored_range: usize,
@@ -340,6 +381,27 @@ pub struct Scope {
     /// Code -> SI of the stored record (wave: `stored_ab`, the scale it
     /// was captured with).
     stored_ab: (f32, f32),
+    /// The generator against the acquisition in flight (its sample 0;
+    /// None: the generator was off, the reading failed, a comparator
+    /// record or the wave view) and the generator epoch it was read in;
+    /// `rec_base`: the absolute sample index of BUF[0] for the next
+    /// `snapshot_mark` (a linearised ring); `stored_gen`: against the
+    /// stored record's BUF[0].
+    gsync: Option<(crate::gen::Sync, u32)>,
+    rec_base: u64,
+    stored_gen: Option<crate::gen::Sync>,
+    /// The GEN trace is shown: every MCX record needs the generator's
+    /// phase, so the comparator (whose stop time is not known) is off.
+    pub gen_trace: bool,
+    /// The DMM CH2 is shown (docs/scope-gen-channel.md section 2): every
+    /// record needs its time (`rec_time`), the comparator is off.
+    pub ch2_on: bool,
+    /// The acquisition in flight: DWT count of its sample 0 (None: a
+    /// comparator record, the wave view) and DWT cycles per sample; the
+    /// stored record's (BUF[0]).
+    t_s0: Option<u32>,
+    t_step: f32,
+    stored_t0: Option<u32>,
 }
 
 /// The DMM-input source of the scope page (docs/dmm-input-scope-
@@ -649,6 +711,7 @@ impl Scope {
             stored_trig: None,
             stored_anchor: 0,
             stored_fs: 0,
+            stored_tb: 0,
             stored_range: 0,
             stored_roll: false,
             zoom_pending: false,
@@ -672,6 +735,14 @@ impl Scope {
             wave: false,
             lent: false,
             stored_ab: (0.0, 1.0),
+            gsync: None,
+            rec_base: 0,
+            stored_gen: None,
+            gen_trace: false,
+            ch2_on: false,
+            t_s0: None,
+            t_step: 1.0,
+            stored_t0: None,
         };
         // WAVE is not loaded on the device (.dmabuf): set up in place.
         unsafe { core::ptr::addr_of_mut!(WAVE).write(Wave::NEW) };
@@ -791,6 +862,18 @@ impl Scope {
 
     pub fn row_of_code(&self, code: f32) -> f32 {
         self.row_of_volts(self.volts(code))
+    }
+
+    /// TRIG:LEV: the level in volts as given, also off screen (its marker
+    /// on the nearest edge row, as a level kept across a zoom). Returns the
+    /// marker row for the settings the caller applies next (`apply` keeps
+    /// the volts: the row does not move on its own).
+    pub fn set_trig_volts(&mut self, v: f32) -> i32 {
+        let r = self.row_of_volts(v);
+        let row = if r.is_finite() { (if r >= 0.0 { r + 0.5 } else { r - 0.5 }).clamp(-10.0, 290.0) as i32 } else { self.s.trig_row };
+        self.trig_v = v;
+        self.s.trig_row = row;
+        row
     }
 
     pub fn trig_volts(&self) -> f32 {
@@ -1083,6 +1166,7 @@ impl Scope {
             return true;
         } else if was_stream {
             let wr = self.stream_wr();
+            self.rec_base = wr - wr.min(CAP as u64);
             if wr > CAP as u64 {
                 unsafe { (&mut (&mut *core::ptr::addr_of_mut!(BUF))[..]).rotate_left((wr % CAP as u64) as usize) };
             }
@@ -1117,12 +1201,20 @@ impl Scope {
         }
         self.stored_len = len;
         self.stored_fs = self.sample_rate();
+        self.stored_tb = self.s.tb as u8;
         self.stored_range = self.s.range;
         self.stored_pos = self.s.pos;
         self.stored_roll = roll;
         self.stored_anchor = anchor.min(len - 1);
         self.stored_trig = trig;
         self.stored_ab = (wv().sc.a, wv().sc.b);
+        self.stored_gen = self.gsync.filter(|g| g.1 == crate::gen::epoch()).map(|(g, _)| {
+            let mut g = g;
+            g.t0 += self.rec_base as f64 * g.s;
+            g.t0 = crate::gen::wrap(g.t0, g.q);
+            g
+        });
+        self.stored_t0 = self.t_s0.map(|t| t.wrapping_add((self.rec_base as f64 * self.t_step as f64) as u64 as u32));
         self.stored_valid = true;
     }
 
@@ -1144,7 +1236,13 @@ impl Scope {
         // Mask once here (snapshot_mark), then search in the masked record.
         self.snapshot_mark(n, 0, None, false);
         let data: &[u16] = unsafe { &(&*core::ptr::addr_of!(BUF))[..n] };
-        let trig = if self.s.ttype != 0 { self.find_soft(data, pre, pre + win) } else { self.find_trigger(&data[pre..pre + win]).map(|i| i + pre) };
+        let trig = if self.gen_src() {
+            self.gen_next(pre as u64).map(|t| t as usize).filter(|&t| t <= pre + win)
+        } else if self.s.ttype != 0 {
+            self.find_soft(data, pre, pre + win)
+        } else {
+            self.find_trigger(&data[pre..pre + win]).map(|i| i + pre)
+        };
         let show = match (trig, self.s.mode) {
             (Some(_), _) => true,
             (None, TrigMode::Auto) => now >= self.deadline,
@@ -1177,6 +1275,7 @@ impl Scope {
         } else {
             wr.min(CAP)
         };
+        self.rec_base = self.roll_written - len as u64;
         self.snapshot_mark(len, len.saturating_sub(1), None, true);
     }
 
@@ -1227,8 +1326,11 @@ impl Scope {
             // `post` samples after the edge (hwtrig.rs). Roll never triggers.
             // Pulse / runt (software, trigsoft.rs): one complete linear
             // record per frame.
-            let soft = self.s.ttype != 0;
-            let hw = self.hw.available() && !self.rolling && !soft;
+            // GEN: the trigger is computed (edge only); the GEN trace needs
+            // every record's phase, which a comparator stop does not give.
+            let gen = self.gen_src() || self.gen_trace;
+            let soft = self.s.ttype != 0 && !self.gen_src();
+            let hw = self.hw.available() && !self.rolling && !soft && !gen && !self.ch2_on;
             // Software trigger at low rates: circular record searched while
             // it is written (stream_poll).
             let stream = !self.rolling && !hw && !soft && fs <= STREAM_FS;
@@ -1248,10 +1350,136 @@ impl Scope {
                 self.hw.prepare(psc, arr, hwtrig::post_for(self.screen - pre, WIN), code, self.s.rising);
             }
             self.hw_mode = hw;
+            self.rec_base = 0;
             w32(TIM8, 1);
+            // The generator's time at the TIM1 start: sample n is taken at
+            // CC4 of TIM1 period n, (ccr4 + n (arr + 1)) (psc + 1) ticks
+            // later (both timers on the 200 MHz clock). An interrupt
+            // between the reading and the start: no phase for this record.
+            let g = if gen && !self.wave { crate::gen::now() } else { None };
             w32(TIM1, 1);
+            let d_en = r32(DWT_CYCCNT);
+            self.t_step = ((psc + 1) * (arr + 1)) as f32;
+            self.t_s0 = (!hw).then(|| d_en.wrapping_add(ccr4 * (psc + 1)));
+            self.gsync = g.and_then(|(gt, d)| {
+                let dt = d_en.wrapping_sub(d);
+                let (t, shape) = crate::gen::running()?;
+                let (q, k) = crate::gen::loop_ticks(&t);
+                let ps = psc as f64 + 1.0;
+                let t0 = gt as f64 + dt as f64 + ccr4 as f64 * ps - gen_lag() as f64;
+                let sy = crate::gen::Sync { t0: crate::gen::wrap(t0, q as f64), s: ps * (arr as f64 + 1.0), q: q as f64, k: k as f64, shape };
+                (dt < 400).then_some((sy, crate::gen::epoch()))
+            });
         }
         self.busy = true;
+    }
+
+    /// DWT count of the stored record's BUF[0] and DWT cycles per sample
+    /// (the DMM CH2's alignment); None without a stored record, or for a
+    /// comparator record (its stop instant is not known) or the wave view.
+    pub fn rec_time(&self) -> Option<(u32, f32)> {
+        if self.stored_valid && !self.wave { self.stored_t0.map(|t| (t, self.t_step)) } else { None }
+    }
+
+    /// Roll (live): DWT count at the end of the newest column and DWT
+    /// cycles per column of the last roll frame.
+    pub fn roll_time(&self) -> Option<(u32, f32)> {
+        if !self.rolling || self.wave {
+            return None;
+        }
+        let t = self.t_s0?;
+        let per = (self.screen / COLS).max(1) as f32;
+        Some((t.wrapping_add((self.roll_written as f64 * self.t_step as f64) as u64 as u32), per * self.t_step))
+    }
+
+    /// A stream record without the generator's phase (the reading at its
+    /// start failed, or the generator was restarted since: a new epoch):
+    /// read it now against the record's sample 0 (`t_s0`, the DWT of the
+    /// TIM1 start + CC4), so a long Normal wait does not stay blind. `wr`
+    /// (samples written) unwraps the 21 s DWT wrap. The samples before a
+    /// generator restart get the new phase too (only later ones are
+    /// searched; the GEN trace of that record is off by the restart).
+    fn gen_resync(&mut self, wr: u64) {
+        let Some(s0) = self.t_s0 else { return };
+        let Some((t, shape)) = crate::gen::running() else { return };
+        let ep = crate::gen::epoch();
+        let Some((g, d)) = crate::gen::now() else { return };
+        let (q, k) = crate::gen::loop_ticks(&t);
+        let s = self.t_step as f64;
+        let span = 4_294_967_296.0;
+        let e0 = d.wrapping_sub(s0) as f64;
+        let e = e0 + span * round_f64((wr as f64 * s - e0) / span);
+        let t0 = g as f64 - e - gen_lag() as f64;
+        let sy = crate::gen::Sync { t0: crate::gen::wrap(t0, q as f64), s, q: q as f64, k: k as f64, shape };
+        self.gsync = Some((sy, ep));
+    }
+
+    /// The trigger source is the generator (MCX records only).
+    fn gen_src(&self) -> bool {
+        self.s.tsrc == TSRC_GEN && !self.wave
+    }
+
+    /// The generator against the record in flight, when still valid.
+    fn gen_live(&self) -> Option<crate::gen::Sync> {
+        self.gsync.filter(|g| g.1 == crate::gen::epoch()).map(|g| g.0)
+    }
+
+    /// GEN trigger: the first sample index (absolute, of the acquisition
+    /// in flight) >= `n0` at the generator's crossing of the trigger level
+    /// in the edge's direction. None: no phase, or the level is outside the
+    /// generator's swing.
+    fn gen_next(&self, n0: u64) -> Option<u64> {
+        let g = self.gen_live()?;
+        let ph = g.shape.crossing(self.trig_volts(), self.s.rising)?;
+        Some(g.next(n0, ph))
+    }
+
+    /// The generator against the stored record (BUF[0] = sample 0), for
+    /// the GEN trace; None without one.
+    pub fn gen_sync(&self) -> Option<crate::gen::Sync> {
+        if self.stored_valid { self.stored_gen } else { None }
+    }
+
+    /// GEN trigger, linear record (fs > STREAM_FS): its trigger window
+    /// (CAP - screen samples) can be shorter than a generator period, so
+    /// the record starts at the generator's phase that puts a crossing in
+    /// the window's middle: true = start now (after at most `GEN_SPIN` of
+    /// busy-wait), false = not this pass. Auto past its timeout, no
+    /// generator, a level outside its swing: start at once (untriggered).
+    fn gen_ready(&mut self, now: u64) -> bool {
+        let fs = TB[self.s.tb].0;
+        if !self.gen_src() || fs <= STREAM_FS || self.roll_ok() {
+            return true;
+        }
+        if self.deadline == 0 {
+            self.deadline = now + self.auto_timeout();
+        }
+        if self.s.mode == TrigMode::Auto && now >= self.deadline {
+            return true;
+        }
+        let Some((t, shape)) = crate::gen::running() else { return true };
+        let Some(ph) = shape.crossing(self.trig_volts(), self.s.rising) else { return true };
+        let (q, k) = crate::gen::loop_ticks(&t);
+        let period = q as f64 / k as f64;
+        let (_, psc, arr, ccr4) = *HW.iter().find(|h| h.0 == fs).unwrap_or(&HW[0]);
+        let ps = psc as f64 + 1.0;
+        let s = ps * (arr as f64 + 1.0);
+        let (pre, _) = self.hw_split();
+        let win = (self.rec - self.screen) as f64;
+        if period <= 0.8 * win * s {
+            return true;
+        }
+        let Some((g, d)) = crate::gen::now() else { return false };
+        let x = (g as f64 - gen_lag() as f64) * k as f64 / q as f64;
+        let to_next = crate::gen::wrap(ph as f64 - x, 1.0) * period;
+        let lead = (pre as f64 + win / 2.0) * s + ccr4 as f64 * ps;
+        let wait = crate::gen::wrap(to_next - lead, period);
+        if wait > GEN_SPIN as f64 {
+            return false;
+        }
+        let wait = wait as u32;
+        while unsafe { r32(DWT_CYCCNT) }.wrapping_sub(d) < wait {}
+        true
     }
 
     /// Screen samples left / right of the trigger point (hpos column).
@@ -1477,6 +1705,11 @@ impl Scope {
         (self.stored_fs, t0, self.stored_trig.is_some())
     }
 
+    /// The timebase (TB index) the stored record was captured at.
+    pub fn record_tb(&self) -> usize {
+        self.stored_tb as usize
+    }
+
     /// Drag preview: take the position settings (CH1 position, trigger level
     /// row, trigger position) into `s` without touching the hardware or the
     /// acquisition in flight (same clamps as `apply`); the caller applies them
@@ -1599,6 +1832,9 @@ impl Scope {
             return None;
         }
         if !self.busy {
+            if !self.gen_ready(now) {
+                return None;
+            }
             self.start();
             self.hw_t0 = now;
             self.st_poll = now;
@@ -1674,10 +1910,21 @@ impl Scope {
                 self.st_idx = (floor % CAP as u64) as usize;
                 self.st_armed = false;
             }
+            if self.gen_src() {
+                // Computed, not searched: the next crossing at or after the
+                // scan position, once it has been sampled.
+                // (The scan below then starts at `wr`: nothing to scan.)
+                if self.gen_live().is_none() {
+                    self.gen_resync(wr);
+                }
+                if let Some(t) = self.gen_next(self.st_scan).filter(|&t| t < wr) {
+                    self.st_found = Some(t);
+                }
+            }
             let l = self.trig_code();
             let rising = self.s.rising;
             let buf = unsafe { &*core::ptr::addr_of!(BUF) };
-            let (mut i, mut armed, mut n) = (self.st_idx, self.st_armed, self.st_scan);
+            let (mut i, mut armed, mut n) = (self.st_idx, self.st_armed, if self.gen_src() { wr } else { self.st_scan });
             while n < wr {
                 let v = (buf[i] & 0x3FF) as i32;
                 let hit = if rising {
@@ -1745,6 +1992,7 @@ impl Scope {
             unsafe { (&mut (&mut *core::ptr::addr_of_mut!(BUF))[..]).rotate_left((wr % CAP as u64) as usize) };
         }
         let base = wr - len as u64;
+        self.rec_base = base;
         let (pre, post) = self.hw_split();
         let start = match t {
             Some(t) if t >= base + pre as u64 && t + post as u64 <= wr => (t - base) as usize - pre,
@@ -2056,6 +2304,8 @@ impl Scope {
     /// Arm a wave acquisition: the record resynchronised when stale (the
     /// backlog thrown away), roll set up, the ISR trigger configured.
     fn wave_start(&mut self, now: u64, src: &mut dyn WaveSource) {
+        self.gsync = None; // the DMM's clock: no generator phase
+
         if wv().stale {
             let n = src.drain(&mut |_| {});
             let w = wv();
@@ -2315,6 +2565,7 @@ impl Scope {
 }
 
 /// Debug: latch word, record DMA count left, first sample, GPIOB IDR.
+#[cfg_attr(not(feature = "dbg-diag"), allow(dead_code))]
 pub fn debug() -> [u32; 4] {
     unsafe {
         [

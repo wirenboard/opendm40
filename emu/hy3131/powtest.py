@@ -269,7 +269,7 @@ SC.update({
          'AC, pure DC in: V, I, P 0; PF, S, Q, f n/a'),
         (16, 'open;pow:230@50,i=1,pf=0.95', both(pw(218.5, 0.95, 230, 1), qreal(230 * math.sqrt(1 - 0.95 ** 2))), 'AC mains PF 0.95: Q 71.8 var'),
     ]),
-    'acdc-floor': (['CONF:POW', 'POW:COUP ACDC'], 58, [
+    'acdc-floor': (['CONF:POW', 'POW:COUP ACDC'], 72, [
         (0, 'open;vsrc:1.234;isrc:1', both(pw(1.234, 1, 1.234, 1, rel=0.003), lambda d: d['Q'] == 0 and near(d['S'], 1.234, 0.003), x('SYST:ALER?', 'DC')),
          'AC+DC, pure DC in: Q 0, PF 1; DC? hint'),
         (16, 'open;pow:230@50,i=1,pf=0.98', both(pw(225.4, 0.98, 230, 1), qreal(230 * math.sqrt(1 - 0.98 ** 2)), x('SYST:ALER?', 'NONE')),
@@ -278,6 +278,8 @@ SC.update({
         # The owner's case: At load on (POW:BURD:STAT ON at 44 s), 10 mohm:
         # V 1.224, P 1.224 W, Vb 0.010.
         (44, 'open;vsrc:1.234;isrc:1', both(pw(1.224, 1, 1.224, 1, rel=0.003), lambda d: near(d['Vb'], 0.01, 0.02)), 'At load on: V 1.224 at 1 A'),
+        # #109: no current: S 0, Q 0, PF n/a (as in AC), not 0.
+        (58, 'open;vsrc:5', both(lambda d: d['S'] == 0 and d['Q'] == 0 and near(d['V'], 5, 0.01), isnan('PF')), 'AC+DC, A open: S 0, Q 0, PF n/a'),
     ]),
 })
 

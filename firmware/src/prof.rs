@@ -20,6 +20,9 @@
 //!
 //! Times are in us (200 cycles each at 200 MHz); a single interval must stay
 //! under the 21 s CYCCNT wrap.
+//!
+//! Built only with the Cargo feature `dbg-prof`; without it the hooks are
+//! empty and DBG:PROF? is refused (`cyc` stays: other modules time with it).
 
 // The app-level ids and `drawn` / `pixel` are for the optional hooks in
 // app.rs / lcd.rs (DBG:PROF? prints n = 0 for a section never entered).
@@ -28,6 +31,10 @@
 use crate::mmio::r32;
 
 const DWT_CYCCNT: u32 = 0xE000_1004;
+/// The profiler is built (Cargo feature `dbg-prof`, DBG:PROF?). Without it
+/// every hook below returns at once, so `P` is left out of the image (1 KB
+/// of RAM) and only `cyc` is live.
+const ON: bool = cfg!(feature = "dbg-prof");
 const CYC_PER_US: u32 = crate::clock::HCLK_HZ / 1_000_000;
 /// An unserved touch event older than this is dropped, not timed.
 const LAT_DROP_MS: u64 = 3000;
@@ -143,6 +150,11 @@ struct Prof {
     win_ms: u64,
 }
 
+// A `dbg-prof` build only (see ON). In the backup SRAM (.bkp_bss,
+// link-native.x; zeroed at reset, every field's initial value is zero
+// bytes; docs/native-boot.md "Extra RAM areas"): TCM has no 1 KB to spare
+// next to the stack, SRAM none on the scope chain.
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut P: Prof = Prof {
     t0: [0; N],
     sec: [Stat::ZERO; N],
@@ -181,6 +193,9 @@ fn us(dc: u32) -> u32 {
 /// Top of a main-loop pass: the loop period, the 1 s windows, the latency
 /// timeouts; starts the `lap` chain.
 pub fn pass(now_ms: u64) {
+    if !ON {
+        return;
+    }
     let p = p();
     let t = cyc();
     if p.looped {
@@ -215,12 +230,18 @@ pub fn pass(now_ms: u64) {
 /// Section `id` starts now.
 #[inline(always)]
 pub fn enter(id: usize) {
+    if !ON {
+        return;
+    }
     p().t0[id] = cyc();
 }
 
 /// Section `id` (started by `enter`) ends now.
 #[inline(always)]
 pub fn exit(id: usize) {
+    if !ON {
+        return;
+    }
     let p = p();
     let d = cyc().wrapping_sub(p.t0[id]);
     p.sec[id].add(us(d));
@@ -230,6 +251,9 @@ pub fn exit(id: usize) {
 /// top of the pass) until now.
 #[inline(always)]
 pub fn lap(id: usize) {
+    if !ON {
+        return;
+    }
     let p = p();
     let t = cyc();
     p.sec[id].add(us(t.wrapping_sub(p.lap_t)));
@@ -239,12 +263,18 @@ pub fn lap(id: usize) {
 /// Restart the `lap` chain without charging the time to any section.
 #[inline(always)]
 pub fn lap_skip() {
+    if !ON {
+        return;
+    }
     p().lap_t = cyc();
 }
 
 /// A touch event (or a synthetic DBG input) was dispatched; `t` = the cycle
 /// count when its report was read.
 pub fn touch(t: u32) {
+    if !ON {
+        return;
+    }
     let p = p();
     p.events = p.events.wrapping_add(1);
     let ms = p.now_ms;
@@ -259,6 +289,9 @@ pub fn touch(t: u32) {
 /// Something is about to be drawn (an LCD window opened).
 #[inline(always)]
 pub fn pixel() {
+    if !ON {
+        return;
+    }
     let p = p();
     if let Some((t, _)) = p.pend_pix.take() {
         p.lat_pix.add(us(cyc().wrapping_sub(t)));
@@ -267,6 +300,9 @@ pub fn pixel() {
 
 /// A scope frame was drawn (ScopeView::frame or a drag re-plot).
 pub fn drawn() {
+    if !ON {
+        return;
+    }
     let p = p();
     p.frames = p.frames.wrapping_add(1);
     if let Some((t, _)) = p.pend_frm.take() {
@@ -276,6 +312,9 @@ pub fn drawn() {
 
 /// DBG:PROF:RESET.
 pub fn reset() {
+    if !ON {
+        return;
+    }
     let p = p();
     let now = p.now_ms;
     p.sec = [Stat::ZERO; N];
@@ -369,6 +408,7 @@ impl W<'_> {
 
 /// DBG:PROF? text table into `buf` (ends with '\n'); returns its length.
 #[inline(never)] // region B (link-native.x): asked during fast sessions; not inlined into the hot caller
+#[cfg(feature = "dbg-prof")]
 pub fn report(buf: &mut [u8]) -> usize {
     let p = p();
     let mut w = W { b: buf, n: 0 };

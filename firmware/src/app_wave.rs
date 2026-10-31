@@ -165,6 +165,7 @@ impl App {
         if self.scope.wave_on() {
             self.scope.wave_keep(&mut RingSrc);
         }
+        self.ch2_drain();
     }
 
     /// Open the wave view on the current DMM function (MF "Wave", the

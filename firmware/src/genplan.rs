@@ -109,10 +109,8 @@ impl Wave {
     /// Note for the UI when the set frequency is above `max_hz` (UF-14).
     pub fn max_note(self) -> &'static str {
         match self {
-            Wave::Sine => "Sine: max 50 kHz",
-            Wave::Square => "Square: max 10 MHz",
-            Wave::Triangle => "Triangle: max 50 kHz",
-            Wave::Ramp => "Ramp: max 50 kHz",
+            Wave::Square => "max 10 MHz",
+            _ => "max 50 kHz",
         }
     }
 }
@@ -595,4 +593,235 @@ pub fn fill(table: &mut [u16], s: &Settings, t: &Timing) {
         };
         *w = (lo + span * shape + 0.5).clamp(0.0, CODE_FS) as u16;
     }
+}
+
+// ------------------------------------------------- the scope's GEN channel
+//
+// The scope never digitises the generator for its GEN channel
+// (docs/scope-gen-channel.md): the output is a known function of time. The
+// DAC table / PWM counter and the scope's sample clock (TIM1) run from the
+// same 200 MHz timer clock, so one reading of the generator's position at
+// the scope's start (gen.rs `now`) fixes the generator's phase at every
+// sample of that record. The trigger is computed (`Sync::next`) and the
+// trace drawn from the wave's shape (`Shape::span`).
+
+/// High level of the PWM path at the output (PB14's 3.3 V logic level
+/// through the output stage): the GEN trace's high level there. 3.0 V: a
+/// 2 MHz square looped back to CH1 read 0..3.0 V (3.07 Vpp) on the device
+/// (PR #64 device check).
+pub const PWM_HIGH_V: f32 = 3.0;
+
+/// The output as a function of its phase (0..1 = one period, 0 = the first
+/// table sample: sine mid-rising, square rising edge, triangle / ramp at
+/// the bottom; the PWM counter at 0 = its rising edge).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shape {
+    pub wave: Wave,
+    pub lo_v: f32,
+    pub hi_v: f32,
+    /// Square: the high fraction of the period (the effective duty).
+    pub duty: f32,
+}
+
+impl Shape {
+    pub fn of(s: &Settings, o: &Out) -> Shape {
+        let (lo_v, hi_v) = match (o.lo_v(), o.hi_v()) {
+            (Some(l), Some(h)) => (l, h),
+            _ => (0.0, PWM_HIGH_V),
+        };
+        Shape { wave: s.wave, lo_v, hi_v, duty: o.duty.min(10000) as f32 / 10000.0 }
+    }
+
+    /// 0..1 at phase `ph` (any real; the fraction is taken).
+    pub fn unit(&self, ph: f32) -> f32 {
+        let p = ph - floor(ph);
+        match self.wave {
+            Wave::Sine => 0.5 + 0.5 * sin(2.0 * core::f32::consts::PI * p),
+            Wave::Square => {
+                if p < self.duty {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Wave::Triangle => {
+                if p < 0.5 {
+                    2.0 * p
+                } else {
+                    2.0 - 2.0 * p
+                }
+            }
+            Wave::Ramp => p,
+        }
+    }
+
+    pub fn volts(&self, ph: f32) -> f32 {
+        self.lo_v + (self.hi_v - self.lo_v) * self.unit(ph)
+    }
+
+    /// Lowest and highest volts over the phases [ph, ph + len] (`len` in
+    /// periods, >= 0): the ends plus the shape's extremes / edges inside.
+    pub fn span(&self, ph: f32, len: f32) -> (f32, f32) {
+        if !(len < 1.0) {
+            return (self.lo_v, self.hi_v);
+        }
+        let a = ph - floor(ph);
+        let b = a + len;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut add = |u: f32| {
+            let v = self.lo_v + (self.hi_v - self.lo_v) * u;
+            lo = lo.min(v);
+            hi = hi.max(v);
+        };
+        add(self.unit(a));
+        add(self.unit(b));
+        // Phases inside (a, b] (b < 2) where the shape peaks or jumps: both
+        // sides of a jump count.
+        let crit: [(f32, f32, f32); 2] = match self.wave {
+            Wave::Sine => [(0.25, 1.0, 1.0), (0.75, 0.0, 0.0)],
+            Wave::Square => [(0.0, 0.0, 1.0), (self.duty, 1.0, 0.0)],
+            Wave::Triangle => [(0.5, 1.0, 1.0), (0.0, 0.0, 0.0)],
+            Wave::Ramp => [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+        };
+        for (c, u0, u1) in crit {
+            for c in [c, c + 1.0] {
+                if c > a && c <= b {
+                    add(u0);
+                    add(u1);
+                }
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Phase (0..1) where the output crosses `v` volts in the direction
+    /// `rising`; None when `v` is not strictly between the low and the high
+    /// level (no crossing: the trigger never fires).
+    pub fn crossing(&self, v: f32, rising: bool) -> Option<f32> {
+        let span = self.hi_v - self.lo_v;
+        let u = (v - self.lo_v) / span;
+        if !(u > 0.0 && u < 1.0) {
+            return None;
+        }
+        let p = match self.wave {
+            Wave::Square => {
+                if rising {
+                    0.0
+                } else {
+                    self.duty
+                }
+            }
+            Wave::Triangle => {
+                if rising {
+                    u / 2.0
+                } else {
+                    1.0 - u / 2.0
+                }
+            }
+            // The fall is the jump back at the period's end.
+            Wave::Ramp => {
+                if rising {
+                    u
+                } else {
+                    0.0
+                }
+            }
+            Wave::Sine => {
+                // Monotonic halves: rising over -1/4..1/4, falling over
+                // 1/4..3/4. Bisection on `unit` (no asin in core).
+                let (mut a, mut b) = if rising { (-0.25f32, 0.25f32) } else { (0.25f32, 0.75f32) };
+                for _ in 0..24 {
+                    let m = 0.5 * (a + b);
+                    if (self.unit(m) < u) == rising {
+                        a = m;
+                    } else {
+                        b = m;
+                    }
+                }
+                0.5 * (a + b)
+            }
+        };
+        Some(p - floor(p))
+    }
+}
+
+/// floor for f32 in `core` (no std): exact for |x| < 2^23.
+fn floor(x: f32) -> f32 {
+    let t = x as i32 as f32;
+    if t > x { t - 1.0 } else { t }
+}
+
+/// The generator's position in time, ticks of the 200 MHz timer clock: a
+/// table of K periods takes `q` = M L ticks (PWM: q = D, K = 1).
+pub fn loop_ticks(t: &Timing) -> (u64, u32) {
+    match t.path {
+        Path::Pwm => (t.div(), 1),
+        Path::Dac => (t.div() * t.len as u64, t.cycles as u32),
+    }
+}
+
+/// One scope record against the generator: the generator's time (ticks
+/// into its table loop, `loop_ticks`) at the record's sample 0 and the
+/// ticks per sample. Sample n is at generator time `t0 + n s`; its phase
+/// is the fraction of `(t0 + n s) k / q` periods.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Sync {
+    pub t0: f64,
+    pub s: f64,
+    pub q: f64,
+    pub k: f64,
+    pub shape: Shape,
+}
+
+impl Sync {
+    /// Periods of the generator at sample `n` (any real).
+    pub fn periods(&self, n: f64) -> f64 {
+        (self.t0 + n * self.s) * self.k / self.q
+    }
+
+    /// Samples per generator period.
+    pub fn period_samples(&self) -> f64 {
+        self.q / (self.k * self.s)
+    }
+
+    /// The phase at sample `n` as f32 (0..1).
+    pub fn phase(&self, n: f64) -> f32 {
+        let p = self.periods(n);
+        (p - (p as i64) as f64) as f32
+    }
+
+    /// First sample index >= `n0` at or after a crossing at phase `ph`
+    /// (the first sample past the instant, as a sampled edge shows it).
+    pub fn next(&self, n0: u64, ph: f32) -> u64 {
+        let x0 = self.periods(n0 as f64);
+        let base = x0 - ph as f64;
+        let mut m = base as i64 as f64;
+        if m < base {
+            m += 1.0;
+        }
+        let dn = (m - base) * self.period_samples();
+        let mut d = dn as u64;
+        if (d as f64) < dn {
+            d += 1;
+        }
+        n0 + d
+    }
+
+    /// Volts min / max over samples [a, b) (a column of the screen).
+    pub fn span(&self, a: f64, b: f64) -> (f32, f32) {
+        let len = (b - a).max(0.0) / self.period_samples();
+        self.shape.span(self.phase(a), if len >= 1.0 { 1.0 } else { len as f32 })
+    }
+}
+
+/// `x` modulo `m` (> 0) into [0, m), for f64 in `core` (no rem_euclid):
+/// exact enough for |x / m| < 2^52.
+pub fn wrap(x: f64, m: f64) -> f64 {
+    let n = x / m;
+    let mut f = n as i64 as f64;
+    if f > n {
+        f -= 1.0;
+    }
+    let r = x - f * m;
+    if r >= m { r - m } else if r < 0.0 { r + m } else { r }
 }

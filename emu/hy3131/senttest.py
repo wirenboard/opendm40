@@ -335,10 +335,17 @@ def run(name):
             # fw uptime: the distance from the start of the act's phase (predicted by the
             # clock marker = the value of the phase's input marker)
             acts = {tl.at(ta, predict=True) if mk.zero is not None else ta: c for ta, c in xtra.get('acts', {}).items()}
+            # DBG:SENTinel? needs --features dbg-sent (refused: an empty reply,
+            # its checks skipped).
+            tm.write('DBG:SENT?')
+            has_sent = bool(tm.read(timeout=60).decode(errors='replace').strip())
+            if not has_sent:
+                tm.write('*CLS')
+                print('%s: DBG:SENT? not in this build (--features dbg-sent): its checks skipped' % name, flush=True)
             while p.poll() is None:
                 row = {}
                 logq = ['DBG:SENT:LOG?'] if 'never' in xtra else []
-                for q in ['DBG:PING?', 'SYST:ALER?', 'DBG:SENT?', 'STAT:QUES:COND?', 'READ?'] + xtra.get('queries', []) + logq:
+                for q in ['DBG:PING?', 'SYST:ALER?'] + ['DBG:SENT?'] * has_sent + ['STAT:QUES:COND?', 'READ?'] + xtra.get('queries', []) + logq:
                     tm.write(q)
                     row[q] = tm.read(timeout=60).decode(errors='replace').strip()
                 row['t'] = int(row['DBG:PING?'].split(',')[0]) / 1000.0
@@ -346,7 +353,7 @@ def run(name):
                 for ta in sorted(acts):
                     if row['t'] >= ta:
                         tm.write(acts.pop(ta))
-                print('%s %6.2f %-6s %-40s %s %s' % (name, row['t'], row['SYST:ALER?'], row['DBG:SENT?'], row['READ?'],
+                print('%s %6.2f %-6s %-40s %s %s' % (name, row['t'], row['SYST:ALER?'], row.get('DBG:SENT?', '-'), row['READ?'],
                                                    ' '.join(row[q] for q in xtra.get('queries', []))), flush=True)
         except Exception as e:
             print(name, 'link ended:', e, flush=True)
@@ -389,7 +396,7 @@ def run(name):
                 v = float(r['READ?'])
             except ValueError:
                 v = 0.0
-            if name == 'dcv-step' and 7.0 < v < 1e6 and not r['DBG:SENT?'].startswith('OFF'):
+            if name == 'dcv-step' and 7.0 < v < 1e6 and 'DBG:SENT?' in r and not r['DBG:SENT?'].startswith('OFF'):
                 ok = False
                 bad.append('%.2f %g V: sentinel %s on the 60 V range' % (r['t'], v, r['DBG:SENT?'].split(',')[0]))
     if 'never' in xtra:
@@ -411,7 +418,9 @@ def run(name):
             if hit:
                 ok = False
                 bad.append('%s logged at %s' % (al, ' '.join('%s@%.2f' % (e[1], e[2]) for e in hit)))
-    if 'aprot_ms' in xtra:
+    if 'aprot_ms' in xtra and not any('DBG:SENT?' in r for r in rows):
+        print('  skip the A-PROT latency (DBG:SENT? not in this build)', flush=True)
+    elif 'aprot_ms' in xtra:
         # the trip latency the firmware recorded (DBG:SENT? field 11)
         ms = [int(r['DBG:SENT?'].split(',')[10]) for r in rows if r['SYST:ALER?'] == 'APROT' and len(r['DBG:SENT?'].split(',')) > 10]
         lo, hi = xtra['aprot_ms']

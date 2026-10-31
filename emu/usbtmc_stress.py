@@ -277,6 +277,9 @@ class Stress:
     def __init__(self, tmc, rnd):
         self.t, self.r = tmc, rnd
         self.emul = None  # unknown until set
+        # DBG:PROF? only in a build with the feature dbg-prof (else -113).
+        tmc.query('DBG:PROF?')
+        self.has_prof = not tmc.query('SYST:ERR?').startswith(b'-113')
 
     def d(self):
         r = self.r.random()
@@ -319,6 +322,8 @@ class Stress:
 
     def c_big(self):
         k = self.r.randint(0, 2)
+        if k == 1 and not self.has_prof:
+            k = 2
         if k == 0:
             rep = nl(self.t.query('WAV:DATA?', delay=self.d()), 'WAV:DATA?')
             if len(rep) != 405 or not rep.startswith(b'#3400'):

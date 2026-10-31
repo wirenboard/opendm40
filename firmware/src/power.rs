@@ -1,7 +1,16 @@
 //! Battery and power status (dmm_v2_6.h section 9).
 //! Battery: ADC0 channel 15 on PC5, Vbat = raw * 3.0 / 4096 * 2, read every 2 s;
 //! pct = (Vbat - 3.3) / 0.9; bars 0..5 at 85/70/50/25/0 % with 5 % hysteresis.
-//! Charging (bt_meas_v2_6.h flags bit 3): PB10 high and PB11 high.
+//! Charger (TP4056, hw/README.md "Charge status pins"; device 2026-10-29,
+//! DBG:CHG:LOG? across a USB power cut): PB10 = 1 while the charger has
+//! input power (0 within ms of the cut; stays 1 against the pull-down);
+//! PB11 = the charger's STDBY (open drain, PB11 pull-up as the stock: low
+//! = charge terminated, high while charging or without input). So: PB10 0 =
+//! no charger, PB10 1 + PB11 1 = charging (the stock's condition,
+//! FUN_0800b776 / FUN_08023840), PB10 1 + PB11 0 = charged. The charger's
+//! CHRG pin is not on an MCU pin found. Not copied: the stock pulses PB10 low
+//! for ~10 ms per 2 s on USB power below 80..85 % and reads the battery during
+//! the pulse (hw/README.md Unknowns 5); PB10 low stops the charge (device).
 //! Bluetooth link: PC14 high = connected.
 //! MCU temperature: the GD32 internal sensor on ADC0 channel 16 (TSVREN, bit 23
 //! of ADC_SYNCCTL at ADC0 + 0x304), read right after the battery every 2 s,
@@ -16,6 +25,77 @@ const RCU_APB2EN: u32 = 0x4002_3844;
 const ADC0: u32 = 0x4001_2000;
 const GPIOB: u32 = 0x4002_0400;
 const GPIOC: u32 = 0x4002_0800;
+
+/// A USB host has the meter configured (main.rs, every pass; DBG:CHG?).
+pub static USB_CONF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The last 8 charge pin changes (DBG:CHG:LOG?): ms << 4 | USB << 2 |
+/// PB11 << 1 | PB10; `last` starts at 0xFF so the boot state is logged.
+pub struct ChgLog {
+    pub n: u32,
+    last: u8,
+    pub ev: [u32; 8],
+}
+pub static mut CHG_LOG: ChgLog = ChgLog { n: 0, last: 0xFF, ev: [0; 8] };
+
+/// DBG:CHG:PIN n,<mode>: set PB10 / PB11 for a charger experiment.
+/// mode 0 input no pull, 1 input pull-up, 2 input pull-down, 3 push-pull
+/// low, 4 push-pull high, 5 open drain released, 6 the default (`pins_init`).
+pub fn dbg_pin(pin: u32, mode: u32) -> bool {
+    if !(pin == 10 || pin == 11) || mode > 6 {
+        return false;
+    }
+    if mode == 6 {
+        pins_init();
+        return true;
+    }
+    let (m2, sh) = (3u32 << (2 * pin), 2 * pin);
+    unsafe {
+        let pupd = match mode { 1 => 1, 2 => 2, _ => 0 };
+        modify32(GPIOB + 0x0C, m2, pupd << sh);
+        modify32(GPIOB + 0x04, 1 << pin, if mode == 5 { 1 << pin } else { 0 }); // OD
+        match mode {
+            3 => w32(GPIOB + 0x28, 1 << pin), // BC: low
+            4 | 5 => w32(GPIOB + 0x18, 1 << pin), // BOP: high / released
+            _ => {}
+        }
+        modify32(GPIOB, m2, if mode >= 3 { 1 << sh } else { 0 });
+    }
+    true
+}
+
+/// DBG:CHG?: PB10 level, PB11 level, GPIOB MODE / PUD / OMODE / OCTL bits
+/// of PB10..11 (hex digits: bits 20..23 >> 20 etc.), USB configured, battery
+/// ADC (sum of 16 raw conversions; Vbat = sum / 16 * 3 / 4096 * 2).
+pub fn dbg_state() -> [u32; 8] {
+    let mut sum = 0;
+    for _ in 0..16 {
+        sum += convert(15);
+    }
+    unsafe {
+        let idr = r32(GPIOB + 0x10);
+        [
+            idr >> 10 & 1,
+            idr >> 11 & 1,
+            r32(GPIOB) >> 20 & 0xF,
+            r32(GPIOB + 0x0C) >> 20 & 0xF,
+            r32(GPIOB + 0x04) >> 10 & 3,
+            r32(GPIOB + 0x14) >> 10 & 3,
+            USB_CONF.load(core::sync::atomic::Ordering::Relaxed) as u32,
+            sum,
+        ]
+    }
+}
+
+/// PB10, PB11 as the stock sets them up (FUN_0800b5f6): PB11 input with
+/// pull-up; PB10 open drain, released (no pull), read as an input.
+fn pins_init() {
+    unsafe {
+        modify32(GPIOB + 0x0C, 0xF << 20, 1 << 22);
+        modify32(GPIOB + 0x04, 3 << 10, 0);
+        modify32(GPIOB, 0xF << 20, 0);
+    }
+}
 
 /// Typical GD32 temperature sensor constants (unverified for the F427).
 const TS_V25: f32 = 1.43;
@@ -58,10 +138,21 @@ impl Power {
             w32(ADC0 + 0x34, 15); // SQR3: ch15
             w32(ADC0 + 0x08, 1); // ADON
         }
+        pins_init();
         Power { next: 0, vbat: 4.2, bars: 5, mcu_t: f32::NAN }
     }
 
     pub fn poll(&mut self, now: u64) -> bool {
+        // Charge pin changes for DBG:CHG:LOG? (every pass: one IDR read).
+        let p = self.pins();
+        unsafe {
+            let l = &mut *core::ptr::addr_of_mut!(CHG_LOG);
+            if p != l.last {
+                l.last = p;
+                l.ev[l.n as usize % 8] = (now as u32) << 4 | p as u32 | (USB_CONF.load(core::sync::atomic::Ordering::Relaxed) as u32) << 2;
+                l.n = l.n.wrapping_add(1);
+            }
+        }
         if now < self.next {
             return false;
         }
@@ -128,9 +219,32 @@ impl Power {
         (lo, hi, cross, dt)
     }
 
+    /// Charging: input power and STDBY not active (PB10 = PB11 = 1).
     pub fn charging(&self) -> bool {
+        self.pins() == 3
+    }
+
+    /// On a charger (USB power present, PB10 = 1): charging or charged.
+    pub fn on_charger(&self) -> bool {
+        self.pins() & 1 != 0
+    }
+
+    /// Charge status pins: bit 0 PB10, bit 1 PB11 (DBG:DIAG? byte 61).
+    pub fn pins(&self) -> u8 {
         let b = unsafe { r32(GPIOB + 0x10) };
-        b & (1 << 10) != 0 && b & (1 << 11) != 0
+        (b >> 10 & 3) as u8
+    }
+
+    /// Battery level as shown: while charging, the top bar blinks (stock:
+    /// level and level - 1, 1 -> 0 bars at 0, alternating every 1 s;
+    /// FUN_08023840 and its timer 0x08023e88). `phase`: the 1 s alternation.
+    pub fn shown_bars(&self, phase: bool) -> u8 {
+        let b = self.bars.min(5);
+        match (self.charging() && phase, b) {
+            (false, _) => b,
+            (true, 0) => 1,
+            (true, _) => b - 1,
+        }
     }
 
     pub fn bt_connected(&self) -> bool {

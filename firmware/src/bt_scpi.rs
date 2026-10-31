@@ -24,6 +24,9 @@
 //!     drain time of the RX ring (bt.rs polls it every ~5 ms), so a main-loop
 //!     stall longer than the gap can drop a request that arrived split around
 //!     the stall; the gaps are far above any normal loop time.
+//!   - RxCursor reads the RX DMA ring and detects an overrun (the DMA wrapped
+//!     past unread bytes); bt.rs then calls `Rx::resync` (skip to the next
+//!     terminator) and reports "Input buffer overrun".
 
 pub const MAX_DATA: usize = 0xC2;
 /// Longest SCPI line (main.rs copies a message into a 256-byte buffer).
@@ -96,6 +99,15 @@ impl Rx {
         self.ln = 0;
         self.rp_n = 0;
         self.rp_i = 0;
+    }
+
+    /// After lost input (RX ring overrun): forget any partial frame / line
+    /// and discard up to the next '\n' / '\r', so no command cut by the gap
+    /// runs (0xAF still starts a frame).
+    pub fn resync(&mut self, now: u64) {
+        self.reset();
+        self.st = St::Skip;
+        self.last_ms = now;
     }
 
     /// Process input from `src` (None = nothing more right now) until the
@@ -240,10 +252,10 @@ enum Step {
 
 /// Header roots never executed for an untrusted transport (Bluetooth: an
 /// unauthenticated radio link anyone in range can open). DBG covers
-/// DBG:UPDATE / DBG:RECOVER (zero the loader marker -> vendor update screen;
-/// executed INSIDE Scpi::handle on native, so the check must run before the
-/// parser sees the message), DBG:RESET, DBG:RELEASE (watchdog -> crash count
-/// -> recovery), the input injection (DBG:KEY / SWIPE D,2 = power off) and
+/// DBG:UPDATE (zero the loader marker -> vendor update screen) and
+/// DBG:LOADER / DBG:RECOVER (vendor update screen through PA2), executed
+/// INSIDE Scpi::handle on native, so the check must run before the parser
+/// sees the message, DBG:RESET, DBG:RELEASE (watchdog reset), the input injection (DBG:KEY / SWIPE D,2 = power off) and
 /// the debug reads. Any future DBG:* command is refused by default. DIAG
 /// (DIAG? / DIAG:DAC?: the generator DAC sampled through the ADC; DIAG:PWM?:
 /// a 2 ms busy loop on PB14) is a bench diagnostic of the same kind.
@@ -278,6 +290,72 @@ pub fn untrusted_refusal(msg: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Read side of the circular RX DMA ring (`cap` bytes): the index of the
+/// next byte to take, and whether the DMA overtook the reader. The DMA write
+/// index alone cannot show a wrap, so this counts the bytes written between
+/// two looks (`see`), and checks the count against the DMA's half / full
+/// transfer flags (set when the writer passes cap/2 / the end): a flag the
+/// count does not explain is a lap the count missed (a main-loop pass longer
+/// than the ring's 89 ms at 115200). Exact while the writer moves less than
+/// 1.5 * cap between looks; a longer gap can go unseen.
+pub struct RxCursor {
+    rd: usize,
+    wr: usize,
+    unread: usize,
+    cap: usize,
+    lost: bool,
+}
+
+impl RxCursor {
+    pub const fn new(cap: usize) -> Self {
+        RxCursor { rd: 0, wr: 0, unread: 0, cap, lost: false }
+    }
+
+    /// One look: `wr`, the DMA's write index (0..cap), and its half / full
+    /// transfer flags since the last look, read together (no byte written
+    /// in between). If the unread bytes no longer fit the ring, the oldest
+    /// are gone: the reader jumps to the newest `cap - 1` bytes and `lost`
+    /// is set until `take_lost`.
+    pub fn see(&mut self, wr: usize, half: bool, full: bool) {
+        let wr = wr % self.cap;
+        let d = (wr + self.cap - self.wr) % self.cap;
+        // Writer at `b` at the last look counts as crossed: the DMA may set
+        // the flag just after the index (a missed lap from there also sets
+        // the other flag, which `d` does not explain).
+        let crossed = |b: usize| (b + self.cap - self.wr) % self.cap <= d;
+        let missed = (half && !crossed(self.cap / 2)) || (full && !crossed(0));
+        self.unread += d + if missed { self.cap } else { 0 };
+        self.wr = wr;
+        if self.unread >= self.cap {
+            self.unread = self.cap - 1;
+            self.rd = (wr + 1) % self.cap;
+            self.lost = true;
+        }
+    }
+
+    /// Index of the next unread byte (None: none, or lost input not yet
+    /// taken by `take_lost`, so no byte after the gap is parsed first).
+    pub fn next(&mut self) -> Option<usize> {
+        if self.unread == 0 || self.lost {
+            return None;
+        }
+        let i = self.rd;
+        self.rd = (self.rd + 1) % self.cap;
+        self.unread -= 1;
+        Some(i)
+    }
+
+    /// True once after input was lost (see `see`).
+    pub fn take_lost(&mut self) -> bool {
+        core::mem::take(&mut self.lost)
+    }
+}
+
+/// TX ring room kept on top of the largest SCPI reply before the next
+/// Bluetooth line is taken (`TxRing::room_for`): stock frame replies (<= 26
+/// bytes each) queued while that line's query waits for a reading.
+pub const TX_SLACK: usize = 256;
+
 /// Byte ring for the TX side: indices only, the storage is passed in (a
 /// static in DMA-reachable SRAM on the target). The reader takes contiguous
 /// segments (one DMA transfer each); `consume` after the transfer is done.
@@ -294,6 +372,11 @@ impl TxRing {
 
     pub fn free(&self) -> usize {
         self.cap - self.used
+    }
+
+    /// Room for a reply of up to `max` bytes plus TX_SLACK.
+    pub fn room_for(&self, max: usize) -> bool {
+        self.free() >= max + TX_SLACK
     }
 
     /// Bytes queued.

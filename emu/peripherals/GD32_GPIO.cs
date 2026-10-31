@@ -9,6 +9,11 @@
 // Registers: MODER OTYPER OSPEEDR PUPDR IDR ODR BSRR LCKR AFRL AFRH BRR(0x28, GD32 BC).
 // Connections[n] carries the pin level (for EXTI and for the bit-bang models);
 // OnGPIO(n, v) drives pin n externally; Release(n) lets it float again.
+// LCKR: the lock key sequence (LKK 1, 0, 1 with the same pin bits, then a
+// read) locks the selected pins: writes to their MODER / OTYPER / OSPEEDR /
+// PUPDR / AFR fields are ignored until Reset() (a system reset or power-on).
+// ODR / BSRR stay writable, as on the chip. opendm40's PA2 entry into the
+// FS-loader relies on it (firmware/src/boot.rs loader_pa2).
 //
 using System;
 using System.Collections.Generic;
@@ -36,7 +41,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         public void Reset()
         {
             moder = modeReset; ospeedr = speedReset; pupdr = pupdReset;
-            otyper = 0; odr = 0; afrl = 0; afrh = 0; lckr = 0;
+            otyper = 0; odr = 0; afrl = 0; afrh = 0; lckr = 0; locked = 0; lockStep = 0;
             for(var i = 0; i < 16; i++) { ext[i] = false; extDriven[i] = false; }
             UpdateLevels();
         }
@@ -55,7 +60,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             case 0x10: return Idr();
             case 0x14: return odr;
             case 0x18: return 0;
-            case 0x1C: return lckr;
+            case 0x1C:
+                // The read that completes the key sequence sets LKK.
+                if(lockStep == 3) { locked = lckr & 0xFFFF; lckr = LKK | locked; lockStep = 0; }
+                return lckr;
             case 0x20: return afrl;
             case 0x24: return afrh;
             case 0x28: return 0;
@@ -67,19 +75,19 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             switch(offset)
             {
-            case 0x00: moder = value; UpdateLevels(); break;
-            case 0x04: otyper = value & 0xFFFF; break;
-            case 0x08: ospeedr = value; break;
-            case 0x0C: pupdr = value; UpdateLevels(); break;
+            case 0x00: moder = Keep(moder, value, 2); UpdateLevels(); break;
+            case 0x04: otyper = Keep(otyper, value & 0xFFFF, 1); break;
+            case 0x08: ospeedr = Keep(ospeedr, value, 2); break;
+            case 0x0C: pupdr = Keep(pupdr, value, 2); UpdateLevels(); break;
             case 0x14: odr = value & 0xFFFF; UpdateLevels(); break;
             case 0x18: // BSRR / BOP: reset bits (high half) then set bits (low half) win
                 odr = (odr & ~(value >> 16)) | (value & 0xFFFF);
                 odr &= 0xFFFF;
                 UpdateLevels();
                 break;
-            case 0x1C: lckr = value; break;
-            case 0x20: afrl = value; break;
-            case 0x24: afrh = value; break;
+            case 0x1C: LockWrite(value); break;
+            case 0x20: afrl = Keep(afrl, value, 4); break;
+            case 0x24: afrh = KeepHigh(afrh, value); break;
             case 0x28: // BRR / BC
                 odr &= ~(value & 0xFFFF);
                 UpdateLevels();
@@ -102,6 +110,38 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(number < 0 || number > 15) return;
             extDriven[number] = false;
             UpdateLevels();
+        }
+
+        public bool Locked(int pin) => (locked & (1u << pin)) != 0;
+
+        // Locked pins keep their field (w bits per pin, pins 0..32/w-1).
+        private uint Keep(uint old, uint value, int w)
+        {
+            uint m = 0, f = (1u << w) - 1;
+            for(var i = 0; i < 32 / w; i++) if(Locked(i)) m |= f << (w * i);
+            return (old & m) | (value & ~m);
+        }
+
+        // AFRH: pins 8..15, 4 bits each.
+        private uint KeepHigh(uint old, uint value)
+        {
+            uint m = 0;
+            for(var i = 0; i < 8; i++) if(Locked(i + 8)) m |= 0xFu << (4 * i);
+            return (old & m) | (value & ~m);
+        }
+
+        // Key sequence: LKK=1 + pins, LKK=0 + same pins, LKK=1 + same pins,
+        // then a read of LCKR. Once locked, LCKR does not change until reset.
+        private void LockWrite(uint value)
+        {
+            if((lckr & LKK) != 0 && locked != 0) return;
+            var pins = value & 0xFFFF;
+            var k = (value & LKK) != 0;
+            if(lockStep == 0 && k) lockStep = 1;
+            else if(lockStep == 1 && !k && pins == (lckr & 0xFFFF)) lockStep = 2;
+            else if(lockStep == 2 && k && pins == (lckr & 0xFFFF)) lockStep = 3;
+            else lockStep = k ? 1 : 0;
+            lckr = value & (LKK | 0xFFFF);
         }
 
         public int Mode(int pin) => (int)((moder >> (2 * pin)) & 3);
@@ -135,7 +175,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         }
 
         private readonly uint modeReset, speedReset, pupdReset;
-        private uint moder, otyper, ospeedr, pupdr, odr, afrl, afrh, lckr;
+        private uint moder, otyper, ospeedr, pupdr, odr, afrl, afrh, lckr, locked;
+        private int lockStep;
+        private const uint LKK = 1u << 16;
         private readonly bool[] ext = new bool[16];
         private readonly bool[] extDriven = new bool[16];
         private readonly bool[] level = new bool[16];

@@ -330,7 +330,7 @@ pub fn grow(dev: &mut dyn BlockDevice, d: &Vol, k: usize, s: &mut [[u8; BLK]; 3]
 }
 
 /// Subdirectory `name` with at least NEED slots: opened, created, or grown.
-/// `s` = three block buffers (calbackup::scratch()).
+/// `s` = three block buffers (diskbuf::blocks()).
 pub fn ensure(dev: &mut dyn BlockDevice, v: &Vol, name: &[u8; 11], s: &mut [[u8; BLK]; 3]) -> Result<Vol, Err> {
     let (hit, free) = find_root(dev, v, name, &mut s[0])?;
     let d = match hit {
@@ -407,7 +407,7 @@ pub fn boot_result() -> Boot {
 /// inlined (the boot frames are popped before main()).
 #[inline(never)]
 pub fn boot(dev: &mut dyn BlockDevice) -> Boot {
-    let s = crate::calbackup::scratch();
+    let s = crate::diskbuf::blocks();
     let mut r = Boot { ok: 0, created: 0, failed: 0 };
     if dev.present() && dev.block_size() as usize == BLK && dev.read_block(0, &mut s[0]) {
         if let Some(v) = crate::fatren::parse_bpb(&s[0][..], dev.block_count()) {

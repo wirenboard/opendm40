@@ -1532,7 +1532,8 @@ namespace Hy3131Tests
                 Check(v < 0.002, "AC V on 1.234 V DC with AC V cal 1.012: settles to the floor (was ~18 mV)", string.Format("{0:F4} V", v));
             }
             {
-                // entry transient: AC V right after a plain DC V row with OP1 off
+                // entry transient: AC V right after a plain DC V row with OP1 off (HpfTransientGain 1.0
+                // since #40: the first block reads ~0.38 V of the 0.5 V step)
                 var m = NewChip();
                 m.Chip.SetInput("dcv:0.5");
                 m.Configure(F1R1, 1);
@@ -1544,7 +1545,7 @@ namespace Hy3131Tests
                 m.Read1(0x1E);
                 b = ReadAfter(m, 0x18, 1);
                 var later = SqrtRms(b) * 1.25 / 262144 * 10;
-                Check(first > 0.5 && later < 0.005, "AC V on 0.5 V DC: transient then floor", string.Format("{0:F3} V -> {1:F4} V", first, later));
+                Check(first > 0.25 && later < 0.005, "AC V on 0.5 V DC: transient then floor", string.Format("{0:F3} V -> {1:F4} V", first, later));
             }
             {
                 var m = NewChip();

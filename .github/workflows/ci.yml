@@ -67,6 +67,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: firmware -> target
+      # A pull request build carries the PR number and its head commit in
+      # the version, 0.3.2-pr148.1a2b3c4 (build.rs; firmware/README.md
+      # "PR builds"). Push and release builds keep Cargo.toml's version.
+      - name: Version suffix (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: echo "DM40_VERSION_SUFFIX=-pr$PR.${HEAD_SHA:0:7}" >> "$GITHUB_ENV"
       # No ../toolchain here: build.sh takes the rustup install above.
       # Stack depth, region A2 / B / C, SRAM and the update-file checks
       # fail the build.
@@ -74,20 +83,32 @@ jobs:
         run: firmware/build.sh --locked
       - name: Non-default feature sets (tools/build-variants)
         run: firmware/tools/build-variants/run.sh
+      # The artifact: opendm40-<commit> for a push; for a pull request
+      # the install name without .bin (dm40_opendm40_v0.3.2-pr148.1a2b3c4),
+      # which pr-build.yml looks for, and BUILD.txt with the commits.
       - name: Image name and checksum
         id: image
         working-directory: firmware
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           name=dm40_opendm40_v$(tools/fw-version.sh).bin
           test -f "$name"
           sha256sum "$name" | tee SHA256SUMS
+          printf 'merge %s\nbase %s\n' "$GITHUB_SHA" "$BASE_SHA" > BUILD.txt
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          if [ -n "${DM40_VERSION_SUFFIX:-}" ]; then
+            echo "artifact=${name%.bin}" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact=opendm40-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: opendm40-${{ github.sha }}
+          name: ${{ steps.image.outputs.artifact }}
           path: |
             firmware/${{ steps.image.outputs.name }}
             firmware/SHA256SUMS
+            firmware/BUILD.txt
             firmware/target/native/stackdepth.txt
           if-no-files-found: error
 
@@ -119,10 +140,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # doc-lang-check diffs against the PR's merge base
       - name: Relative links and anchors (tools/linkcheck.py)
         run: python3 firmware/tools/linkcheck.py .
       - name: SCPI reference vs parser (tools/scpi-doc-check)
         run: firmware/tools/scpi-doc-check/run.sh
+      - name: English and Russian docs in step (tools/doc-lang-check.sh)
+        env:
+          # Through env, not inline: the PR description is untrusted text.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: firmware/tools/doc-lang-check.sh $BASE $HEAD_SHA
 
   version:
     name: Version bumped since the last tag

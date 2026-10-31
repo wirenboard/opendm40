@@ -13,8 +13,11 @@ to the internal flash 0x08080000..0x080C1000 of that boot.
   4 the disk of 3, image B, a byte of the calibration sector's unused tail
     changed in the flash (--base copy)       -> WRITTEN (a calibration change)
   5 the disk of 4, the same flash as 4       -> PRESENT
-  6 a blank SPI disk, image A: no mirror (BADBPB); an AD2 stream to the
-    host while INFO/ is read: NOT READY from exactly the slow-bank sectors
+  6 a blank SPI disk, image A: no mirror (BADBPB); an AD2 stream that
+    starts inside a READ(10) crossing into the slow bank: the command fails
+    at the first slow sector (residue, 02/04/01), the retry after the stream
+    reads the same bytes; an AD2 stream to the host while INFO/ is read: NOT
+    READY from exactly the slow-bank sectors
 
   cd firmware && ./build.sh && DM40_TDIR=target/ks DM40_OUT=/tmp/ks.bin ./build.sh --features keep-screen
   emu/mirrortest.py --app firmware/target/native/thumbv7em-none-eabihf/release/opendm40 \\
@@ -48,6 +51,7 @@ os.environ['USBIP_PORT'] = str(A.port)
 import usbip_client as uc  # noqa: E402
 
 OUT = os.path.join(HERE, 'out')
+os.makedirs(OUT, exist_ok=True)
 TAG = 'mirror-%d-%d' % (A.port, os.getpid())
 LO, HI = 0x08080000, 0x080C1000
 FAIL = []
@@ -87,13 +91,13 @@ def mirror_file(disk):
     return None
 
 
-def boot(n, app, disk_in, base=None, during=None):
+def boot(n, app, disk_in, base=None, during=None, run_for=None):
     disk = os.path.join(OUT, '%s-disk%d.bin' % (TAG, n))
     flash = os.path.join(OUT, '%s-flash%d.bin' % (TAG, n))
     shutil.copy(disk_in, disk)
     MADE.extend([disk, flash])
     cmd = [sys.executable, os.path.join(HERE, 'run.py'), 'fwrs', '--app', app, '--usbip', '0.01',
-           '--usbip-port', str(A.port), '--run-for', str(A.run_for), '--name', '%s-%d' % (TAG, n),
+           '--usbip-port', str(A.port), '--run-for', str(run_for or A.run_for), '--name', '%s-%d' % (TAG, n),
            '--disk', disk, '--save-disk', disk, '--save-flash', flash]
     if base:
         cmd += ['--base', base]
@@ -175,6 +179,64 @@ try:
     # slow-bank sectors answer NOT READY 02/04/01, exactly those.
     import infovol  # noqa: E402
 
+    def isr_active(q):
+        return q('DBG:ISR?').split(',')[1] == '1'
+
+    def mid_read(m, q):
+        """A stream that starts inside a multi-block READ(10): the next
+        slow-bank block fails the command with the residue, sense 02/04/01;
+        the rest of the data phase is fill bytes. Without a mirror the vdisk
+        read of that block (`mir_read`) fails as well, so this checks the
+        behaviour, not msc.rs's own mid-transfer check. The READ
+        crosses from FIRMWARE.BIN's zero-wait part into its slow-bank tail;
+        the stream starts after PRE_N of its sectors were taken."""
+        fw_lba, _ = infovol.vol_dir(m, 'INFO')['FIRMWARE.BIN']
+        slow = fw_lba + infovol.SLOW_FILES['FIRMWARE.BIN'] // 512
+        lo, n, pre_n, fast_n = slow - 64, 128, 32, 64
+        ref = m.read(0, lo, n, 512, retries=2)
+        m.tag += 1
+        want_tag = m.tag
+        cb = struct.pack('>BBIBHB', 0x28, 0, lo, 0, n, 0)
+        m.d.bulk_out(m.ep_out, struct.pack('<4sIIBBB16s', b'USBC', m.tag, n * 512, 0x80, 0, len(cb), cb.ljust(16, b'\0')))
+        data = b''
+        while len(data) < pre_n * 512:
+            c = m.d.bulk_in(m.ep_in, 4096)
+            if not c:
+                break
+            data += c
+        q('LOG:STATe ON')
+        on = False
+        for _ in range(20):
+            on = isr_active(q)
+            if on:
+                break
+            time.sleep(0.5)
+        check(on, 'boot 6: the stream started inside the READ (DBG:ISR? active)')
+        while len(data) < n * 512:
+            c = m.d.bulk_in(m.ep_in, min(4096, n * 512 - len(data)))
+            if not c:
+                break
+            data += c
+        sig, tag, residue, status = struct.unpack('<4sIIB', m.d.bulk_in(m.ep_in, 13))
+        sense = m.sense(0)
+        check(sig == b'USBS' and tag == want_tag and status == 1 and residue == (n - fast_n) * 512 and len(data) == n * 512,
+              'boot 6: READ(10) %d x %d, stream on after %d: CSW status %d (want 1), residue %d (want %d), %d bytes'
+              % (lo, n, pre_n, status, residue, (n - fast_n) * 512, len(data)))
+        check(sense == infovol.NOT_READY, 'boot 6: then sense %s (want %s)' % (sense, infovol.NOT_READY))
+        check(data[:fast_n * 512] == ref[:fast_n * 512], 'boot 6: the %d sectors before the slow bank == the read without a stream'
+              % fast_n)
+        st, residue, _ = m.cmd(0, cb, n * 512)
+        sense = m.sense(0)
+        check(st == 1 and residue == n * 512 and sense == infovol.NOT_READY,
+              'boot 6: the retry while streaming fails before its data: status %d, residue %d, sense %s' % (st, residue, sense))
+        q('LOG:STATe OFF')
+        for _ in range(20):
+            if not isr_active(q):
+                break
+            time.sleep(0.5)
+        again = infovol.read(m, lo, n)
+        check(again == ref, 'boot 6: the retry after the stream stopped reads the same %d sectors' % n)
+
     def stream_read(d, t, mir):
         def q(s):
             t.write(s)
@@ -185,9 +247,10 @@ try:
         q('LOG:SRATe 4800')
         q('LOG:CHOP ON')
         time.sleep(3)
+        m = uc.Msc(d)
+        mid_read(m, q)
         q('LOG:STATe ON')
         isr = q('DBG:ISR?').split(',')
-        m = uc.Msc(d)
         refused, whole, other = infovol.read_info(m)
         isr2 = q('DBG:ISR?').split(',')
         q('LOG:STATe OFF')
@@ -199,7 +262,9 @@ try:
     blank = os.path.join(OUT, '%s-blank.bin' % TAG)
     MADE.append(blank)
     open(blank, 'wb').write(bytes(16 << 20))
-    m6, _, _ = boot(6, A.app, blank, during=stream_read)
+    # Boot 6's callback (two READ(10)s around a stream, then INFO/ during
+    # another) takes longer than the other boots': 30 virtual s more.
+    m6, _, _ = boot(6, A.app, blank, during=stream_read, run_for=A.run_for + 30)
     print('boot 6 (blank SPI disk): DBG:VDISK:MIR? %s' % m6, flush=True)
     check(m6 is not None and m6[0] == 0 and m6[1] == 2, 'boot 6: blank disk -> mirror not served, status BADBPB (%s)' % m6)
 finally:

@@ -19,7 +19,8 @@ rate, so DBG:AD2:DRAW 2 costs the main loop what it does on the meter):
     0.5 V after LOG:STATe OFF;
   * a function change mid-stream (CONF:VOLT:DC): the stream stops first
     (DBG:ISR? forced + 1, LOG:STATe? 0, "Settings conflict"), DC V reads ~0,
-    AC V 0.5 V again, DBG:HYSPI:SELF? 200 clean.
+    AC V 0.5 V again, DBG:HYSPI:SELF? 200 clean (a --features dbg-hyspi
+    build; without it: refused, skipped).
 Exit status 0 = all passed. Parallel runs: a distinct --port each (a busy
 port is refused); every file of a run (event script, Renode log, flash
 image, .resc) is named ad2stream-<port>-<pid> in emu/out/ (the log is kept,
@@ -249,9 +250,18 @@ try:
     q('CONF:VOLT:AC')
     time.sleep(2)
     check(abs(read_v() - 0.5) < 0.005, 'AC V reads 0.5 V again')
-    self_ = q('DBG:HYSPI:SELF? 200').split(',')
-    check(self_[2:6] == ['0', '0', '0', '0'], 'DBG:HYSPI:SELF? 200 clean (%s)' % ','.join(self_[:6]))
-    for mode in range(4):
+    # DBG:HYSPI needs --features dbg-hyspi (default off since region B
+    # audit #9): without it the query is refused (an empty reply).
+    q('*CLS')
+    r = q('DBG:HYSPI:SELF? 200')
+    self_ = r.split(',') if r else None
+    if self_ is None:
+        err = q('SYST:ERR?')
+        check('Undefined header' in err, 'DBG:HYSPI refused in a build without dbg-hyspi (%s)' % err)
+        print('  (DBG:HYSPI not in this build: its checks skipped)', flush=True)
+    if self_ is not None:
+        check(self_[2:6] == ['0', '0', '0', '0'], 'DBG:HYSPI:SELF? 200 clean (%s)' % ','.join(self_[:6]))
+    for mode in (range(4) if self_ is not None else ()):
         wr = q('DBG:HYSPI:WR? %d' % mode).split(',')
         check(len(wr) >= 7 and wr[2:4] == ['0', '0'] and wr[5] == wr[6],
               'DBG:HYSPI:WR? %d (the model takes every write path; the device tells them apart): %s' % (mode, ','.join(wr[:8])))

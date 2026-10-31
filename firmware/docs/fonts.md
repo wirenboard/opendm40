@@ -50,10 +50,17 @@ What can be dropped or packed without changing a pixel:
 `mkstockfont.py` emits:
 
 * no glyph from U+2E80 up (`CJK_FROM`);
-* 4 bpp glyphs as **RLE4**: row-major nibble tokens, no run crosses a row
-  end, byte-aligned per glyph: `1..14` one pixel of that coverage; `0|15, n`
-  n + 1 pixels of 0|15 (n <= 13); `0|15, 14, hi, lo` 15 + (hi lo) pixels;
-  `0, 15, k` at a row start: the last literal row k + 1 more times;
+* 4 bpp glyphs as **HUF**: row tokens, no token crosses a row end, a glyph
+  starts at a byte boundary. Tokens: `L(v)` one pixel of coverage 1..14;
+  `F0(n)` / `F15(n)` n pixels of 0 / 15; `C(E)` as a row's first token: the
+  row above again. A run length is a class (1..6, 7-8, 9-12, 13-20, 21-36,
+  37-68) plus 0-5 extra bits, or `E` = to the end of the row. Each token is
+  a canonical Huffman code from the table of its context (the previous
+  token's kind in the row: row start, L, F0, F15), then the extra bits, MSB
+  first. The 4 tables are shared by all 4 bpp fonts (`HUF_CNT`: codes per
+  length, `HUF_SYM`: symbols in code order; 182 B). The generator parses each
+  row optimally for the code lengths and alternates parse and Huffman
+  construction six times;
 * 1 bpp glyphs cropped to their ink rows t .. t + ih (column-major, ih bits
   per column);
 * 10-byte entries `E(code u16, off u16, w, h, adv, yoff, t, ih)`; the full
@@ -61,19 +68,46 @@ What can be dropped or packed without changing a pixel:
 * each glyph decoded back and compared with the stock bitmap (an assert in
   the generator).
 
-Drawing reads rows top to bottom, so an RLE4 glyph keeps a 6-byte cursor
-(`Cur`: next token, start of the last literal row, pending repeats, next
-row) instead of a row index table; `row_emit` decodes a row straight into
-the LCD writes (`label`, `glyphs`), `row` into a 64-byte row buffer. 1 bpp
-glyphs keep the direct column walk. Random access (`alpha`) remains for
-`Ink::at` / the scope markers (1 bpp fonts); on an RLE4 glyph it decodes
-from the top (correct, slow, not used by any 4 bpp drawing path).
+Drawing reads rows top to bottom, so a HUF glyph keeps a 6-byte cursor
+(`Cur`: bit index of the next token, of the last literal row, next row)
+instead of a row index table; `row_runs` hands a row's runs straight to the
+LCD writes (`label`, `glyphs`), `row` decodes into a 64-byte row buffer. A
+code of up to 6 bits (95 % of the tokens) is one lookup in a 512-byte table
+in SRAM, built from `HUF_CNT` / `HUF_SYM` at the first glyph lookup; longer
+codes are decoded bit by bit. 1 bpp glyphs keep the direct column walk.
+Random access (`alpha`) remains for `Ink::at` / the scope markers (1 bpp
+fonts); on a HUF glyph it decodes from the top (correct, slow, not used by
+any 4 bpp drawing path).
 
-Result on af4be54: 32 422 B of bitmaps and 8 690 B of entries (was 90 897 +
-13 212 B), ~12.4 KB of renderer code. The RLE decode is also faster than
-the raw bitmaps (Renode, DBG:PROF?: DMM page full draw -8.7 %, DMM reading
-redraw avg 646 -> 484 us): blank rows are skipped and a run fills several
-pixels per token.
+Result: 27 142 B of bitmaps (4 bpp 18 843 B, was 24 123 B as RLE4 and
+90 897 B raw), 182 B of tables, 8 690 B of entries. Against RLE4: region A2
++2 148 B free, region B +2 296 B (4 bpp data -5 280 B, tables +182 B,
+decoder code +624 B), SRAM -512 B, static worst stack path unchanged. Draw time
+(Renode, below) is a few per cent longer than RLE4.
+
+### Draw time
+
+[`DBG:PROF?`](../src/prof.rs) in the emulator, same scenario on each build
+(DMM page with a DC input whose every digit changes every 0.3 s, five DMM
+page entries, the scope page entry), and a temporary bench hook (not in
+the tree) over every 4 bpp glyph: each row through `row_runs` only, and
+each glyph through `label`. Renode
+runs one instruction per cycle at 200 MIPS, so these figures are
+instruction counts: no flash wait states, no pipeline or branch costs.
+
+| | RLE4 | HUF |
+|---|---:|---:|
+| bench: decode, instructions per glyph row | 282 | 408 (+44 %) |
+| bench: `label` of all 261 glyphs, k instructions | 6 734 | 7 608 (+13 %) |
+| DMM reading redraw (`d.read` avg / max), us | 2 346 / 3 480 | 2 531 / 3 776 (+8 %) |
+| DMM page entry (`tick` max), us | 19 060 | 19 954 (+5 %) |
+| scope page entry (`tick` max; its texts are in the 1 bpp SC_ fonts), us | 86 318 | 86 415 (+0.1 %) |
+
+Three or four runs per build, alternating: the DMM and bench figures
+repeat to within 0.1 %.
+
+Without the table (codes decoded bit by bit) a row took 814 instructions
+and the DMM reading redraw 3 045 us.
 
 ### Where the fonts live
 
@@ -99,8 +133,9 @@ to region C (not zero-wait): labels are drawn while the AD2 stream ISR runs.
 | big digits scaled from a smaller master | ~4 KB | visibly softer |
 | re-rasterize an outline font at build time | ~0 | not the stock face (the stock fonts are bitmaps of an unknown face) |
 | runtime vector rasterizer | negative | outlines ~15-30 KB + rasterizer 5-8 KB, 10-50x the draw time per pixel |
+| HUF contexts by the pixel above (0 / 15 / 1..14 / none, 20 tables) + `C(n)` partial copies from the row above | 1.1 KB more than HUF (4 bpp data 16 282 B, tables 794 B, code +860 B) | decode 763 instructions per row (2.7x RLE4), DMM reading redraw +53 %; the cursor holds the previous row (+32 B per glyph: `label` frame +1.5 KB), table 2.5 KB of SRAM ([feat/font-huffman-b](https://github.com/opendm40/opendm40/tree/feat/font-huffman-b)) |
 
-Every lossy option saves at most ~6 KB of the ~41 KB of font data and
+Every lossy option saves at most ~6 KB of the ~36 KB of font data and
 changes the look.
 
 ## 5. Checks

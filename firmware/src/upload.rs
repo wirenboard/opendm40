@@ -23,7 +23,7 @@
 //! Errors go to SYST:ERR? (the upload is then aborted; the first error
 //! is kept: later DATA is dropped silently, END? reports it).
 //!
-//! Writing: the data is collected in calbackup::scratch()[0]; every full
+//! Writing: the data is collected in diskbuf::blocks()[0]; every full
 //! 4 KiB block goes to the next free cluster (first fit, ascending, FAT 1
 //! untouched: `write_block` + read back). At END the last block (0xFF
 //! padded) is written, every block re-read and the CRC-32 compared, the
@@ -31,7 +31,7 @@
 //! (fatren::header_valid), then the chain in every FAT copy (FAT 1 first),
 //! then the root entry DM40FW.BIN (archive, size): data -> FAT -> directory,
 //! a power cut leaves at worst lost clusters. While an upload is active it
-//! owns the disk and scratch(): screenshot.rs / csvlog.rs / gallery.rs wait
+//! owns the disk and blocks(): screenshot.rs / csvlog.rs / gallery.rs wait
 //! (`busy`), and BEGIN is refused while one of them writes. An upload with
 //! no DATA for TIMEOUT_MS is dropped (`poll`; nothing to undo: the clusters
 //! were never linked).
@@ -39,6 +39,7 @@
 //! Host test: tools/fatren-test/run.sh "upload".
 
 use crate::calbackup;
+use crate::diskbuf;
 use crate::fatren::{self, le16, parse_bpb, verify};
 use crate::msc::BlockDevice;
 
@@ -68,7 +69,7 @@ struct Up {
     hint: u32,
     /// Blocks written (spc blocks per cluster).
     blocks: u32,
-    /// Bytes of the current block in scratch()[0].
+    /// Bytes of the current block in blocks()[0].
     fill: usize,
     t_last: u64,
     /// The first error of the upload (it ended there): later DATA is
@@ -77,7 +78,9 @@ struct Up {
     err: Option<&'static str>,
 }
 
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+// Backup SRAM (.bkp_bss, link-native.x; CPU only, zeroed at reset;
+// docs/native-boot.md "Extra RAM areas").
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut UP: Up = Up { active: false, size: 0, crc: 0, got: 0, run: 0, cl: [0; MAXCL], ncl: 0, hint: 0, blocks: 0, fill: 0, t_last: 0, err: None };
 /// The device's own SpiFlash handle (as screenshot.rs).
 #[cfg(target_os = "none")]
@@ -88,9 +91,9 @@ fn up() -> &'static mut Up {
     unsafe { &mut *core::ptr::addr_of_mut!(UP) }
 }
 
-/// An upload owns the SPI disk (and calbackup::scratch()): this one over
+/// An upload owns the SPI disk (and diskbuf::blocks()): this one over
 /// SCPI, or a firmware file being copied onto the USB volume (vwrite.rs
-/// staging). Inlined: calbackup::fft_work (the scope FFT, every pass) asks
+/// staging). Inlined: diskbuf::fft_work (the scope FFT, every pass) asks
 /// it, and this module is .cold.
 #[inline(always)]
 pub fn busy() -> bool {
@@ -179,7 +182,7 @@ pub fn begin_on(dev: &mut dyn BlockDevice, size: u32, crc: u32, now_ms: u64) -> 
     if !dev.present() || dev.block_size() as usize != BLK {
         return Err(E_IO);
     }
-    let [buf, tmp, _] = calbackup::scratch();
+    let [buf, tmp, _] = diskbuf::blocks();
     if fatren::delete_updates(dev, buf, tmp).is_none() {
         return Err(E_IO);
     }
@@ -222,7 +225,7 @@ fn data_inner(dev: &mut dyn BlockDevice, m: &[u8], now_ms: u64) -> R<()> {
     u.got += d.len() as u32;
     let mut d = d;
     while !d.is_empty() {
-        let buf = &mut calbackup::scratch()[0];
+        let buf = &mut diskbuf::blocks()[0];
         let n = (BLK - u.fill).min(d.len());
         buf[u.fill..u.fill + n].copy_from_slice(&d[..n]);
         u.fill += n;
@@ -234,10 +237,10 @@ fn data_inner(dev: &mut dyn BlockDevice, m: &[u8], now_ms: u64) -> R<()> {
     Ok(())
 }
 
-/// Write scratch()[0] (0xFF after `fill`) as the next block: a new cluster
+/// Write blocks()[0] (0xFF after `fill`) as the next block: a new cluster
 /// when the block starts one.
 fn flush(dev: &mut dyn BlockDevice, u: &mut Up) -> R<()> {
-    let [buf, fat, tmp] = calbackup::scratch();
+    let [buf, fat, tmp] = diskbuf::blocks();
     buf[u.fill..].fill(0xFF);
     if !dev.read_block(0, tmp) {
         return Err(E_IO);
@@ -317,7 +320,7 @@ fn end_inner(dev: &mut dyn BlockDevice) -> R<(u32, u32)> {
     if u.fill > 0 {
         flush(dev, u)?;
     }
-    let [buf, _, tmp] = calbackup::scratch();
+    let [buf, _, tmp] = diskbuf::blocks();
     if !dev.read_block(0, tmp) {
         return Err(E_IO);
     }
@@ -352,7 +355,7 @@ pub fn commit_on(dev: &mut dyn BlockDevice, cl: &[u16], size: u32) -> R<()> {
     if cl.is_empty() || cl.len() > MAXCL || !(128..=MAX).contains(&size) || (size as usize).div_ceil(BLK) != cl.len() {
         return Err("Illegal parameter value");
     }
-    let [buf, tmp, _] = calbackup::scratch();
+    let [buf, tmp, _] = diskbuf::blocks();
     if fatren::delete_updates(dev, buf, tmp).is_none() {
         return Err(E_IO);
     }
@@ -373,7 +376,7 @@ pub fn commit_on(dev: &mut dyn BlockDevice, cl: &[u16], size: u32) -> R<()> {
 /// root: the chain, then the entry `name` (`attr`). vwrite.rs parks a host
 /// session's data this way (hidden system temp files).
 pub(crate) fn link_named(dev: &mut dyn BlockDevice, cl: &[u16], size: u32, name: &[u8; 11], attr: u8) -> R<()> {
-    let tmp = &mut calbackup::scratch()[2];
+    let tmp = &mut diskbuf::blocks()[2];
     if !dev.read_block(0, tmp) {
         return Err(E_IO);
     }
@@ -388,7 +391,7 @@ pub(crate) fn link_named(dev: &mut dyn BlockDevice, cl: &[u16], size: u32, name:
 /// touched block, fewer when the clusters ascend), then the root entry
 /// `name` (`attr`) of `size` bytes.
 fn link_and_enter(dev: &mut dyn BlockDevice, v: &crate::fatren::Vol, cl: &[u16], size: u32, name: &[u8; 11], attr: u8) -> R<()> {
-    let [buf, fat, tmp] = calbackup::scratch();
+    let [buf, fat, tmp] = diskbuf::blocks();
     for k in 0..v.nfats {
         let mut i = 0;
         while i < cl.len() {

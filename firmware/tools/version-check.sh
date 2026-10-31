@@ -11,7 +11,7 @@
 # 0.1.0-pre2 -> v0.1.0-pre2).
 set -e
 cd "$(dirname "$0")/.."
-VER=$(tools/fw-version.sh)
+VER=$(DM40_VERSION_SUFFIX= tools/fw-version.sh) # Cargo.toml's, never a PR suffix
 if [ "$1" = --tag ]; then
     if [ "$2" != "v$VER" ]; then
         echo "version-check: tag $2 does not match Cargo.toml (version $VER, tag v$VER expected)" >&2

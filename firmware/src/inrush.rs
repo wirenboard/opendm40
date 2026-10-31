@@ -535,18 +535,17 @@ pub fn step_codes(amps: f32, b: f32) -> u32 {
     if k < 1.0 { 1 } else { k as u32 }
 }
 
-/// Next / previous threshold of the stepper from `cur` (`dir` -1 / +1).
+/// Next / previous threshold of the stepper from `cur` (`dir` -1 / +1):
+/// the nearest ladder step below / above it. `cur` stays when there is
+/// none: a value set over SCPI below 0.2 A or above 10 A (a "-" raised
+/// 0.1 A to 0.2 A, a "+" lowered 30 A to 10 A).
 pub fn thr_step(cur: f32, dir: i8) -> f32 {
-    let i = THR_STEPS.iter().position(|&t| t >= cur * 0.999).unwrap_or(THR_STEPS.len() - 1);
-    let exact = (THR_STEPS[i] - cur).abs() <= cur * 0.001;
-    let j = if dir < 0 {
-        i.saturating_sub(1)
-    } else if exact {
-        (i + 1).min(THR_STEPS.len() - 1)
+    let next = if dir < 0 {
+        THR_STEPS.iter().rev().find(|&&t| t < cur * 0.999)
     } else {
-        i
+        THR_STEPS.iter().find(|&&t| t > cur * 1.001)
     };
-    THR_STEPS[j]
+    next.copied().unwrap_or(cur)
 }
 
 #[cfg(test)]
@@ -784,6 +783,12 @@ mod tests {
         assert_eq!(thr_step(10.0, 1), 10.0);
         assert_eq!(thr_step(0.7, 1), 1.0);
         assert_eq!(thr_step(0.7, -1), 0.5);
+        // Off the ladder (INR:THR): never the other way.
+        assert_eq!(thr_step(0.1, -1), 0.1);
+        assert_eq!(thr_step(0.1, 1), 0.2);
+        assert_eq!(thr_step(30.0, 1), 30.0);
+        assert_eq!(thr_step(30.0, -1), 10.0);
+        assert_eq!(thr_step(12.0, -1), 10.0);
         assert_eq!(step_codes(1.0, B), 262);
     }
 }

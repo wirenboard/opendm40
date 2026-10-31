@@ -5,19 +5,29 @@
 //! has initialised RAM (only `set_info`/`info` below use one, afterwards).
 //! Every wait is bounded and feeds the FWDGT. Every cap fails toward a
 //! normal boot: a key-gesture pass cap counts as a RELEASE, never as a held
-//! key (review N1), so a stopped cycle counter cannot reach recovery.
+//! key (review N1).
 //!
-//! Recovery zeroes the loader marker (src/recovery.rs): a one-way door into
-//! the vendor updater. So every trigger is deliberate or repeated.
+//! Two ways into the vendor FS-loader's update screen:
+//! - PA2 entry (`loader_pa2`, DBG:LOADER / DBG:RECOVER, the key hold): PA2
+//!   driven low and locked, then a jump to the ROM's reset handler. The ROM
+//!   and the loader see PA2 low for their whole poll, as with the TX-GND short.
+//!   The marker stays valid: a power cycle (or the loader's power-off) boots
+//!   opendm40 again.
+//! - Marker zeroing (`enter_loader_update`, DBG:UPDATE, the on-meter
+//!   install of a copied image): a one-way door, the loader stays until a good
+//!   install. Used only where a staged image must be installed.
 //!
-//! Decision, in this order (docs/native-boot.md "Implementation"):
+//! Decision, in this order (docs/native-boot.md "Shim (reset path)"):
+//!   backup-SRAM request word == LOADER_MAGIC  -> PA2 entry (consumed; first
+//!     thing, before the clock or the watchdog are touched)
 //!   backup-SRAM request word == REQ_MAGIC     -> recovery (Requested; consumed)
-//!   key gesture confirmed (below)             -> recovery (KeyHold)
+//!   key gesture confirmed (below)             -> request word LOADER_MAGIC,
+//!                                                SYSRESETREQ (-> PA2 entry)
 //!   key held to the cue, released in time     -> normal   (KeyHoldAborted)
 //!   clock init failed (HXTAL and IRC16M), or a GENUINE watchdog reset after
-//!     our own normal boot: crash counter += 1;
-//!       counter >= CRASH_MAX                  -> recovery (ClockFail / Watchdog)
-//!       else clock failed                     -> SYSRESETREQ, retry (ClockFail)
+//!     our own normal boot: crash counter += 1 (shown by DBG:BOOT?);
+//!       clock failed, counter < CLOCK_RETRIES -> SYSRESETREQ, retry (ClockFail)
+//!       clock failed                          -> normal   (ClockFail)
 //!       else                                  -> normal   (WdtRetry)
 //!   FWDGTRSTF, previous boot was recovery     -> normal   (WdtAfterRecovery)
 //!   FWDGTRSTF otherwise                       -> normal   (WdtStale)
@@ -32,7 +42,7 @@
 //! Key gesture: the backlight comes on at once (instant feedback, so a normal
 //! power-on press is released early). Holding the power key HOLD_MS (4 s)
 //! after the shim started gives a cue (beep + backlight blink); the key must
-//! then STILL be held CONFIRM_MS (0.5 s) to enter recovery. Releasing during
+//! then STILL be held CONFIRM_MS (0.5 s) to enter the loader. Releasing during
 //! that window aborts to a normal boot.
 
 use crate::clock::{self, Src};
@@ -72,16 +82,16 @@ const DWT_CYCCNT: u32 = 0xE000_1004;
 pub const PD6_PRESSED_HIGH: bool = true;
 /// Hold the power key this long after the shim started -> cue.
 pub const HOLD_MS: u32 = 4000;
-/// ... and still this long after the cue -> recovery.
+/// ... and still this long after the cue -> the loader (PA2 entry).
 pub const CONFIRM_MS: u32 = 500;
-/// Crash counter value that takes the recovery path (2 = the second watchdog
-/// reset / clock failure without 60 s of healthy main loop in between).
-pub const CRASH_MAX: u32 = 2;
+/// A release shorter than this is contact bounce, not a release.
+const RELEASE_DEBOUNCE_MS: u32 = 30;
+/// A clock failure retries the boot (SYSRESETREQ) while the crash counter is
+/// below this; then opendm40 runs on the clock it has (never recovery).
+pub const CLOCK_RETRIES: u32 = 2;
 /// Main-loop time after which `mark_healthy` clears the crash counter.
 // (60 s of RUNNING main loop since this boot, not 60 s between two resets)
 pub const HEALTHY_MS: u64 = 60_000;
-/// A release shorter than this is contact bounce, not a release.
-const RELEASE_DEBOUNCE_MS: u32 = 30;
 
 /// Backup SRAM (0x40024000, 4 KiB). persist.rs uses the start: record v4 =
 /// magic, version, 40 words, CRC = 43 words, 0x40024000..0x400240AB; these
@@ -90,12 +100,18 @@ const RELEASE_DEBOUNCE_MS: u32 = 30;
 /// Crash counter (`CRASH_TAG | n`).
 pub const BKP_CRASH: u32 = 0x4002_4FF0;
 const CRASH_TAG: u32 = 0x4352_0000; // "CR"
-/// Last recovery's result (0x54520010 marker zeroed, 0x54520011 failed;
+/// Last loader entry (0x54520010 marker zeroed, 0x54520011 failed, 0x54520012
+/// PA2 entry, 0x54520013 PA2 entry without the GPIO lock;
 /// recovery-file: `0x5452_0000 | fatren::Trigger`).
 pub const BKP_TRIG: u32 = 0x4002_4FF4;
 pub const BKP_REQ: u32 = 0x4002_4FF8;
 pub const BKP_LAST: u32 = 0x4002_4FFC;
 pub const REQ_MAGIC: u32 = 0x5245_4356; // "VCER" LE: recovery requested
+/// BKP_REQ value for the PA2 entry into the loader (`loader_pa2`).
+pub const LOADER_MAGIC: u32 = 0x4C32_4150; // "PA2L" LE
+/// BKP_TRIG after the PA2 entry: GPIOA lock confirmed / not confirmed.
+pub const TRIG_PA2: u32 = 0x5452_0012;
+pub const TRIG_PA2_NOLOCK: u32 = 0x5452_0013;
 const LAST_NORMAL: u32 = 0x4C4D_524E; // "NRML"
 const LAST_RECOVERY: u32 = 0x5256_4352; // "RCVR"
 
@@ -108,11 +124,9 @@ pub enum Mode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     None,
-    Watchdog,
     WdtAfterRecovery,
     WdtStale,
     WdtRetry,
-    KeyHold,
     KeyHoldAborted,
     Requested,
     ClockFail,
@@ -135,8 +149,6 @@ pub struct BootInfo {
     pub clock: ClockState,
     /// Previous boot's mode word (BKP_LAST) as found.
     pub last: u32,
-    /// How long PD6 was held after the shim started (capped at HOLD_MS).
-    pub hold_ms: u32,
 }
 
 #[inline(always)]
@@ -153,7 +165,8 @@ pub fn pd6_pressed() -> bool {
 /// PD6 input WITH pull-down, as the stock key init does
 /// (app_decompile.c:6482, gpio_mode_set(GPIOD, input, PUPD 2, 0x40)). After a
 /// reset the ROM/loader leave PD6 floating (PUPD 00); without the pull a
-/// floating 1 would read as a held key. Then let the pull settle.
+/// floating 1 would read as a held key (recovery-usb reads the key without
+/// board::init). Then let the pull settle.
 fn pd6_input() {
     unsafe {
         modify32(RCU_AHB1EN, 0, 1 << 3); // GPIOD
@@ -176,9 +189,9 @@ fn backlight(on: bool) {
     }
 }
 
-/// Cue before the destructive key-hold action: backlight off and a ~0.3 s
-/// beep (buzzer PA7 toggled as plain GPIO at ~2.7 kHz, the stock drives the
-/// same pin with TIM14 PWM at 3.57 kHz), then backlight on again.
+/// Cue of the key-hold gesture: backlight off and a ~0.3 s beep (buzzer PA7
+/// toggled as plain GPIO at ~2.7 kHz, the stock drives the same pin with
+/// TIM14 PWM at 3.57 kHz), then backlight on again.
 fn cue(cyc_per_ms: u32) {
     backlight(false);
     unsafe {
@@ -187,11 +200,8 @@ fn cue(cyc_per_ms: u32) {
         modify32(GPIOA, 3 << 14, 1 << 14);
     }
     let half = cyc_per_ms * 10 / 54; // ~185 us
-    // Pass cap per half period (review N1): a pass is >= 4 cycles (two DWT
-    // reads, compare, count; ~8 in the native build), so with a running
-    // counter the time ends it first; with a stopped counter the whole cue
-    // still ends after 1620 x half/2 passes (~1 s), not tens of seconds. Only
-    // the tone is affected: the cue decides nothing.
+    // Pass cap per half period (review N1): with a stopped cycle counter the
+    // cue still ends after 1620 x half/2 passes (~1 s). The cue decides nothing.
     let cap = half / 2;
     let mut level = false;
     for _ in 0..1620 {
@@ -381,8 +391,95 @@ pub fn record_trigger(code: u32) {
 }
 
 // (BKP_REQ = REQ_MAGIC before a reset asks the shim for recovery. No caller
-// sets it now: DBG:RECOVER zeroes the loader marker instead; kept as the
-// in-app recovery request for later.)
+// sets it now; kept as the in-app recovery request for later.)
+
+/// DBG:LOADER / DBG:RECOVER: ask the next shim pass for the PA2 entry
+/// (`loader_pa2`); the caller resets (deferred SYSRESETREQ). The marker is
+/// not touched.
+pub fn request_loader() {
+    bkp_enable();
+    unsafe { w32(BKP_REQ, LOADER_MAGIC) };
+}
+
+// --- PA2 entry into the vendor loader --------------------------------------
+//
+// The ROM (0x080005f4) and the FS-loader (0x080a1c0e) each set PA2 to input
+// with pull-up (gpio_mode_set: MODER and PUPD rewritten) and poll IDR bit 2
+// 1000 times; one high read launches a valid app. Neither resets GPIOA
+// (no RCU_AHB1RST write) nor touches GPIOA_LCKR. So PA2 configured as a
+// push-pull output at 0 and then LOCKED (GPIOx_LOCK, offset 0x1C: MODER,
+// OTYPER, OSPEEDR, PUPDR and AFR of the pin frozen until the next system
+// reset; the output data register is not locked, and nothing in the ROM or
+// the loader writes PA2's output bit) keeps PA2 low through both polls. The
+// loader then shows its update screen; it installs a dm40*.bin found in the
+// SPI-flash root as on a TX-GND power-on. A system reset (the loader after an
+// install) or a power cycle ends the lock: PA2 reads high again, the marker
+// is valid, opendm40 boots.
+//
+// Called first thing in the shim after a reset, so the state is the one the
+// ROM leaves when it launches the app: its clock (PLL 200 MHz), its FWDGT
+// (the ROM sets it up again), no interrupt enabled. The jump repeats what the
+// ROM's own reset path expects: VTOR 0x08000000, MSP from its vector table,
+// PRIMASK clear, CONTROL 0.
+
+const GPIOA_LCKR: u32 = GPIOA + 0x1C;
+const LCKR_LKK: u32 = 1 << 16;
+const ROM_BASE: u32 = 0x0800_0000;
+const SCB_VTOR: u32 = 0xE000_ED08;
+const SCB_ICSR: u32 = 0xE000_ED04;
+const SYST_CSR: u32 = 0xE000_E010;
+const NVIC_ICER: u32 = 0xE000_E180;
+const NVIC_ICPR: u32 = 0xE000_E280;
+
+/// PA2 output low, locked; then the ROM's reset handler. Never returns.
+#[link_section = ".shim"]
+#[inline(never)]
+fn loader_pa2() -> ! {
+    unsafe {
+        // Consumed: a reset from here on (the loader's install, the FWDGT
+        // after its power-off on USB power) boots normally.
+        w32(BKP_REQ, 0);
+        w32(BKP_LAST, LAST_RECOVERY);
+        modify32(RCU_AHB1EN, 0, 1 << 0); // GPIOA
+        w32(GPIOA + 0x18, 1 << (2 + 16)); // PA2 = 0 before the mode
+        modify32(GPIOA + 0x04, 1 << 2, 0); // push-pull
+        modify32(GPIOA + 0x0C, 3 << 4, 0); // no pull
+        modify32(GPIOA, 3 << 4, 1 << 4); // output
+        // Lock key sequence (GD32F4xx GPIOx_LOCK = STM32 GPIOx_LCKR).
+        let pin = 1 << 2;
+        w32(GPIOA_LCKR, LCKR_LKK | pin);
+        w32(GPIOA_LCKR, pin);
+        w32(GPIOA_LCKR, LCKR_LKK | pin);
+        let _ = r32(GPIOA_LCKR);
+        let locked = r32(GPIOA_LCKR) & (LCKR_LKK | pin) == LCKR_LKK | pin;
+        // Without the lock the ROM's pull-up wins and it launches opendm40
+        // again (a plain reboot); DBG:BOOT? shows which.
+        w32(BKP_TRIG, if locked { TRIG_PA2 } else { TRIG_PA2_NOLOCK });
+        // Nothing may interrupt the ROM before it sets itself up.
+        w32(SYST_CSR, 0);
+        for i in 0..8 {
+            w32(NVIC_ICER + 4 * i, !0);
+            w32(NVIC_ICPR + 4 * i, !0);
+        }
+        w32(SCB_ICSR, 1 << 25); // PENDSTCLR
+        w32(SCB_VTOR, ROM_BASE);
+        let sp = r32(ROM_BASE);
+        let pc = r32(ROM_BASE + 4);
+        core::arch::asm!(
+            "dsb",
+            "isb",
+            "msr msp, {sp}",
+            "msr control, {z}",
+            "isb",
+            "cpsie i",
+            "bx {pc}",
+            sp = in(reg) sp,
+            pc = in(reg) pc,
+            z = in(reg) 0u32,
+            options(noreturn)
+        );
+    }
+}
 
 /// Clear the latched reset flags and reset by SYSRESETREQ (SW reset: the shim
 /// then boots normally unless a request word is set).
@@ -409,12 +506,8 @@ fn cyccnt() -> u32 {
 /// Fail-safe cap (review N1): the loop is also bounded by a pass count (each
 /// pass is >= 8 cycles: an FWDGT write, a GPIO read, a DWT read, so with a
 /// running counter the time limit always comes first). Reaching the cap means
-/// the cycle counter is not advancing, so neither "held for limit_ms" nor a
-/// debounced release can be measured; it returns `Some(limit_ms)`, i.e. it is
-/// treated as a RELEASE: never as "held", so a stopped counter can never
-/// confirm the gesture (recovery = zeroed marker). The cap is checked before
-/// the time limit. Effect in `key_gesture`: first window -> (HOLD_MS, false)
-/// -> KEY_HOLD_ABORTED, normal boot, no cue; confirm window -> abort, normal.
+/// the cycle counter is not advancing; it returns `Some(limit_ms)`, i.e. a
+/// RELEASE, never "held", so a stopped counter never confirms the gesture.
 fn held_for(t0: u32, limit_ms: u32, cyc_per_ms: u32) -> Option<u32> {
     // (4000 + 100) x 25_000 = 1.03e8 at 200 MHz: no u32 overflow.
     let cap = (limit_ms + 100) * (cyc_per_ms / 8);
@@ -444,7 +537,7 @@ fn held_for(t0: u32, limit_ms: u32, cyc_per_ms: u32) -> Option<u32> {
     }
 }
 
-/// The recovery key gesture: (held ms, confirmed). Not pressed -> (0, false);
+/// The key gesture: (held ms, confirmed). Not pressed -> (0, false);
 /// released before HOLD_MS -> (ms, false); held to HOLD_MS -> cue, then
 /// released within CONFIRM_MS -> (ms, false) = abort; still held -> confirmed.
 fn key_gesture(cyc_per_ms: u32) -> (u32, bool) {
@@ -465,6 +558,12 @@ fn key_gesture(cyc_per_ms: u32) -> (u32, bool) {
 #[link_section = ".shim"]
 #[inline(never)]
 pub fn shim() -> BootInfo {
+    // (a) PA2 entry requested before this reset: first, in the state the ROM
+    // left (its clock and watchdog), never returns.
+    bkp_enable();
+    if unsafe { r32(BKP_REQ) } == LOADER_MAGIC {
+        loader_pa2();
+    }
     // (b) watchdog first: from here on any hang resets into this shim.
     crate::wdt::start::fwdgt();
     // Keep the unit powered before anything slow (the key may be released),
@@ -491,8 +590,7 @@ pub fn shim() -> BootInfo {
         modify32(DEMCR, 0, 1 << 24); // TRCENA
         modify32(DWT_CTRL, 0, 1); // CYCCNTENA
     }
-    // (e) request word (consumed), previous mode, key hold.
-    bkp_enable();
+    // (e) request word (consumed), previous mode, crash counter, key hold.
     let req = unsafe { r32(BKP_REQ) } == REQ_MAGIC;
     if req {
         unsafe { w32(BKP_REQ, 0) };
@@ -500,7 +598,12 @@ pub fn shim() -> BootInfo {
     let last = unsafe { r32(BKP_LAST) };
     let crash = unsafe { r32(BKP_CRASH) };
     let crash = if crash & 0xFFFF_0000 == CRASH_TAG { crash & 0xFF } else { 0 };
-    let (hold_ms, confirmed) = key_gesture(cyc_per_ms);
+    let (hold_ms, confirmed) = if req { (0, false) } else { key_gesture(cyc_per_ms) };
+    if confirmed {
+        // The PA2 entry runs on the next pass, from the ROM's state.
+        unsafe { w32(BKP_REQ, LOADER_MAGIC) };
+        sysreset()
+    }
 
     let wdt = rstsck & FWDGTRSTF != 0;
     // Genuine = our own hang: FWDGT alone (no SW reset, no power-on) after a
@@ -509,24 +612,19 @@ pub fn shim() -> BootInfo {
     let failed = clock == ClockState::Failed;
     let (mode, reason) = if req {
         (Mode::Recovery, Reason::Requested)
-    } else if confirmed {
-        (Mode::Recovery, Reason::KeyHold)
     } else if hold_ms >= HOLD_MS {
         (Mode::Normal, Reason::KeyHoldAborted)
     } else if failed || genuine {
+        // Counted for DBG:BOOT? only: a hang reboots opendm40, every time.
         let n = (crash + 1).min(0xFF);
         unsafe { w32(BKP_CRASH, CRASH_TAG | n) };
-        let why = if failed { Reason::ClockFail } else { Reason::Watchdog };
-        if n >= CRASH_MAX {
-            (Mode::Recovery, why)
-        } else if failed {
+        if failed && n < CLOCK_RETRIES {
             // Transient clock failure: retry the whole boot (the ROM sets the
             // clock up again) instead of running opendm40 at 16 MHz.
             unsafe { w32(BKP_LAST, LAST_NORMAL) };
             sysreset()
-        } else {
-            (Mode::Normal, if failed { Reason::ClockFail } else { Reason::WdtRetry })
         }
+        (Mode::Normal, if failed { Reason::ClockFail } else { Reason::WdtRetry })
     } else if wdt && last == LAST_RECOVERY {
         (Mode::Normal, Reason::WdtAfterRecovery)
     } else if wdt {
@@ -541,7 +639,7 @@ pub fn shim() -> BootInfo {
         w32(BKP_LAST, if mode == Mode::Recovery { LAST_RECOVERY } else { LAST_NORMAL });
     }
     feed();
-    BootInfo { rstsck, rstsck_after, mode, reason, clock, last, hold_ms }
+    BootInfo { rstsck, rstsck_after, mode, reason, clock, last }
 }
 
 // --- After RAM init: boot info for DBG:BOOT? --------------------------------
@@ -565,8 +663,8 @@ pub fn info() -> Option<BootInfo> {
 static mut HEALTHY: bool = false;
 
 /// Call from the main loop every iteration with the uptime in ms: after
-/// HEALTHY_MS of running it clears the crash counter once, so a later single
-/// hang counts as a first crash again (one reboot, not recovery).
+/// HEALTHY_MS of running it clears the crash counter once, so the counter
+/// shows the hangs in a row (DBG:BOOT?).
 // Call site: main.rs main loop (`now` = ms since main started, after pre_main).
 pub fn mark_healthy(now_ms: u64) {
     if now_ms >= HEALTHY_MS && !unsafe { HEALTHY } {
@@ -576,42 +674,19 @@ pub fn mark_healthy(now_ms: u64) {
     }
 }
 
-fn hex(s: &mut crate::scpi::Scpi, v: u32) {
-    let mut t = [0u8; 10];
-    t[0] = b'0';
-    t[1] = b'x';
-    for i in 0..8 {
-        t[2 + i] = b"0123456789ABCDEF"[(v >> (28 - 4 * i) & 0xF) as usize];
-    }
-    s.put_bytes(&t);
-}
-
-fn dec(s: &mut crate::scpi::Scpi, mut v: u32) {
-    let mut t = [0u8; 10];
-    let mut i = t.len();
-    loop {
-        i -= 1;
-        t[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    s.put_bytes(&t[i..]);
-}
-
-/// DBG:BOOT? reply (reason: NONE WATCHDOG WDT_AFTER_RECOVERY WDT_STALE
-/// WDT_RETRY KEY_HOLD KEY_HOLD_ABORTED REQUESTED CLOCK_FAIL; clock: HXTAL
-/// IRC16M FAILED):
-/// `rstsck,rstsck_after,mode,reason,clock,last,hold_ms,bcr1,btr1,bwtr1,lcd_id,
-/// fatren_status,found,renamed_8.3_name(11 chars),old_backup,old_deleted,
-/// freed_clusters,others,rcvr_deleted,last_trigger` (others > 0: more
-/// dm40*.bin left untouched = warning; rcvr_deleted: a leftover DM40RCVR.BIN
-/// was removed; last_trigger: see below), marker_w0,w1,w2,VALID|INVALID,
-/// crash_word (0x435200nn), HEALTHY|-, fmc_last (0 = clean),
-/// PD6,moder,pupd,idr (power key pin read live: MODER[13:12] 0 = input,
-/// PUPD[13:12] 2 = pull-down, IDR bit 6 1 = pressed), then
-/// native::put_extra: STAGED,n,CALBK,status,written,conflict,differs,STACK,used,size,CALMS,ms,SPICLK,...
+/// DBG:BOOT? reply: `B2,` then the words below in hex (no prefix, no
+/// leading zeros), then `,` and fatren's renamed 8.3 name (11 characters,
+/// blanks if none). One formatter for every field: names, enum orders and
+/// meanings in docs/manual/scpi-reference.md ("DBG:BOOT?") and
+/// tools/dm40dbg.py `BOOT_FIELDS` (`dm40dbg.py boot` decodes it).
+///   0 mode (0 normal, 1 recovery)  1 reason (`Reason` order)  2 clock
+///   (`ClockState` order)  3 rstsck  4 rstsck_after  5 last  6 last_trigger
+///   (BKP_TRIG)  7..9 loader marker words  10 marker valid (1 / 0)
+///   11 crash word  12 healthy (1 / 0)  13 fmc_last  14..17 FSMC BCR1 /
+///   BTR1 / BWTR1 and the panel ID as found  18 fatren status
+///   (`fatren::Status` order)  19 found  20 old_backup  21 old_deleted
+///   22 freed_clusters  23 others  24 rcvr_deleted  25 staged
+///   26.. native::boot_words.
 #[inline(never)] // .cold (link-native.x): not inlined into the hot caller
 pub fn put_info(s: &mut crate::scpi::Scpi) {
     s.len = 0;
@@ -619,74 +694,56 @@ pub fn put_info(s: &mut crate::scpi::Scpi) {
         s.put_bytes(b"NONE");
         return;
     };
-    hex(s, i.rstsck);
-    s.put_bytes(b",");
-    hex(s, i.rstsck_after);
-    s.put_bytes(if i.mode == Mode::Normal { b",NORMAL," } else { b",RECOVERY," });
-    s.put_bytes(match i.reason {
-        Reason::None => b"NONE" as &[u8],
-        Reason::Watchdog => b"WATCHDOG",
-        Reason::WdtAfterRecovery => b"WDT_AFTER_RECOVERY",
-        Reason::WdtStale => b"WDT_STALE",
-        Reason::WdtRetry => b"WDT_RETRY",
-        Reason::KeyHoldAborted => b"KEY_HOLD_ABORTED",
-        Reason::KeyHold => b"KEY_HOLD",
-        Reason::Requested => b"REQUESTED",
-        Reason::ClockFail => b"CLOCK_FAIL",
-    });
-    s.put_bytes(match i.clock {
-        ClockState::Hxtal => b",HXTAL," as &[u8],
-        ClockState::Irc16m => b",IRC16M,",
-        ClockState::Failed => b",FAILED,",
-    });
-    hex(s, i.last);
-    s.put_bytes(b",");
-    dec(s, i.hold_ms);
     let b = unsafe { BOARD }.unwrap_or_default();
-    for v in [b.bcr1, b.btr1, b.bwtr1, b.lcd_id] {
-        s.put_bytes(b",");
-        hex(s, v);
-    }
     let r = crate::fatren::result();
-    s.put_bytes(match r.status {
-        crate::fatren::Status::NotRun => b",NOTRUN," as &[u8],
-        crate::fatren::Status::NoMedium => b",NOMEDIUM,",
-        crate::fatren::Status::BadBpb => b",BADBPB,",
-        crate::fatren::Status::Clean => b",CLEAN,",
-        crate::fatren::Status::DryRun => b",DRYRUN,",
-        crate::fatren::Status::Renamed => b",RENAMED,",
-        crate::fatren::Status::Error => b",ERROR,",
-    });
-    dec(s, r.found as u32);
+    let m = marker();
+    let head = [
+        i.mode as u32,
+        i.reason as u32,
+        i.clock as u32,
+        i.rstsck,
+        i.rstsck_after,
+        i.last,
+        // Last loader entry: 0x54520010 marker zeroed, 0x54520011 zeroing
+        // failed, 0x54520012 PA2 entry, 0x54520013 PA2 entry, lock not
+        // confirmed; recovery-file: 0x5452000n (0 / other = none recorded).
+        unsafe { r32(BKP_TRIG) },
+        m[0],
+        m[1],
+        m[2],
+        marker_valid() as u32,
+        unsafe { r32(BKP_CRASH) },
+        unsafe { HEALTHY } as u32,
+        fmc_last(),
+        b.bcr1,
+        b.btr1,
+        b.bwtr1,
+        b.lcd_id,
+        r.status as u32,
+        r.found as u32,
+        r.old_backup as u32,
+        r.old_deleted as u32,
+        r.freed_clusters,
+        r.others as u32,
+        r.fake_deleted as u32,
+        r.staged as u32,
+    ];
+    s.put_bytes(b"B2");
+    for v in head.iter().chain(crate::native::boot_words().iter()) {
+        s.put_bytes(b",");
+        let mut t = [0u8; 8];
+        let mut n = t.len();
+        let mut v = *v;
+        loop {
+            n -= 1;
+            t[n] = b"0123456789ABCDEF"[(v & 15) as usize];
+            v >>= 4;
+            if v == 0 {
+                break;
+            }
+        }
+        s.put_bytes(&t[n..]);
+    }
     s.put_bytes(b",");
     s.put_bytes(&r.renamed);
-    s.put_bytes(if r.old_backup { b",1," } else { b",0," });
-    s.put_bytes(if r.old_deleted { b"1," } else { b"0," });
-    dec(s, r.freed_clusters);
-    s.put_bytes(b",");
-    dec(s, r.others as u32);
-    s.put_bytes(if r.fake_deleted { b",1," } else { b",0," });
-    // Last recovery: 0x54520010 marker zeroed, 0x54520011 zeroing failed;
-    // recovery-file: 0x5452000n, n = 0 Created, 1 AlreadyThere, 2 NoMedium,
-    // 3 BadBpb, 4 NoSpace, 5 Error (0 / other = none recorded).
-    hex(s, unsafe { r32(BKP_TRIG) });
-    for w in marker() {
-        s.put_bytes(b",");
-        hex(s, w);
-    }
-    s.put_bytes(if marker_valid() { b",VALID," } else { b",INVALID," });
-    // Crash counter word, healthy flag, last zero_marker FMC status.
-    hex(s, unsafe { r32(BKP_CRASH) });
-    s.put_bytes(if unsafe { HEALTHY } { b",HEALTHY," } else { b",-," });
-    hex(s, fmc_last());
-    // PD6 (power key) pin config read live: MODER[13:12] (0 = input),
-    // PUPD[13:12] (2 = pull-down, review B2), IDR bit 6 (1 = pressed).
-    let (moder, pupd, idr) = unsafe { (r32(GPIOD), r32(GPIOD + 0x0C), r32(GPIOD + 0x10)) };
-    s.put_bytes(b",PD6,");
-    dec(s, moder >> 12 & 3);
-    s.put_bytes(b",");
-    dec(s, pupd >> 12 & 3);
-    s.put_bytes(b",");
-    dec(s, idr >> 6 & 1);
-    crate::native::put_extra(s);
 }

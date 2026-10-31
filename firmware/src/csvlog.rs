@@ -11,7 +11,7 @@
 //! tools/dlog.py) and is byte for byte what this module wrote before DLG:
 //! CRLF line ends, '.' decimal point, ASCII only:
 //!   # Alientek DM40A, opendm40 0.1.0, function DC V, range AUTO, started uptime 12.345 s
-//!   # time_s = seconds since the start of this recording (no real-time clock); empty value = overload
+//!   # time_s = seconds since the start of this recording (no real-time clock); empty value = overflow
 //!   time_s,value,unit,flags
 //!   0.250,1.23456,V,
 //!   0.750,,V,OL
@@ -38,6 +38,15 @@
 //! nominal end. A duration (10 min .. 24 h) ends the recording by itself
 //! (`push` / `poll`) with the usual result. Interval files have one more
 //! header line ("# interval N s: ..."); every-reading files are unchanged.
+//!
+//! On-change mode (Record page "On change", LOG:CSV:INTerval CHANge; event
+//! logging as the Fluke 289 / Keysight U1281A, TODO FR-04): a reading
+//! becomes a row, at its own time as in every-reading mode, when it is
+//! the first, when |value - the last row's value| > N % of the range's
+//! full scale (`push` `fs`, per reading: autorange changes it), when its
+//! OL / HI / LO flags differ from the last row's, or when the last row is
+//! HEARTBEAT_MS old. N = CHANGES (0.1 / 1 / 5 %). One more header line
+//! ("# event: change > N % ...").
 //!
 //! Non-blocking, like screenshot.rs: `start` / `push` / `stop` only touch RAM;
 //! `poll` (every main-loop pass) does one bounded slice of a flush (one block
@@ -105,7 +114,7 @@
 //!     and a commit does not start while one is in progress (`HOST_WRITING`).
 //!   * Screenshot: a commit never starts while `screenshot::busy()`; the
 //!     screenshot waits before its FAT scan while a commit runs
-//!     (msc.rs `LOG_FLUSHING`). Both use calbackup::scratch() only while they
+//!     (msc.rs `LOG_FLUSHING`). Both use diskbuf::blocks() only while they
 //!     hold the disk. Rows keep going into FIFO meanwhile (~27 s at 10 rows/s
 //!     before rows are dropped and the next row is flagged GAP).
 //!   * Before every link the old last cluster must still be end-of-chain in
@@ -124,6 +133,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::calbackup;
+use crate::diskbuf;
 use crate::dlog;
 use crate::fatdir;
 use crate::fatren::{le16, le32, parse_bpb, Vol};
@@ -148,10 +158,18 @@ const MAXNEW: usize = FIFO / BLK + 2;
 
 #[cfg_attr(target_os = "none", link_section = ".dmabuf")]
 static mut FIFO_BUF: [u8; FIFO] = [0; FIFO];
-#[cfg_attr(target_os = "none", link_section = ".dmabuf")]
-static mut TAIL: [u8; BLK] = [0; BLK];
+crate::wordram::usbhs_static! {
+    /// The block being filled. In the USBHS FIFO RAM, which takes whole
+    /// words only (wordram.rs; CPU only: the SPI flash takes it by CPU
+    /// writes; docs/native-boot.md "Extra RAM areas"); `start` fills it with
+    /// 0xFF.
+    static TAIL: WordRam<{ BLK / 4 }>;
+}
 
+/// The row FIFO of a recording. Its third tenant, the MMEM:CAT? cache
+/// (`Cat`), is dropped here: a recording's bytes overwrite it.
 fn fifo() -> &'static mut [u8; FIFO] {
+    cat().ok = false;
     unsafe { &mut *core::ptr::addr_of_mut!(FIFO_BUF) }
 }
 
@@ -159,12 +177,16 @@ fn fifo() -> &'static mut [u8; FIFO] {
 /// the way to the flash pages). The two never run together: fastlog::begin
 /// refuses while a recording is active, `start` refuses while a fast
 /// session holds the disk; nothing of a finished recording is left in it.
+/// Drops the MMEM:CAT? cache, as `fifo`.
 #[inline(always)]
 pub(crate) fn lend_fifo() -> &'static mut [u8; FIFO] {
     fifo()
 }
-fn tail() -> &'static mut [u8; BLK] {
-    unsafe { &mut *core::ptr::addr_of_mut!(TAIL) }
+
+/// The FIFO holds no bytes of a recording or a fast-log session: the
+/// MMEM:CAT? cache may be written into it (`Cat`).
+fn fifo_idle() -> bool {
+    !active() && !crate::fastlog::active()
 }
 
 /// `push` flags.
@@ -250,7 +272,7 @@ struct Job {
     filled: bool,
     lba: u32,
     st: Step,
-    /// FAT 1 block cached in scratch[1].
+    /// FAT 1 block cached in blocks()[1].
     cur: u32,
     fat_k: u32,
     fbs: [u32; MAXNEW + 1],
@@ -288,6 +310,15 @@ struct Job {
     inum: u32,
     iall: u32,
     iflags: u8,
+    // --- on-change mode
+    /// Threshold as a fraction of full scale (0 = not on-change mode); the
+    /// last row's value (NaN: OL / none), flags (OL HI LO) and time (ms);
+    /// a row was written.
+    chg: f32,
+    ev_v: f32,
+    ev_f: u8,
+    ev_t: u64,
+    ev_any: bool,
 }
 
 const JOB0: Job = Job {
@@ -342,6 +373,11 @@ const JOB0: Job = Job {
     inum: 0,
     iall: 0,
     iflags: 0,
+    chg: 0.0,
+    ev_v: 0.0,
+    ev_f: 0,
+    ev_t: 0,
+    ev_any: false,
 };
 
 /// Record page choices (decision 2026-10-22 #1): row interval in s (0 =
@@ -350,6 +386,27 @@ const JOB0: Job = Job {
 /// values only; persisted as their indices (app.rs, persist.rs W_REC).
 pub const INTERVALS_S: [u32; 4] = [0, 1, 10, 60];
 pub const DURATIONS_S: [u32; 5] = [0, 600, 3600, 8 * 3600, 24 * 3600];
+/// Interval index of the on-change mode (after INTERVALS_S; SCPI
+/// LOG:CSV:INTerval CHANge).
+pub const ON_CHANGE: u8 = INTERVALS_S.len() as u8;
+/// On-change thresholds in % of full scale (texts: header, Record page,
+/// LOG:CSV:CHANge, which accepts these only); default index 1 (1 %).
+pub const CHANGES: [&str; 3] = ["0.1", "1", "5"];
+const CHANGE_FR: [f32; 3] = [0.001, 0.01, 0.05];
+/// On-change mode: a row at least this often (ms) while readings arrive.
+pub const HEARTBEAT_MS: u64 = 60_000;
+/// Threshold index of the next recording (CHANGES).
+static mut NEXT_CHG: u8 = 1;
+
+/// The on-change threshold of the next recording (index into CHANGES;
+/// out of range = the default 1 %).
+pub fn set_change(i: u8) {
+    unsafe { *core::ptr::addr_of_mut!(NEXT_CHG) = if (i as usize) < CHANGES.len() { i } else { 1 } };
+}
+
+pub fn change() -> u8 {
+    unsafe { *core::ptr::addr_of!(NEXT_CHG) }
+}
 /// Row interval / length of the next recording (indices into the above).
 static mut NEXT: (u8, u8) = (0, 0);
 
@@ -357,7 +414,7 @@ static mut NEXT: (u8, u8) = (0, 0);
 /// DURation; the swipe-down REC uses them too). Out-of-range indices = the
 /// defaults. A running recording keeps the values it started with.
 pub fn set_next(ival_idx: u8, dur_idx: u8) {
-    let i = if (ival_idx as usize) < INTERVALS_S.len() { ival_idx } else { 0 };
+    let i = if ival_idx <= ON_CHANGE { ival_idx } else { 0 };
     let d = if (dur_idx as usize) < DURATIONS_S.len() { dur_idx } else { 0 };
     unsafe { *core::ptr::addr_of_mut!(NEXT) = (i, d) };
 }
@@ -405,7 +462,7 @@ pub fn start(func: &str, unit: &str, range: &str, now_ms: u64) -> bool {
     j.t0_ms = now_ms;
     j.last_commit = now_ms;
     j.now = now_ms;
-    tail().fill(0xFF);
+    TAIL.fill_words(0xFFFF_FFFF);
     j.ulen = ascii(unit, &mut j.unit);
     let mut h = [0u8; 384];
     let mut w = W { b: &mut h, n: 0 };
@@ -419,16 +476,23 @@ pub fn start(func: &str, unit: &str, range: &str, now_ms: u64) -> bool {
     w.a(range);
     w.s(", started uptime ");
     w.ms(now_ms);
-    w.s(" s\r\n# time_s = seconds since the start of this recording (no real-time clock); empty value = overload\r\n");
+    w.s(" s\r\n# time_s = seconds since the start of this recording (no real-time clock); empty value = overflow\r\n");
     let (ii, di) = next();
-    j.ival = INTERVALS_S[ii as usize] * 1000;
+    j.ival = INTERVALS_S.get(ii as usize).map_or(0, |s| s * 1000);
     j.dur = DURATIONS_S[di as usize] * 1000;
+    if ii == ON_CHANGE {
+        let c = change() as usize;
+        j.chg = CHANGE_FR[c];
+        w.s("# event: change > ");
+        w.s(CHANGES[c]);
+        w.s(" % of the range's full scale, an OL / HI / LO change, or 60 s since the last row; time_s = time of the reading\r\n");
+    }
     if j.ival > 0 {
         // Interval mode (Record page): one more comment line; every
         // reading mode keeps the header byte for byte.
         w.s("# interval ");
         w.u(j.ival as u64 / 1000);
-        w.s(" s: one row per interval with readings, value = mean of its readings, time_s = end of the interval; OL = an overload in it\r\n");
+        w.s(" s: one row per interval with readings, value = mean of its readings, time_s = end of the interval; OL = an overflow in it\r\n");
     }
     w.s("time_s,value,unit,flags\r\n");
     let n = w.n;
@@ -443,12 +507,14 @@ pub fn start(func: &str, unit: &str, range: &str, now_ms: u64) -> bool {
 }
 
 /// One reading: `t_ms` = uptime (same clock as `start`), `value` in the
-/// recording's unit, `flags` = F_* bits. Every-reading mode: one row each;
-/// interval mode: added to the open interval (`Job::add`). A row that does
+/// recording's unit, `flags` = F_* bits, `fs` = the full scale of the
+/// reading's range in that unit (on-change mode). Every-reading mode: one
+/// row each; interval mode: added to the open interval (`Job::add`);
+/// on-change mode: a row if `Job::event` says so. A row that does
 /// not fit FIFO is dropped (and counted); the next row that fits carries
 /// GAP. Ignored unless recording. Ends the recording at its duration and
 /// at the 49.7-day limit of the u32 ms DLG time.
-pub fn push(t_ms: u64, value: f32, flags: u8) {
+pub fn push(t_ms: u64, value: f32, flags: u8, fs: f32) {
     let j = job();
     if j.state != State::Recording || j.stopping {
         return;
@@ -458,7 +524,9 @@ pub fn push(t_ms: u64, value: f32, flags: u8) {
         stop();
         return;
     }
-    if j.ival == 0 {
+    if j.chg > 0.0 {
+        j.event(t, value, flags & 31, fs);
+    } else if j.ival == 0 {
         j.row(t, value, flags & 31);
     } else {
         j.add(t, value, flags & 31);
@@ -577,7 +645,7 @@ pub fn poll_on(disk: &mut dyn BlockDevice, now_ms: u64) {
         }
         j.close_chunk();
         j.tx_left = j.fh.wrapping_sub(j.ft);
-        j.cur = NONE; // scratch[1] was free for others since the last commit
+        j.cur = NONE; // blocks()[1] was free for others since the last commit
         j.phase = if j.v.is_none() { Phase::Bpb } else { Phase::Data };
         set_flags(true, true);
     }
@@ -625,6 +693,22 @@ impl Job {
         } else {
             self.dropped += 1;
             self.gap = true;
+        }
+    }
+
+    /// On-change mode: a row for this reading when it is the first, its OL
+    /// / HI / LO flags differ from the last row's, its value is more than
+    /// `chg` x `fs` away from the last row's (both not OL), or the last
+    /// row is HEARTBEAT_MS old.
+    fn event(&mut self, t: u64, value: f32, flags: u8, fs: f32) {
+        let ev = flags & (F_OL | F_HI | F_LO);
+        let v = if flags & F_OL == 0 && value.is_finite() { value } else { f32::NAN };
+        if !self.ev_any || ev != self.ev_f || (v - self.ev_v).abs() > self.chg * fs || t >= self.ev_t + HEARTBEAT_MS {
+            self.row(t, value, flags);
+            self.ev_any = true;
+            self.ev_f = ev;
+            self.ev_v = v;
+            self.ev_t = t;
         }
     }
 
@@ -743,7 +827,7 @@ impl Job {
     }
 
     fn bpb(&mut self, disk: &mut dyn BlockDevice) -> Option<State> {
-        let buf = &mut calbackup::scratch()[0];
+        let buf = &mut diskbuf::blocks()[0];
         if !disk.read_block(0, buf) {
             return Some(State::Error);
         }
@@ -751,8 +835,8 @@ impl Job {
             return Some(State::NoDisk);
         };
         // LOGS/ (fatdir.rs; created at boot, here only if it went missing:
-        // synchronous, ~1 s once). scratch[1] (FAT cache) is overwritten.
-        let v = match fatdir::ensure(disk, &v, &fatdir::LOGS, calbackup::scratch()) {
+        // synchronous, ~1 s once). blocks()[1] (FAT cache) is overwritten.
+        let v = match fatdir::ensure(disk, &v, &fatdir::LOGS, diskbuf::blocks()) {
             Ok(d) => d,
             Err(fatdir::Err::Io) => return Some(State::Error),
             Err(_) => return Some(State::Full),
@@ -769,7 +853,7 @@ impl Job {
     fn root(&mut self, disk: &mut dyn BlockDevice) -> Option<State> {
         let v = self.vol();
         let (lba, sub, base, lim) = fatdir::seq(&v, self.i);
-        let buf = &mut calbackup::scratch()[0];
+        let buf = &mut diskbuf::blocks()[0];
         if !disk.read_block(lba, buf) {
             return Some(State::Error);
         }
@@ -818,10 +902,10 @@ impl Job {
         None
     }
 
-    /// FAT 1 entry `c` through the one-block cache in scratch[1].
+    /// FAT 1 entry `c` through the one-block cache in blocks()[1].
     fn fat_get(&mut self, disk: &mut dyn BlockDevice, c: u32) -> Option<u32> {
         let v = self.vol();
-        let fat = &mut calbackup::scratch()[1];
+        let fat = &mut diskbuf::blocks()[1];
         let fb = c / FPER;
         if fb >= v.fat_blocks {
             return None;
@@ -869,15 +953,17 @@ impl Job {
             if self.tfill == BLK as u32 {
                 self.tb += 1;
                 self.tfill = 0;
-                tail().fill(0xFF);
+                TAIL.fill_words(0xFFFF_FFFF);
             }
             let k = (BLK as u32 - self.tfill).min(self.tx_left);
-            let t = tail();
             let f = fifo();
-            for b in &mut t[self.tfill as usize..(self.tfill + k) as usize] {
-                *b = f[self.ft as usize % FIFO];
-                self.ft = self.ft.wrapping_add(1);
-            }
+            let mut ft = self.ft;
+            TAIL.put_bytes(self.tfill as usize, k as usize, || {
+                let b = f[ft as usize % FIFO];
+                ft = ft.wrapping_add(1);
+                b
+            });
+            self.ft = ft;
             self.tfill += k;
             self.size += k;
             self.tx_left -= k;
@@ -886,7 +972,7 @@ impl Job {
             self.wrote = true;
             self.st = STEP0;
         }
-        match disk.write_step(self.lba, &tail()[..], &mut self.st)? {
+        match disk.write_step(self.lba, &TAIL, &mut self.st)? {
             false => Some(State::Error),
             true => {
                 self.filled = false;
@@ -960,7 +1046,7 @@ impl Job {
         if !self.filled {
             let fb = self.fbs[self.fbi];
             self.lba = v.fat_start + self.fat_k * v.fat_blocks + fb;
-            let buf = &mut calbackup::scratch()[0];
+            let buf = &mut diskbuf::blocks()[0];
             if !disk.read_block(self.lba, buf) {
                 return Some(State::Error);
             }
@@ -990,7 +1076,7 @@ impl Job {
             return None; // the write from the next pass
         }
         // Whole block in one call (H1: never left erased across a pass).
-        let buf = &calbackup::scratch()[0];
+        let buf = &diskbuf::blocks()[0];
         match disk.write_block(self.lba, &buf[..]) {
             false => Some(State::Error),
             true => {
@@ -1023,7 +1109,7 @@ impl Job {
                 return self.committed(); // nothing new (disk full at once)
             }
             self.lba = v.dlba(self.slot / PER);
-            let buf = &mut calbackup::scratch()[0];
+            let buf = &mut diskbuf::blocks()[0];
             if !disk.read_block(self.lba, buf) {
                 return Some(State::Error);
             }
@@ -1054,7 +1140,7 @@ impl Job {
             return None;
         }
         // Whole block in one call (H1: never left erased across a pass).
-        let buf = &calbackup::scratch()[0];
+        let buf = &diskbuf::blocks()[0];
         match disk.write_block(self.lba, &buf[..]) {
             false => Some(State::Error),
             true => {
@@ -1218,7 +1304,7 @@ fn gallery_vol(disk: &mut dyn BlockDevice) -> Result<Vol, GErr> {
     if !disk.present() || disk.block_size() as usize != BLK {
         return Err(GErr::NoDisk);
     }
-    let buf = &mut calbackup::scratch()[0];
+    let buf = &mut diskbuf::blocks()[0];
     if !disk.read_block(0, buf) {
         return Err(GErr::Error);
     }
@@ -1270,7 +1356,7 @@ pub fn list_on(disk: &mut dyn BlockDevice, out: &mut [FileInfo]) -> Result<Catal
 fn for_each_file(disk: &mut dyn BlockDevice, f: &mut dyn FnMut(&FileInfo)) -> Result<Catalog, GErr> {
     let v = gallery_vol(disk)?;
     let mut cat = Catalog { n: 0, total: 0, free_bytes: 0, disk_bytes: v.clusters * v.spc * BLK as u32 };
-    let buf = &mut calbackup::scratch()[0];
+    let buf = &mut diskbuf::blocks()[0];
     fatdir::for_each(disk, &v, &[&fatdir::LOGS, &fatdir::SHOTS, &fatdir::SCOPE], buf, &mut |d, _, e| {
         if let Some(kind) = kind_of(e) {
             let mut name = [0u8; 11];
@@ -1308,7 +1394,7 @@ fn free_in(disk: &mut dyn BlockDevice, v: &Vol, buf: &mut [u8; BLK]) -> Result<u
 /// screenshot, a commit, an upload or a host write holds the disk.
 pub fn free_bytes_on(disk: &mut dyn BlockDevice) -> Result<u32, GErr> {
     let v = gallery_vol(disk)?;
-    free_in(disk, &v, &mut calbackup::scratch()[0])
+    free_in(disk, &v, &mut diskbuf::blocks()[0])
 }
 
 pub fn free_bytes() -> Result<u32, GErr> {
@@ -1378,22 +1464,37 @@ pub fn catalog_scpi_on(disk: &mut dyn BlockDevice, out: &mut [u8]) -> Result<usi
 /// Wave view, the inrush page), so a host listing the files while the
 /// stream runs finds it valid (nothing writes the disk then: a disk job
 /// pauses the Wave view's stream and the restart warms it again).
+///
+/// The reply itself is kept in the first CAT_MAX bytes of the row FIFO
+/// (`FIFO_BUF`; docs/native-boot.md "SRAM audit"), written only while
+/// `fifo_idle`. `fifo` / `lend_fifo` clear `ok` before a recording or a
+/// fast-log session writes there. A fast-log session holds the disk
+/// (`gallery_free`: MMEM:CAT? is Busy); during a recording every query
+/// reads the disk, but no stream the cache is for runs then: the Wave view
+/// and inrush refuse to start during one, CH2 stops (app_wave.rs,
+/// app_inrush.rs, app_ch2.rs `csvlog::active`).
 struct Cat {
     ok: bool,
     stamp: u32,
     len: usize,
-    buf: [u8; CAT_MAX],
 }
 
 /// The reply buffers' size (usbtmc::RSP_MAX, the BT block: main.rs asserts).
 pub const CAT_MAX: usize = 6144;
+const _: () = assert!(CAT_MAX <= FIFO);
 
-#[cfg_attr(target_os = "none", link_section = ".sram_bss")]
-static mut CAT: Cat = Cat { ok: false, stamp: 0, len: 0, buf: [0; CAT_MAX] };
+static mut CAT: Cat = Cat { ok: false, stamp: 0, len: 0 };
 
 #[inline(always)]
 fn cat() -> &'static mut Cat {
     unsafe { &mut *core::ptr::addr_of_mut!(CAT) }
+}
+
+/// The cached reply's bytes (the FIFO's head; see `Cat`). Read only while
+/// `cat().ok`, written only while `fifo_idle()`.
+#[inline(always)]
+fn cat_buf() -> &'static mut [u8] {
+    unsafe { &mut (&mut *core::ptr::addr_of_mut!(FIFO_BUF))[..CAT_MAX] }
 }
 
 fn flash_writes() -> u32 {
@@ -1412,12 +1513,12 @@ pub fn catalog_scpi(out: &mut [u8]) -> Result<usize, GErr> {
     let c = cat();
     let w = flash_writes();
     if c.ok && c.stamp == w && c.len <= out.len() {
-        out[..c.len].copy_from_slice(&c.buf[..c.len]);
+        out[..c.len].copy_from_slice(&cat_buf()[..c.len]);
         return Ok(c.len);
     }
     let n = catalog_scpi_on(disk(), out)?;
-    if n <= c.buf.len() && flash_writes() == w {
-        c.buf[..n].copy_from_slice(&out[..n]);
+    if n <= CAT_MAX && flash_writes() == w && fifo_idle() {
+        cat_buf()[..n].copy_from_slice(&out[..n]);
         (c.ok, c.stamp, c.len) = (true, w, n);
     }
     Ok(n)
@@ -1425,16 +1526,16 @@ pub fn catalog_scpi(out: &mut [u8]) -> Result<usize, GErr> {
 
 /// Build the MMEM:CAT? cache now if it is stale (main.rs, before a stream
 /// starts: one scan, ~10 block reads, while the stream ISR is not running).
-/// Nothing when the disk is busy.
+/// Nothing when the disk is busy or the FIFO is in use.
 #[inline(never)]
 pub fn catalog_warm() {
     let c = cat();
     let w = flash_writes();
-    if (c.ok && c.stamp == w) || !gallery_free() {
+    if (c.ok && c.stamp == w) || !gallery_free() || !fifo_idle() {
         return;
     }
     c.ok = false;
-    if let Ok(n) = catalog_scpi_on(disk(), &mut c.buf) {
+    if let Ok(n) = catalog_scpi_on(disk(), cat_buf()) {
         if flash_writes() == w {
             (c.ok, c.stamp, c.len) = (true, w, n);
         }
@@ -1481,7 +1582,7 @@ pub fn delete_on(disk: &mut dyn BlockDevice, name: &[u8; 11]) -> Result<(), GErr
         return Err(GErr::Busy);
     }
     let root = gallery_vol(disk)?;
-    let [buf, fat1, tmp] = calbackup::scratch();
+    let [buf, fat1, tmp] = diskbuf::blocks();
     let sub = match fatdir::dir_of(name).map(|d| fatdir::open(disk, &root, d, buf)) {
         Some(Ok(d)) => d,
         Some(Err(fatdir::Err::Io)) => return Err(GErr::Error),
@@ -1565,6 +1666,7 @@ fn delete_in(disk: &mut dyn BlockDevice, v: &Vol, name: &[u8; 11], buf: &mut [u8
         }
     }
     crate::screenshot::MEDIUM_CHANGED.store(true, Ordering::Relaxed);
+    dlog::csv_forget();
     #[cfg(feature = "vdisk")]
     {
         dlog::set_stale();

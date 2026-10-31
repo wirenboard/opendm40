@@ -786,7 +786,7 @@ where it is idle: it needs no converter, so no note-7 exposure.
 | function (mode) | sentinel (`Kind`) | row override | threshold |
 |---|---|---|---|
 | DC V 6 V (1 r0), DC mV (3), ohm (10), temperature (15, TC and resistive sensors) | A-JACK: comparator on PB1 (`CmpA`); CTSTA on every poll, ORed into 100 ms windows | R20 = 0x90 (SCMPI PB1, ENCMP) | the rows' R21 0xdd window: +-20.8 mV = 0.44 mA on 47.5 ohm |
-| DC V 60 / 600 / 1000 V (1 r1..3) | none (PB1 picks up the input there: A-JACK tripped at 10 V with the A jack open, device f80524f; [hw/README.md, Measured node behaviour](../../hw/README.md#measured-node-behaviour)) | stock row | - |
+| DC V 60 / 600 / 1000 V (1 r1..3) | none (the PB1 comparator trips in these rows: A-JACK at 10 V with the A jack open, device f80524f; CTSTA 0x50 at every R21 window also with V-COM open, while AD1 reads PB1 at ~2 mV, 2026-10-27; [hw/README.md, Measured node behaviour](../../hw/README.md#measured-node-behaviour)) | stock row | - |
 | AC V (0), AC mV (2) | A-JACK: AD1 peak hold on PB1 - PB3 (`PeakA`); AD1 off in the stock rows | R22 0x00 (OSR 256 unchopped), R23 \|= ENAD1, R24 0x95, R25 AD1IG 3.6, R29 ENPKH + PKHSEL 01, R33 OP1CHOP 00 (with AD1 on, OP1's chopper puts a ~37 mV RMS floor on AC V 6 V: [hw/README.md, Measured node behaviour](../../hw/README.md#measured-node-behaviour)) | `PK_THR` 17 900 codes = 0.5 mA |
 | continuity (11), diode (12), capacitance r0..4 (13, RC oscillator) | A-JACK: AD2 peak hold on OP2 x1 <- PB1, AD2 = OP2O - PB3 (`Ad2A`) | R25 AD2IG 2.0 + OPS2 0, R26 0x83, R27 0x6D, R29 ENPKH, R32 0xD0 \| OP1; the row goes out with AD1 off and ENAD1 last (note 7) | `PK2_THR` 9 900 codes = 0.5 mA |
 | DC A / mA / uA (7..9) | V-JACK?: comparator on SENSE via the /1000 tap (`CmpV`; SS5 only: the A rows run the power bus as SGND, PS5 would ground the tap) | R20 0x10, R2C \|= 0x10 | ~21 V on V/ohm |
@@ -799,8 +799,11 @@ where it is idle: it needs no converter, so no note-7 exposure.
 
 Gaps (no fake coverage):
 
-* **Frequency**: PB1 - PB3 follows the input path there (device d8e249d,
-  [hw/README.md, Measured node behaviour](../../hw/README.md#measured-node-behaviour)): no fixed threshold tells a current from it.
+* **Frequency**: PB1 - PB3 follows the input from ~3 V on (-59 / -89 mV at
+  3 / 3.7 V, 2.5 mV at rest; [hw/README.md, Measured node behaviour](../../hw/README.md#measured-node-behaviour)).
+  The standing ~54 mV of device d8e249d came with the row's SAD1I = 11 (AD1
+  on the temperature sensor inputs, *inferred*): an AD1 sentinel there needs
+  R33 SAD1I = 00.
 * **Capacitance r5..7** (the ramp): both op amps on PB0, AD1 and the
   comparator busy.
 * **DC V 60 V+** (above) and so AC+DC V above 6 V in both phases (an

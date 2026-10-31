@@ -9,6 +9,7 @@
 //               @0xA4000, calibration @0xC0000, flag @0xFF000)
 //   0x10000000  TCM SRAM 64K       0x20000000 SRAM 192K (SRAM0/1 + ADDSRAM)
 //   0x40024000  backup SRAM 4K     0x1FFF7800 OTP, UID @0x1FFF7A10
+//   0x40060000  USBHS FIFO RAM 4K
 //   0x60000000  FSMC bank 1 -> ILI9488 (A16 = RS)   0xA0000000 FSMC registers
 
 cpu: CPU.CortexM @ sysbus
@@ -34,6 +35,15 @@ sram: Memory.MappedMemory @ sysbus 0x20000000
     size: 0x30000
 
 bkpsram: Memory.MappedMemory @ sysbus 0x40024000
+    size: 0x1000
+
+// USBHS FIFO RAM (the DWC2 core's direct FIFO window, base + 0x20000): the
+// DM40 has no USBHS port; opendm40 keeps CPU-only buffers there
+// (link-native.x .usbhs_bss; the device probe of PR #183). As on the device,
+// a byte / halfword store writes the whole word with the value replicated
+// (peripherals/WordOnlyRam.cs; firmware/src/wordram.rs). The USBHSEN clock
+// gate is not modelled.
+usbhs_fifo: Miscellaneous.WordOnlyRam @ sysbus 0x40060000
     size: 0x1000
 
 // System memory: OTP 0x1FFF7800 (512 B + 16 lock), UID 0x1FFF7A10, flash size 0x1FFF7A22
@@ -302,6 +312,11 @@ cpucost: Miscellaneous.CpuCost @ sysbus 0x7FFF4000
 // Data reads of the slow flash bank while the stream ISR owns the bus
 // (peripherals/FlashWatch.cs, emu/regionc.py): off until Arm.
 flashwatch: Miscellaneous.FlashWatch @ sysbus 0x7FFF5000
+
+// Code executed while the stream ISR owns the bus (peripherals/BTrace.cs,
+// firmware/tools/region-profile/rprof.py --trace): off until Arm (emu/run.py
+// arms it when DM40_BTRACE is set).
+btrace: Miscellaneous.BTrace @ sysbus 0x7FFF6000
 
 // 3PA1030 scope ADC + comparator: feeds DMA2 stream 4 at the TIM1 rate, drives PA15.
 scopefeed: Miscellaneous.ScopeFeeder @ sysbus 0x7FFF3000

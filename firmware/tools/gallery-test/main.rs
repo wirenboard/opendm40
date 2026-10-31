@@ -72,10 +72,14 @@ pub mod msc {
         fn block_count(&self) -> u32;
         fn read_block(&mut self, lba: u32, buf: &mut [u8]) -> bool;
         fn write_block(&mut self, lba: u32, buf: &[u8]) -> bool;
-        fn write_step(&mut self, lba: u32, buf: &[u8], st: &mut Step) -> Option<bool> {
+        fn write_step(&mut self, lba: u32, buf: &dyn crate::wordram::BlockSrc, st: &mut Step) -> Option<bool> {
             let _ = st;
-            Some(self.write_block(lba, buf))
+            Some(self.write_block(lba, &src_bytes(buf)))
         }
+    }
+    /// The bytes of a `write_step` source (src/wordram.rs `BlockSrc`).
+    pub fn src_bytes(buf: &dyn crate::wordram::BlockSrc) -> Vec<u8> {
+        (0..buf.len() / 4).flat_map(|i| buf.word(i).to_le_bytes()).collect()
     }
     #[derive(Clone, Copy, Default)]
     pub struct Step {
@@ -151,6 +155,8 @@ mod upload;
 mod fatren;
 #[path = "../../src/calbackup.rs"]
 mod calbackup;
+#[path = "../../src/diskbuf.rs"]
+mod diskbuf;
 #[path = "../../src/screenshot.rs"]
 mod screenshot;
 #[path = "../../src/scope_csv.rs"]
@@ -158,6 +164,9 @@ mod screenshot;
 mod scope_csv;
 #[path = "../../src/dlog.rs"]
 mod dlog;
+#[path = "../../src/wordram.rs"]
+#[allow(dead_code)]
+mod wordram;
 #[path = "../../src/csvlog.rs"]
 mod csvlog;
 #[path = "../../src/fastenc.rs"]
@@ -676,7 +685,7 @@ fn ui(out: &str, data: &str, imgs: &str) -> bool {
             reset_screen();
             g.draw();
             scene(&mut ck, &format!("confirm-{name}"), true);
-            for (t, m) in [("Disk in use by the PC", "Eject it, then retry"), ("Cannot delete", "Disk busy, try again"), ("Cannot delete", "File not found"), ("Cannot delete", "Delete failed")] {
+            for (t, m) in [("Disk in use by the PC", "Eject it, then retry"), ("Cannot delete", "Disk busy, try again"), ("Cannot delete", "Stop the recording"), ("Cannot delete", "File not found"), ("Cannot delete", "Delete failed")] {
                 g.test_info(t, m);
                 reset_screen();
                 g.draw();
@@ -878,8 +887,43 @@ fn lock(imgp: &str, data: &str) -> bool {
     t("MENU key in the grid: leave", g.back() == gallery::Out::Exit);
     // 6. Busy flags of the on-device writers.
     csvlog_busy(&mut t);
+    // 7. The recording in progress (issue #86): Delete says to stop it.
+    recording(&mut img, &mut t);
     std::fs::write(imgp, &img.d).unwrap();
     ok
+}
+
+fn recording(img: &mut Img, t: &mut dyn FnMut(&str, bool)) {
+    t("csvlog start", csvlog::start("DC V", "V", "AUTO", 1000));
+    let mut now = 1000;
+    for _ in 0..50 {
+        now += 200;
+        csvlog::push(now, 1.0, 0, 6.0);
+        csvlog::poll_on(img, now);
+    }
+    let name = csvlog::recording_name();
+    t("the recording has its file", name.is_some());
+    let g = open(img);
+    let n = g.test_state().0;
+    let r = (0..n).find(|&r| {
+        g.test_view(r);
+        run(g, img);
+        Some(g.test_info_cur().1) == name
+    });
+    t("the recording is listed", r.is_some());
+    tap(g, 420, 20); // Delete
+    run(g, img);
+    tap(g, 300, 200); // Delete in the confirmation
+    run(g, img);
+    t("Delete of the recording: Stop the recording", g.test_info_cur().0 == Some("Stop the recording"));
+    t("the recording is still listed", g.test_state().0 == n);
+    csvlog::stop();
+    for _ in 0..50 {
+        now += 200;
+        csvlog::poll_on(img, now);
+    }
+    t("recording stopped", !csvlog::active());
+    t("its file deleted after the stop", name.is_some_and(|nm| csvlog::delete_on(img, &nm).is_ok()));
 }
 
 fn csvlog_busy(t: &mut dyn FnMut(&str, bool)) {

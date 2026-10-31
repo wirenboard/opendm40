@@ -358,9 +358,225 @@ fn txring() {
     println!("ok  tx ring ({next_out} bytes through a 64-byte ring)");
 }
 
+/// Model of the circular RX DMA: `w` bytes written in all, the half / full
+/// transfer flags (sticky until a look clears them).
+struct Dma<const CAP: usize> {
+    ring: [u8; CAP],
+    w: u64,
+    half: bool,
+    full: bool,
+}
+
+impl<const CAP: usize> Dma<CAP> {
+    fn new() -> Self {
+        Dma { ring: [0; CAP], w: 0, half: false, full: false }
+    }
+    fn put(&mut self, b: u8) {
+        self.ring[(self.w % CAP as u64) as usize] = b;
+        self.w += 1;
+        match (self.w % CAP as u64) as usize {
+            0 => self.full = true,
+            i if i == CAP / 2 => self.half = true,
+            _ => {}
+        }
+    }
+    /// As bt.rs `rx_see`: the write index and the flags (cleared).
+    fn look(&mut self, c: &mut RxCursor) {
+        let (h, f) = (core::mem::take(&mut self.half), core::mem::take(&mut self.full));
+        c.see((self.w % CAP as u64) as usize, h, f);
+    }
+}
+
+/// RxCursor against the model DMA: bytes come out in order while the reader
+/// keeps up; an overrun is reported exactly when unread input no longer
+/// fits (also after a gap of up to 1.5 rings between looks), and reading
+/// then resumes at the newest cap - 1 bytes.
+fn rxcursor() {
+    const CAP: usize = 16;
+    let mut r = Lcg(11);
+    let mut d = Dma::<CAP>::new();
+    let mut c = RxCursor::new(CAP);
+    let mut rd = 0u64; // bytes taken in all
+    let (mut lost, mut laps) = (0, 0);
+    for _ in 0..400_000 {
+        if r.next(2) == 0 {
+            // DMA: up to 1.5 rings between two looks (a long main-loop pass).
+            let n = r.next(CAP * 3 / 2);
+            laps += (n >= CAP) as usize;
+            for _ in 0..n {
+                d.put((d.w % 251) as u8);
+            }
+            d.look(&mut c);
+            if d.w - rd >= CAP as u64 {
+                assert!(c.take_lost(), "overrun not seen: {} unread", d.w - rd);
+                lost += 1;
+                rd = d.w - (CAP as u64 - 1);
+            } else {
+                assert!(!c.take_lost(), "false overrun: {} unread", d.w - rd);
+            }
+        } else {
+            for _ in 0..r.next(CAP) {
+                match c.next() {
+                    Some(i) => {
+                        assert_eq!(d.ring[i], (rd % 251) as u8, "RX byte order");
+                        rd += 1;
+                    }
+                    None => {
+                        assert_eq!(rd, d.w, "bytes left unread");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(lost > 1000 && laps > 1000, "the run must exercise overruns ({lost}) and missed laps ({laps})");
+    // While lost is pending nothing is handed out.
+    let mut c = RxCursor::new(CAP);
+    c.see(10, false, false);
+    c.see(0, false, true); // 16 unread
+    assert_eq!(c.next(), None);
+    assert!(c.take_lost());
+    assert_eq!(c.next(), Some(1), "the newest 15 bytes, oldest first");
+    // A whole lap between two looks: only the flags show it.
+    let mut c = RxCursor::new(CAP);
+    c.see(3, false, false);
+    c.see(3, true, true);
+    assert!(c.take_lost(), "a missed lap");
+    println!("ok  rx cursor ({lost} overruns, {laps} gaps over one ring, {rd} bytes)");
+}
+
+/// bt.rs `poll` / `take_line` on the 1 KiB ring: a host pipelines lines
+/// while one waits to be taken (a READ? waiting for its reading). Past
+/// 1 KiB: an overrun, no cut or joined line is handed out, and lines after
+/// the gap are taken again.
+fn rx_held(chunk: usize) {
+    const CAP: usize = 1024;
+    struct M {
+        d: Dma<CAP>,
+        c: RxCursor,
+        rx: Rx,
+        held: Option<String>,
+        overruns: usize,
+    }
+    impl M {
+        fn write(&mut self, b: &[u8]) {
+            for &x in b {
+                self.d.put(x);
+            }
+        }
+        /// As bt.rs `poll`: look at the DMA, resync on lost input, parse
+        /// while no line waits.
+        fn poll(&mut self) {
+            self.d.look(&mut self.c);
+            if self.c.take_lost() {
+                self.rx.resync(1000);
+                self.overruns += 1;
+            }
+            while self.held.is_none() {
+                let (c, ring) = (&mut self.c, &self.d.ring);
+                let mut src = || c.next().map(|i| ring[i]);
+                match self.rx.next(1000, &mut src) {
+                    Some(Event::Line(l)) => self.held = Some(String::from_utf8_lossy(l).into_owned()),
+                    Some(_) => panic!("unexpected event"),
+                    None => break,
+                }
+            }
+        }
+    }
+    let mut m = M { d: Dma::new(), c: RxCursor::new(CAP), rx: Rx::new(), held: None, overruns: 0 };
+    let sent: Vec<String> = (0..400).map(|k| format!("SYST:ERR:COUN?;*OPC;:X{k}")).collect();
+    let bytes = |ls: &[String]| -> Vec<u8> { ls.iter().flat_map(|l| l.bytes().chain([b'\n'])).collect() };
+    // 45 lines (~1.1 KiB) arrive while the first waits, `chunk` bytes per
+    // poll (64: 5 ms polls; all: one main-loop pass longer than the ring).
+    m.write(&bytes(&sent[..1]));
+    m.poll();
+    assert!(m.held.is_some());
+    let burst = bytes(&sent[1..45]);
+    assert!(burst.len() > CAP);
+    for ch in burst.chunks(chunk) {
+        m.write(ch);
+        m.poll();
+    }
+    // Lost input past the 1 KiB: an overrun at each look while it grows.
+    let burst_overruns = m.overruns;
+    assert!(burst_overruns >= 1, "overrun not seen");
+    // The waiting query is answered: lines are taken again, one per poll
+    // (5 ms), so the host sends no faster than that (16 bytes per poll).
+    let rest = bytes(&sent[45..]);
+    let mut it = rest.chunks(16);
+    let mut got = Vec::new();
+    for _ in 0..2000 {
+        if let Some(h) = m.held.take() {
+            got.push(h);
+        }
+        m.poll();
+        if let Some(ch) = it.next() {
+            m.write(ch);
+        }
+    }
+    assert_eq!(m.overruns, burst_overruns, "no overrun once lines are taken");
+    // Every line handed out is one the host sent, whole, in order; the ones
+    // after the burst all arrive.
+    let mut k = 0;
+    for g in &got {
+        let p = sent[k..].iter().position(|s| s == g).unwrap_or_else(|| panic!("cut / joined line {g:?}"));
+        k += p + 1;
+    }
+    assert!(got.ends_with(&sent[45..]), "lines after the burst all taken");
+    assert!(got.len() < 400 && got[0] == sent[0], "the burst lost lines, the waiting one kept");
+    println!("ok  rx held line + 1.1 KiB burst, {} bytes per poll ({} of 400 lines, {burst_overruns} overruns)", chunk.min(burst.len()), got.len());
+}
+
+/// bt.rs `take_line` gate against a host pipelining block queries: the TX
+/// ring (8 KiB) drains at 115200 baud, the main loop runs every 5 ms; a line
+/// is taken only while `room_for(REPLY_MAX)`. No reply is dropped. Without
+/// the gate the same streams overflow the ring (the test is meaningful).
+fn tx_gate() {
+    const TX: usize = 8192;
+    const REPLY_MAX: usize = 6144 + 1;
+    let streams: &[(&str, Vec<usize>)] = &[
+        ("WAV:DATA? x3 (WORD, 2000 points)", vec![3807; 3]),
+        ("LOG:DATA? x2", vec![REPLY_MAX; 2]),
+        ("LOG:DATA? x4 + small", vec![REPLY_MAX, 15, REPLY_MAX, 15, 15, REPLY_MAX, 400, REPLY_MAX]),
+    ];
+    for (name, replies) in streams {
+        for gate in [true, false] {
+            let mut buf = vec![0u8; TX];
+            let mut t = TxRing::new(TX);
+            let (mut q, mut dropped, mut ms, mut credit) = (0usize, 0, 0u64, 0.0f64);
+            while q < replies.len() || !t.is_empty() {
+                // 5 ms of wire time: 11.52 bytes per ms.
+                credit += 5.0 * 11.52;
+                let n = (credit as usize).min(t.used());
+                credit -= n as f64;
+                t.consume(n);
+                if q < replies.len() && (!gate || t.room_for(REPLY_MAX)) {
+                    let r = vec![b'x'; replies[q]];
+                    if !t.push(&mut buf, &[&r]) {
+                        dropped += 1;
+                    }
+                    q += 1;
+                }
+                ms += 5;
+                assert!(ms < 60_000);
+            }
+            if gate {
+                assert_eq!(dropped, 0, "{name}: a reply dropped with the gate");
+            } else {
+                assert!(dropped > 0, "{name}: overflows without the gate");
+            }
+        }
+    }
+    println!("ok  tx gate ({} pipelined block streams, none dropped)", streams.len());
+}
+
 fn main() {
     dispatcher();
     filter();
     txring();
+    rxcursor();
+    rx_held(64);
+    rx_held(2000);
+    tx_gate();
     println!("PASS");
 }

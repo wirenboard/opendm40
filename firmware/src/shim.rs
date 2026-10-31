@@ -12,7 +12,7 @@
 //!   VTOR = 0x08004000; then the Rust shim (src/boot.rs `shim`), which uses
 //!   stack only, then native::start (.data/.bss init, recovery or main).
 //! Exceptions all go to `default_handler` (`b .`): a fault hangs, the FWDGT
-//! (started by the shim) resets, and the shim chooses recovery. The table runs
+//! (started by the shim) resets, and the shim boots opendm40 again. The table runs
 //! to IRQ 55 (TIMER6 = STM32 TIM7), the AD2 stream ISR of the `ad2-isr`
 //! feature (../docs/history/decisions-2026-10-22.md #3); PRIMASK stays set (`cpsid i`)
 //! except while that stream runs (hy3131.rs `stream`).

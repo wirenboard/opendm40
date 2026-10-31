@@ -42,9 +42,21 @@ fn main() {
     check("fs 10 A", full_scale(3, "A") == 10.0, String::new());
     check("fs 60 mA", (full_scale(3, "mA") - 60.0).abs() < 1e-4, String::new());
     // Continuity / diode: their OL ceilings, not the format's 600 ohm / 6 V.
-    check("fs continuity 1000 ohm", mode_full_scale(11, 2, "\u{3a9}") == 1000.0, String::new());
-    check("fs diode 3 V", mode_full_scale(12, 4, "V") == 3.0, String::new());
-    check("fs DC V by mode", mode_full_scale(1, 4, "V") == 6.0, String::new());
+    check("fs continuity 1000 ohm", mode_full_scale(11, 0, 2, "\u{3a9}") == 1000.0, String::new());
+    check("fs diode 3 V", mode_full_scale(12, 0, 4, "V") == 3.0, String::new());
+    check("fs DC V by mode", mode_full_scale(1, 0, 4, "V") == 6.0, String::new());
+    // Capacitance: 6000 counts (dmm.rs cap_val): 100.0 nF on 600 nF,
+    // 6.000 nF, 60.00 mF.
+    check("fs cap 600 nF", (mode_full_scale(13, 2, 1, "nF") - 600.0).abs() < 1e-3, String::new());
+    check("fs cap 6 nF", (mode_full_scale(13, 0, 3, "nF") - 6.0).abs() < 1e-5, String::new());
+    check("fs cap 6 uF", (mode_full_scale(13, 3, 3, "\u{b5}F") - 6.0).abs() < 1e-5, String::new());
+    check("fs cap 6000 uF", (mode_full_scale(13, 6, 0, "\u{b5}F") - 6000.0).abs() < 1e-2, String::new());
+    check("fs cap 60000 uF", (mode_full_scale(13, 7, 0, "\u{b5}F") - 60000.0).abs() < 1e-1, String::new());
+    // The experimental 600 Mohm: its range at any decimals.
+    for d in 1..=3 {
+        check("fs 600 Mohm", mode_full_scale(10, 7, d, "M\u{3a9}") == 600.0, String::new());
+    }
+    check("fs 6 Mohm by mode", (mode_full_scale(10, 5, 4, "M\u{3a9}") - 6.0).abs() < 1e-6, String::new());
     // frac: fraction of the full scale.
     check("frac 4.8176 V", (frac(4.8176, 6.0, false).unwrap() - 4.8176 / 6.0).abs() < 1e-6, String::new());
     check("frac -600 mV", (frac(-600.0, 600.0, false).unwrap() + 1.0).abs() < 1e-6, String::new());

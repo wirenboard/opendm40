@@ -37,6 +37,9 @@ impl App {
             Gesture::Drag(_, p, _) | Gesture::Move(_, p) if self.pressed.map(|q| q.1) == self.press_hit(p.x, p.y) => {}
             // A long press with no action of its own still taps on release.
             Gesture::Grab(_) | Gesture::LongPress(_) => {}
+            // The tap's action first (`press_after_tap`): a tap that opens
+            // another page does not draw the item released before it.
+            Gesture::Tap(p) if self.pressed.map(|q| q.1) == self.press_hit(p.x, p.y) => {}
             _ => self.press_end(),
         }
     }
@@ -69,7 +72,7 @@ impl App {
                 } else if app_wave::WAVE_BUILD && b == Button::Amp && ui::inrush_hit(x, y) {
                     r(ui::RP_INRUSH as usize, 0)
                 } else {
-                    match ui::range_hit(b, x, y)? {
+                    match ui::range_hit(b, self.range_sel(), x, y)? {
                         Ok(i) => r(i, 0),
                         Err(k) => r((ui::RP_ERR + k) as usize, 0),
                     }
@@ -101,6 +104,17 @@ impl App {
                 self.draw_static();
                 ui::set_row_only(None);
             }
+        }
+    }
+
+    /// After a tap's action: the item drawn released, unless the page is
+    /// left or repainted anyway.
+    #[inline(never)]
+    pub(super) fn press_after_tap(&mut self) {
+        if self.redraw {
+            self.pressed = None;
+        } else {
+            self.press_end();
         }
     }
 

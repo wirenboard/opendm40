@@ -158,7 +158,7 @@ enum Phase {
 /// Complex work buffer of a job (re, im interleaved, bit-reversed after
 /// `load`), owned by the caller and passed to `load` / `step`: it is needed
 /// only while a job is in flight, so the device lends it from a buffer that
-/// is idle meanwhile (calbackup.rs `fft_work`, the disk scratch arena).
+/// is idle meanwhile (diskbuf.rs `fft_work`, the disk buffer arena).
 pub type Work = [f32; N];
 
 /// One spectrum job and the last complete result.

@@ -3,7 +3,9 @@
 methods A / B / C (src/acdcm.rs, DBG:ACDC:METH), with what the MR9270S+
 calibrator gives: DC up to 24 V (mr9270.VOLTAGE_MAX: a 30 V request puts out
 23.99 V) and its small 40 Hz square (tools/mr9270.py,
-'frequency' output). The meter on opendm40 over USB (USBTMC), leads on V / COM.
+'frequency' output). The meter on opendm40 over USB (USBTMC), leads on V / COM,
+on an image built with `--features acdc-meth` (Cargo.toml; the default build
+refuses DBG:ACDC:METH / STAT? / ZERO / R0).
 
   e1  note 7 / B's zero: per V range (DBG:ACDC:RANG 1..4) at 0 V and the
       calibrator's top level (24 V), B entered N times (each entry measures the zero:
@@ -108,6 +110,11 @@ class Run:
             self.cal = mr9270.MR9270(a.cal).connect()
         self.out = open(a.out, 'a') if a.out else None
         self.a = a
+        self.link.query('*CLS')
+        self.w('DBG:ACDC:METH A')
+        err = self.q('SYST:ERR?')
+        if err.startswith('-113'):
+            sys.exit('acdcmeth.py: the meter needs an image built with --features acdc-meth (%s)' % err)
 
     def q(self, line):
         return self.link.query(line).strip()

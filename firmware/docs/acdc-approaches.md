@@ -61,7 +61,8 @@ Short names: "acdc" = `stock/re/docs/history/acdc-stock-vs-opendm40.md` (in the 
   case (the reason AC+DC exists, Fluke's own example) the DC error dominates
   and a 0.1 % DC path costs ~0.07 % of the total against AD1.
 * **Outcome (section 10).** Methods B (option (b)) and C (option (c)) run
-  next to the stock alternation A, selected with `DBG:ACDC:METH`. B failed
+  next to the stock alternation A, selected with `DBG:ACDC:METH`, in builds
+  with the cargo feature `acdc-meth` (off by default: A only). B failed
   its device rule (its zero is bimodal per entry, 10.5). C meets the rule on
   V on this unit (10.15); A stays the default until C is checked on the
   current ranges with real current (10.16, TODO). Option (d) is not built.
@@ -667,7 +668,12 @@ Web (retrieved 2026-10-22):
 ## 10. Prototype: methods B and C in opendm40 (2026-10-22, `src/acdcm.rs`)
 
 Behind a RAM-only switch (`DBG:ACDC:METH`), default A (the stock
-alternation, unchanged), so a device session compares them. Device input
+alternation, unchanged), so a device session compares them. Built only with
+the cargo feature `acdc-meth` ([`Cargo.toml`](../Cargo.toml); `./build.sh
+native --features acdc-meth`): the default build has A alone and refuses
+`DBG:ACDC:METH` / `STAT?` / `ZERO` / `R0` (undefined header);
+`tools/acdcmeth.py`, `emu/hy3131/acdcmethtest.py` and `couptest.py --meth`
+need such an image. Device input
 before the prototype (feasibility 13.2): with AD2 + AD3 + RMS on for the
 whole DC V row AD1 shifts by 30..90 x its noise, offsets -2.9 mV / +17 mV /
 +0.17 V / -1.6 V on 6 / 60 / 600 / 1000 V (0.03..0.16 % of the range,

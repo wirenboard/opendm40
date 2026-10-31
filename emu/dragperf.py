@@ -75,6 +75,12 @@ try:
             time.sleep(0.05)
 
     print('*IDN?', q('*IDN?'), flush=True)
+    # DBG:PROF? / DBG:PROF:RESET only in a build with the feature dbg-prof
+    # (else -113 "Undefined header"): without it the figures are left out.
+    q('DBG:PROF:RESET')
+    has_prof = q('SYST:ERR?').startswith('0,')
+    if not has_prof:
+        print('no DBG:PROF? in this build (--features dbg-prof): no main-loop figures', flush=True)
     until(3000)
     q('DBG:KEY 0')
     until(up() + 500)
@@ -95,7 +101,8 @@ try:
     def ngest():
         return int(q('DBG:GEST?').split(';')[0].split('|')[0])
     n0 = ngest()
-    q('DBG:PROF:RESET')
+    if has_prof:
+        q('DBG:PROF:RESET')
     lv = [float(q('TRIG:LEV?'))]
     t_end = time.time() + 600
     for k in range(len(drags)):
@@ -105,8 +112,8 @@ try:
     if ngest() != n0 + len(drags):
         print('FAIL %d drags logged, want %d (setup too slow? raise --t0)' % (ngest() - n0, len(drags)), flush=True)
         rc = 1
-    prof = q('DBG:PROF?')
-    print(prof, flush=True)
+    if has_prof:
+        print(q('DBG:PROF?'), flush=True)
     print('TRIG:LEV? before / after each drag: %s' % ['%.3f' % v for v in lv], flush=True)
     if not all(abs(lv[i + 1] - lv[i]) > 0.1 for i in range(len(drags))):
         print('FAIL the level did not move with every drag', flush=True)

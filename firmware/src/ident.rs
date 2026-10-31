@@ -3,14 +3,19 @@
 //! `VERSION` is the one version string, Cargo.toml's package version as it
 //! is (0.1.0, 0.1.0-pre2, 0.1.2): *IDN? (also in the 34401A emulation),
 //! Settings > Device, README.TXT / BACKUP.TXT, the CSV / log headers.
-//! build.sh names the install file `dm40_opendm40_v<VERSION>.bin`. Host
-//! tests built without Cargo (no CARGO_PKG_VERSION) get "dev".
+//! A pull request build in CI appends `-pr<N>.<commit>` (build.rs,
+//! DM40_VERSION_SUFFIX). build.sh names the install file
+//! `dm40_opendm40_v<VERSION>.bin`. Host tests built without Cargo (no
+//! OPENDM40_VERSION / CARGO_PKG_VERSION) get "dev".
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
-const PKG: &str = match option_env!("CARGO_PKG_VERSION") {
+const PKG: &str = match option_env!("OPENDM40_VERSION") {
     Some(v) => v,
-    None => "dev",
+    None => match option_env!("CARGO_PKG_VERSION") {
+        Some(v) => v,
+        None => "dev",
+    },
 };
 
 pub const VERSION: &str = PKG;

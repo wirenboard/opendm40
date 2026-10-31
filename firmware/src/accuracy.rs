@@ -61,6 +61,10 @@ pub fn spec(mode: u8, range: i8, acdc: bool, tc: bool, f: bool) -> Option<Spec> 
     if mode == 15 {
         return tc.then_some(Spec { pct: if f { 150 } else { 100 }, n: 5, abs: true, decade: 0 });
     }
+    // The experimental 600 Mohm (ohm r7, dmm::OHM600): no spec.
+    if mode == 10 && range > 6 {
+        return None;
+    }
     let m = *MODE_ROW.get(mode as usize)?;
     if m & 0x40 != 0 && range < 1 {
         return None;

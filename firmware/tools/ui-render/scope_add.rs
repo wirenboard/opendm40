@@ -84,8 +84,93 @@ fn srate(ck: &mut Checker, out: &str) {
     println!("scope sample rate (timebase list): widest rate \"{}\" {} px, widest time {wt} px", widest.1, widest.0);
 }
 
+/// WCAG contrast ratio of two RGB565 colours.
+fn contrast(a: u16, b: u16) -> f32 {
+    let lum = |c: u16| {
+        let ch = |v: u32, max: u32| {
+            let v = (v * 255 / max) as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch((c >> 11) as u32 & 31, 31) + 0.7152 * ch((c >> 5) as u32 & 63, 63) + 0.0722 * ch(c as u32 & 31, 31)
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Panel and badge text on the user's channel colours (CH1_INK, MATH_INK)
+/// and channel-coloured text on the dark bar (PAL_TEXT: trigger badge,
+/// measurement strip, FFT labels): every palette entry reads at least as
+/// well as the stock default math panel (white on orange); the defaults
+/// keep the stock text colours; PAL_TEXT is the palette colour wherever
+/// that already reads so; the drawn CHA / math label buttons, the V/div
+/// badge, the trigger badge and a measurement cell use them.
+fn ink_contrast(ck: &mut Checker, out: &str) {
+    use scope_ui::{CH1_INK, C_BAR, C_FILL, C_WHITE, MATH_INK, PALETTE, PAL_TEXT};
+    let floor = contrast(PALETTE[1], C_WHITE) - 0.01;
+    let base = &stock::scenes()[0];
+    ck.cases += 1;
+    if CH1_INK[base.m.colour as usize] != C_FILL || MATH_INK[base.m.math_colour as usize] != C_WHITE {
+        ck.fail("ink/default", "default CH1 / math text colour differs from the stock".into());
+    }
+    for i in 0..9usize {
+        for (what, ink) in [("CH1", CH1_INK[i]), ("math", MATH_INK[i])] {
+            ck.cases += 1;
+            let c = contrast(PALETTE[i], ink);
+            if c < floor {
+                ck.fail(&format!("ink/{what}/{i}"), format!("{what} text on {} {c:.2}:1 < {floor:.2}:1", scope_ui::COLOUR_NAMES[i]));
+            }
+        }
+        ck.cases += 1;
+        let c = contrast(PAL_TEXT[i], C_BAR);
+        let keep = contrast(PALETTE[i], C_BAR) >= floor;
+        if c < floor || (keep && PAL_TEXT[i] != PALETTE[i]) {
+            ck.fail(&format!("ink/text/{i}"), format!("{} text on the bar {c:.2}:1 (floor {floor:.2}:1), palette kept: {keep}", scope_ui::COLOUR_NAMES[i]));
+        }
+        let mut m = base.m;
+        m.colour = i as u8;
+        m.math_colour = i as u8;
+        m.math_on = true;
+        host::reset(0);
+        scope_ui::invalidate();
+        scope_ui::update(&m);
+        scope_ui::meas_cell(&m, 0, "Freq:1.00kHz");
+        if i == 4 {
+            save(out, "s08-ink-ch1-blue");
+        }
+        // CHA button (B_RECT[1]), math label button (B_RECT[4]), V/div badge.
+        for (what, r, fill, ink) in [
+            ("CHA", scope_ui::B_RECT[1], PALETTE[i], CH1_INK[i]),
+            ("math", scope_ui::B_RECT[4], PALETTE[i], MATH_INK[i]),
+            ("V/div badge", stockfont::rect(304, 1, 44, 17), PALETTE[i], CH1_INK[i]),
+            // Text in the channel colour on the bar: fill = the bar.
+            ("trigger badge", stockfont::rect(364, 2, 49, 15), C_BAR, PAL_TEXT[i]),
+            ("measurement cell", stockfont::rect(14, 303, 96, 15), C_BAR, PAL_TEXT[i]),
+        ] {
+            let e = emu();
+            let (mut n_fill, mut n_ink, mut other) = (0, 0, 0);
+            for y in r.y..r.y + r.h {
+                for x in r.x..r.x + r.w {
+                    let c = e.fb[y as usize * W + x as usize];
+                    if c == fill {
+                        n_fill += 1;
+                    } else if c == ink {
+                        n_ink += 1;
+                    } else if c == if fill == C_BAR { if PALETTE[i] != ink { PALETTE[i] } else { 0x0001 } } else if ink == C_FILL { C_WHITE } else { C_FILL } {
+                        other += 1;
+                    }
+                }
+            }
+            ck.cases += 1;
+            if n_fill == 0 || n_ink == 0 || other > 0 {
+                ck.fail(&format!("ink/draw/{what}/{i}"), format!("{what} on {}: fill {n_fill} px, ink {n_ink} px, the other text colour {other} px", scope_ui::COLOUR_NAMES[i]));
+            }
+        }
+    }
+}
+
 pub fn run(ck: &mut Checker, out: &str) {
     srate(ck, out);
+    ink_contrast(ck, out);
     let base = &stock::scenes()[0];
     let screen = Bx::new(0, 0, 480, 320);
     let mut n = 0;
@@ -382,6 +467,110 @@ pub fn run(ck: &mut Checker, out: &str) {
             nw += 1;
         }
     }
+    // A CSV recording (Model::rec, issues #101, #105 feedback): the REC mark
+    // (scope_ui::rec_mark) in the source badge's slot, the record bar beside
+    // it (also on the stock page of builds without the stream ISR,
+    // SRC_NONE, and in the combined view): running, stopped with its
+    // brackets, roll, the generator frequency; both blink phases; each of
+    // the texts (RecStyle; the default Dmm last so the rest of the run
+    // draws it; RecFunc with every unit). Updates between them, to / from
+    // no recording and the blink step (the dot's box alone) equal fresh draws.
+    let rec_scene = |src: u8, status: u8, roll: bool, gen: bool, dim: bool| {
+        let mut sc = wave_scene(src, 0, status, roll, 3);
+        sc.name = "rec";
+        sc.m.rec = true;
+        sc.m.rec_dim = dim;
+        sc.m.gen_hz = if gen { 1000.0 } else { 0.0 };
+        sc
+    };
+    let styles = [(scope_ui::RecStyle::Rec, "rec"), (scope_ui::RecStyle::RecDmm, "b"), (scope_ui::RecStyle::RecFunc, "c"), (scope_ui::RecStyle::DmmRec, "d"), (scope_ui::RecStyle::Dmm, "a")];
+    for (style, sn) in styles {
+        scope_ui::set_rec_style(style);
+        for dim in [false, true] {
+            for src in [scope_ui::SRC_NONE, scope_ui::SRC_MCX] {
+                for (status, roll, gen) in [(scope_ui::ST_TD, false, false), (scope_ui::ST_STOP, false, false), (scope_ui::ST_RUN, true, false), (scope_ui::ST_TD, false, true)] {
+                    let sc = rec_scene(src, status, roll, gen, dim);
+                    stock::draw(&sc);
+                    let name = format!("rec/{sn}/{}/{src}/{status}/{}/{}", dim as u8, roll as u8, gen as u8);
+                    ck.check_replica(&name);
+                    ck.check_add(&name, &[("badge row", Bx::new(0, -2, 480, 24))], &[rb(scope_ui::SRC_BADGE)], top);
+                    nw += 1;
+                    if src == scope_ui::SRC_MCX {
+                        let st = match (status, roll, gen) {
+                            (scope_ui::ST_STOP, _, _) => "stop",
+                            (_, true, _) => "roll",
+                            (_, _, true) => "gen",
+                            _ => "run",
+                        };
+                        save(out, &format!("s05-rec-{sn}-{st}-{}", if dim { "off" } else { "on" }));
+                    }
+                }
+            }
+            // The combined view (no source badge; the strip below).
+            let mut sc = rec_scene(scope_ui::SRC_NONE, scope_ui::ST_TD, false, false, dim);
+            sc.m.combined = true;
+            stock::draw(&sc);
+            let name = format!("rec/{sn}/{}/combined", dim as u8);
+            ck.check_add(&name, &[("badge row", Bx::new(0, -2, 480, 24))], &[rb(scope_ui::SRC_BADGE)], top);
+            nw += 1;
+            save(out, &format!("s05-rec-{sn}-combined-{}", if dim { "off" } else { "on" }));
+        }
+        // RecFunc: every recorded function's unit (the widest decides).
+        if style == scope_ui::RecStyle::RecFunc {
+            for (k, f) in [1u8, 7, 10, 13, 14, 18, 15].into_iter().enumerate() {
+                let mut sc = rec_scene(scope_ui::SRC_MCX, scope_ui::ST_STOP, false, false, false);
+                sc.m.rec_unit = scope_ui::rec_unit(f);
+                stock::draw(&sc);
+                let name = format!("rec/{sn}/unit/{f}");
+                ck.check_replica(&name);
+                ck.check_add(&name, &[("badge row", Bx::new(0, -2, 480, 24))], &[rb(scope_ui::SRC_BADGE)], top);
+                nw += 1;
+                save(out, &format!("s05-rec-c-unit{k}"));
+            }
+        }
+        let states = [
+            stock::Scene { name: "rec", m: base.m, popup: scope_ui::Popup::None, trace: base.trace.clone(), persist: None, cols: 399, cells: base.cells.clone() },
+            wave_scene(scope_ui::SRC_MCX, 0, scope_ui::ST_TD, false, 3),
+            rec_scene(scope_ui::SRC_MCX, scope_ui::ST_TD, false, false, false),
+            rec_scene(scope_ui::SRC_MCX, scope_ui::ST_TD, false, false, true),
+            rec_scene(scope_ui::SRC_MCX, scope_ui::ST_STOP, false, false, false),
+            rec_scene(scope_ui::SRC_MCX, scope_ui::ST_STOP, false, false, true),
+            rec_scene(scope_ui::SRC_NONE, scope_ui::ST_TD, false, true, false),
+            rec_scene(scope_ui::SRC_NONE, scope_ui::ST_TD, false, true, true),
+            rec_scene(scope_ui::SRC_NONE, scope_ui::ST_RUN, true, false, true),
+            {
+                let mut s = rec_scene(scope_ui::SRC_MCX, scope_ui::ST_TD, false, false, false);
+                s.m.rec_unit = scope_ui::rec_unit(14);
+                s
+            },
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                stock::draw(b);
+                let want = emu().fb.clone();
+                stock::draw(a);
+                stock::load(b);
+                scope_ui::update(&b.m);
+                scope_ui::cells(&b.m, &b.cells);
+                ck.same_as(&format!("rec/{sn}/update/{i}->{j}"), &want);
+                nw += 1;
+            }
+        }
+        // The blink step above a popup (App::sp_tick: rec_mark_blink alone).
+        for dim in [false, true] {
+            let mut b = rec_scene(scope_ui::SRC_MCX, scope_ui::ST_TD, false, false, dim);
+            stock::draw(&b);
+            let want = emu().fb.clone();
+            b.m.rec_dim = !dim;
+            stock::draw(&b);
+            scope_ui::rec_mark_blink(scope_ui::SRC_BADGE, scope_ui::C_BAR, !dim, b.m.rec_unit);
+            ck.same_as(&format!("rec/{sn}/blink/{}", dim as u8), &want);
+            nw += 1;
+        }
+    }
     // Trigger-level drag steps (src/scope_ui.rs Graph::flush repaints the
     // changed guide rows as row runs between the holes; the trigger badge
     // after the graph): each step equals its fresh draw, plain and with the
@@ -430,4 +619,75 @@ pub fn run(ck: &mut Checker, out: &str) {
         }
     }
     println!("scope additions: {n} FFT scenes, {nt} trigger-tab scenes, {nw} wave-view scenes, {nd} trigger-level drag steps");
+    gen_channel(ck, out);
+}
+
+/// The GEN channel (docs/scope-gen-channel.md): the computed trace under
+/// CH1, the trigger badge in its colour, the Source row of the Trigger
+/// tab and the GEN trace row of the Display tab; an update equals a fresh
+/// draw.
+fn gen_channel(ck: &mut Checker, out: &str) {
+    let base = &stock::scenes()[0];
+    let shape = gen::Shape { wave: gen::Wave::Sine, lo_v: 0.0, hi_v: 3.0, duty: 0.5 };
+    for combined in [false, true] {
+        let mut m = base.m;
+        m.combined = combined;
+        m.tsrc = scope::TSRC_GEN;
+        let h = m.frame_h();
+        let draw = |m: &scope_ui::Model, popup: scope_ui::Popup, pv: &scope_ui::PopVals, gen_on: bool| {
+            let sc = stock::Scene { name: "gen", m: *m, popup: scope_ui::Popup::None, trace: base.trace.clone(), persist: None, cols: 399, cells: base.cells.clone() };
+            stock::draw_with(&sc, pv);
+            if gen_on {
+                let g = scope_ui::graph();
+                for i in 0..399 {
+                    // 2.5 periods on the screen, 1 V/div, 0 V on the centre row.
+                    let (lo, hi) = shape.span(i as f32 * 2.5 / 399.0, 2.5 / 399.0);
+                    let r = |v: f32| (140.0 - 141.0 * v / 4.0) as i32;
+                    g.gn[i] = (scope_ui::trace_fy(h, r(hi)), scope_ui::trace_fy(h, r(lo)));
+                    let c = (200.0 + 60.0 * shape.unit(i as f32 * 1.5 / 399.0 + 0.1)) as i32;
+                    g.c2[i] = (scope_ui::trace_fy(h, c), scope_ui::trace_fy(h, c + 1));
+                }
+                scope_ui::update(m);
+            }
+            scope_ui::draw_popup(popup, pv);
+        };
+        let mut pv = stock::popvals(&m);
+        pv.tsrc = scope::TSRC_GEN;
+        pv.gen_trace = true;
+        pv.ch2_on = true;
+        pv.ch2_vdiv = scope_ui::Txt::new("250mA");
+        // The DMM CH2 too: its label (a graph hole) and a trace.
+        m.ch2_txt = scope_ui::Txt::new("CH2 250mA");
+        draw(&m, scope_ui::Popup::None, &pv, true);
+        ck.check_replica(&format!("gen/{}/trace", combined as u8));
+        let want = emu().fb.clone();
+        if !combined {
+            save(out, "s08-gen-trace");
+        }
+        // Off -> on as an update.
+        draw(&m, scope_ui::Popup::None, &pv, false);
+        let g = scope_ui::graph();
+        for i in 0..399 {
+            let (lo, hi) = shape.span(i as f32 * 2.5 / 399.0, 2.5 / 399.0);
+            let r = |v: f32| (140.0 - 141.0 * v / 4.0) as i32;
+            g.gn[i] = (scope_ui::trace_fy(h, r(hi)), scope_ui::trace_fy(h, r(lo)));
+            let c = (200.0 + 60.0 * shape.unit(i as f32 * 1.5 / 399.0 + 0.1)) as i32;
+            g.c2[i] = (scope_ui::trace_fy(h, c), scope_ui::trace_fy(h, c + 1));
+        }
+        scope_ui::update(&m);
+        ck.same_as(&format!("gen/{}/update", combined as u8), &want);
+        for (tab, name) in [(1u8, "s08-gen-display"), (2, "s08-gen-trigger")] {
+            draw(&m, scope_ui::Popup::Mf(tab), &pv, true);
+            let add = if tab == 1 {
+                vec![rb(scope_ui::GT_LABEL), rb(scope_ui::C2_LABEL), rb(scope_ui::C2_MINUS), rb(scope_ui::C2_VALUE), rb(scope_ui::C2_PLUS)]
+            } else {
+                vec![rb(scope_ui::TS_LABEL), rb(scope_ui::TS_NOTE)]
+            };
+            let area = if tab == 1 { Bx::new(14, 161, 399, 99) } else { Bx::new(14, 186, 399, 50) };
+            ck.check_add(&format!("gen/{}/tab{tab}", combined as u8), &[("page", area)], &add, Bx::new(13, 20, 401, if tab == 1 { 241 } else { 216 }));
+            if !combined {
+                save(out, name);
+            }
+        }
+    }
 }

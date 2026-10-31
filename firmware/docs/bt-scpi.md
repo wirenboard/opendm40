@@ -32,15 +32,25 @@ on the first byte of each request:
   then starts a frame.
 - A partial line is dropped after 2 s without a byte, a partial frame after
   0.5 s, and both are dropped when the host leaves (PC14 falls).
+  A query still waiting for its reply (`READ?`, `MEAS?`) and the rest of its
+  message are dropped then too: the next host gets no reply of the old one.
 - A line over 256 bytes is discarded; `SYST:ERR?` then reports "Input buffer
   overrun".
+- Input is not read while a line waits to be taken, so more than 1 KiB sent
+  behind a slow query (`READ?`, `MEAS?`, a block reply still going out)
+  overflows the RX ring: the oldest unread bytes are lost, `SYST:ERR?`
+  reports "Input buffer overrun", and input up to the next `\n` / `\r` is
+  discarded, so no command cut by the gap runs. Lines are taken at most one
+  per 5 ms poll (~200 lines/s), so a host that pipelines short commands at
+  full wire speed can overflow it too.
 - Replies: the text plus `\n`. A definite-length block (`WAV:DATA?`,
   `LOG:DATA?`) is `#<n><len><data>` plus `\n`. USBTMC ends its replies the
   same way (IEEE 488.2 NL^END).
-- Messages run one at a time: the next line is read only after the reply to
-  the previous query has gone out, as on a serial instrument. Pipelined
-  queries are answered in order, and none is cut short ("Query INTERRUPTED"
-  only happens on USBTMC).
+- Messages run one at a time: the next line is taken only after the reply to
+  the previous query is queued and the TX ring has room for the largest reply
+  (6145 bytes + 256 for stock frames), as on a serial instrument. Pipelined
+  queries, block queries too, are answered in order, and none is cut short
+  ("Query INTERRUPTED" only happens on USBTMC).
 - USBTMC and Bluetooth have separate SCPI sessions (error queue, pending
   `READ?`), so one host does not see or consume the other's errors.
 - The module's start-up text is not parsed. On every module start (power-up,
@@ -95,7 +105,8 @@ must go under `DBG:` or be added to `bt_scpi::UNTRUSTED_DENY`.
 
 The UART runs at 115200 8N1 = 11.5 kB/s (87 us per byte). TX goes out by DMA
 (DMA0 channel 4) from an 8 KiB ring, so a long reply does not block the main
-loop. RX goes to a 1 KiB circular DMA ring (89 ms of input).
+loop; behind a block reply the next line waits until at most ~1.8 kB of it
+is left to send (up to 0.38 s after a 6 KiB `LOG:DATA?`). RX goes to a 1 KiB circular DMA ring (89 ms of input).
 
 | Query | Reply | On the UART | Round trip (expected) |
 |---|---|---|---|

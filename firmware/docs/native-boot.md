@@ -21,15 +21,21 @@ In short:
   shows its update screen with a USB disk.
 - **Update file:** a 12-byte header (the marker) plus the body flashed at
   `0x08004000` ("Update file format" below).
-- **opendm40's shim** at the image's reset vector picks a normal boot or
-  recovery; recovery zeroes the marker and resets into the FS-loader
-  ("Shim (reset path)", "Recovery mode" below).
+- **opendm40's shim** at the image's reset vector starts the watchdog and
+  the clock and boots opendm40; a hang reboots it. Two ways into the
+  FS-loader from opendm40:
+  - **PA2 entry** (`DBG:LOADER` / `DBG:RECOVER`, the power-key hold at
+    power-on): PA2 driven low and locked, jump to the ROM; the marker stays
+    valid, a power cycle boots opendm40 ("PA2 entry" below);
+  - **marker zeroing** (`DBG:UPDATE`, the on-meter install of a copied
+    image): the loader stays until a good install ("Recovery mode" below).
+  No hang count leads to the loader (removed in 0.4.0).
 
 Stock flash layout (`stock/re/ANALYSIS.md` §1):
 
 ```
 0x08000000  ROM (primary bootloader)  16 KB  sector 0      never touched by updates
-0x08004000  application              ~480 KB sectors 1..8  = update body offset 0
+0x08004000  application              624 KB sectors 1..8  = update body offset 0 (zero-wait below 0x08080000)
 0x080a0000  FS-loader                  64 KB sector 9      never touched by updates
 0x080a4000  UID-bound bootloader data        sector 9      never erase
 0x080c0000  settings / calibration           sector 10     opendm40 only reads it
@@ -56,8 +62,10 @@ read-locked. The boot gate and install in detail, with addresses:
 - **The marker is the switch.** As soon as the loader finds a `dm40*.bin` it
   zeroes the marker; a bad file therefore leaves the application unbootable
   and the unit in the loader until a good install. opendm40 uses the same
-  switch from software: zeroing the marker and resetting reaches the update
-  screen from any reset ("Recovery mode" below).
+  switch from software where a staged image must be installed: zeroing the
+  marker and resetting reaches the install state from any reset, also after
+  a power loss on the way ("Recovery mode" below). To only open the update
+  screen it uses PA2 ("PA2 entry" below).
 - Neither the ROM nor the loader reads the reset cause.
 - The stock application never deletes or renames the file; on leaving USB
   Connect with a `dm40*.bin` present it zeroes the marker and resets.
@@ -67,6 +75,90 @@ outside the application area, and a failed install always ends on the
 loader's update screen with its disk. The user procedure is in
 [the manual, Backup, recovery and back to stock](../../docs/manual/README.md#backup-recovery-and-back-to-stock); the hardware entry (TX-GND
 short) in [hw/README.md, Hardware recovery](../../hw/README.md#hardware-recovery).
+
+### PA2 entry (`boot::loader_pa2`)
+
+The way into the loader that keeps the marker: opendm40 does in software what
+the TX-GND short does at power-on. `DBG:LOADER` / `DBG:RECOVER` and the
+power-key hold use it.
+
+How the ROM and the loader read PA2 (disassembly of the 2026-10-13 dump):
+- ROM `0x080005f4`: GPIOA clock on (`0x08001308`, `RCU_AHB1EN` bit 0), then
+  `gpio_mode_set(GPIOA, input, pull-up, pin 2)` (`0x08000fa6`: MODER and
+  PUPDR rewritten for the pin), one 20000-iteration delay (`0x080005dc`),
+  then up to 1000 reads of IDR bit 2 (`0x08000612`, `0x08000f96`), each
+  followed by the same delay. One read of 1 launches a valid application.
+- FS-loader: begin `0x080a1bd8` first sets PA2 to AF7 (USART1 TX) with
+  pull-up (`0x080a4b14` → `0x080a5158` → `0x080a9a58`), then the same input +
+  pull-up set-up and 1000 reads (`0x080a1c0e`..`0x080a1c48`, delay
+  `0x080a1bc2`).
+- Timing in the emulator (instruction-count time, not cycle-exact): the ROM's
+  poll takes ~0.5 s, the loader's about the same.
+- Neither writes `RCU_AHB1RST` (GPIOA is never reset) or `GPIOA_LCKR`, and
+  neither writes PA2's output bit (their GPIO output writes are PE2, PC4 and
+  PA11 / PA12).
+
+So a plain output-low does not survive: the ROM's mode write turns PA2 back
+into an input with pull-up, and the first read is high. What survives is a
+**locked** pin. `loader_pa2`:
+1. PA2 = 0 (BOP), push-pull, no pull, output; then the GPIOx_LOCK key
+   sequence (offset `0x1C`: LKK + pin, pin, LKK + pin, read, read). MODER,
+   OTYPER, OSPEEDR, PUPDR and AFR of PA2 then ignore writes until the next
+   system reset; the output register is not locked.
+2. `BKP_TRIG` = `0x54520012` (lock read back) or `0x54520013` (not: the ROM's
+   pull-up wins, opendm40 boots again).
+3. SysTick off, NVIC disabled and cleared, `VTOR = 0x08000000`, MSP from
+   `0x08000000`, CONTROL = 0, `cpsie i`, jump to the ROM's reset handler
+   (`0x080001c1`).
+
+The ROM then sets its clock and FWDGT up again, reads PA2 low 1000 times and
+starts the loader, which reads it low 1000 times and enters its install state:
+a `dm40*.bin` in the SPI-flash root is installed, otherwise the update screen
+with its USB disk. Ways out, each a reset that clears the lock (PA2 reads
+high, the valid marker boots opendm40):
+- an install: the loader resets itself;
+- the power key held on the update screen (a 3 s hold in the emulator; a
+  0.2 s press did nothing): the loader's tick `0x080a1cf4` returns exit code
+  1, `0x080a5134` drops PE2 / PC4 (power off on battery), and its main
+  returns into the stack the ROM left. In the emulator the CPU then jumps to
+  a garbage address (the emulation aborts). Inferred for the device on USB
+  power: a fault, nothing feeds the FWDGT any more, reset within ~20 s;
+- switching the meter off and on.
+
+The loader has no timeout (its event loop feeds the FWDGT), and a USB VBUS
+cycle does not reset the meter while the battery holds it up (inferred).
+
+It runs as the first step of the shim, after a SYSRESETREQ with
+`BKP_REQ` = `0x4C324150` ("PA2L"): the CPU is then in the state the ROM
+leaves when it launches the application (its PLL at 200 MHz, its FWDGT, no
+interrupt enabled), the same state the loader sees after the ROM on every
+cold boot. A jump straight from the running firmware would have to undo
+opendm40's USB, DMA, timers and clock first. The key hold therefore also
+sets the word and resets.
+
+Device, 2026-10-29: with the running image staged as `DM40FW.BIN`,
+`DBG:LOADER` ended in the loader's install and its reset (`last_trigger`
+`0x54520012`, reset flag SW, the file deleted, marker = the image header).
+Not yet tried there: the update screen without a file, the key hold. If the
+lock did not hold, the result would be a normal reboot with `last_trigger`
+`0x54520013` in `DBG:BOOT?`.
+
+**PA2 low across a reset instead (not used).** Drive PA2 low, then
+SYSRESETREQ, and rely on the pin's capacitance: the reset returns GPIOA to
+its reset state (PA2 a floating input), the ROM enables the pull-up
+(~40 kΩ typical) and waits one delay loop before the first of 1000 reads
+spread over ~0.5 s. A pad and a short trace (inferred: tens of pF) charge
+through the pull-up in microseconds, and any single high read launches the
+application, so this cannot work, not just unreliably. The emulator's GPIO
+model has no capacitance (a reset clears the pin), so it says nothing here.
+
+Emulator: [`emu/peripherals/GD32_GPIO.cs`](../../emu/peripherals/GD32_GPIO.cs)
+models the lock (key sequence, locked fields ignored, cleared on a machine
+reset); `machine Reset` stands for a power cycle.
+[`emu/recoverytest.py`](../../emu/recoverytest.py) cases `loader`,
+`key-hold`, `usb-loader` (DBG:LOADER over USB/IP): ROM → FS-loader update
+screen with PA2 low and locked, marker valid; after a power cycle opendm40
+boots.
 
 ## Update file format
 
@@ -118,8 +210,8 @@ any body byte):
 | Update file with a bad header | the loader zeroes the marker, keeps the application bytes and the file, shows "update error" and its disk | header checked before any erase; delete the file, copy a good one, press "update" |
 | Header OK, body bad / short / hazardous last block | application erased, "update error" / "app crc error", disk up | same: install a good file from the loader's disk |
 | Power loss while the loader flashes | marker zeroed, application partly written | the next boot enters the install state again and re-installs the file (deleted only after success) |
-| opendm40 hangs before or after the shim decision | FWDGT reset (~20 s); the first one reboots normally, a second within 60 s of main loop takes recovery | "Shim (reset path)" below; the shim itself only reads and programs the 12 marker bytes |
-| opendm40 too broken for any software path | – | TX (PA2) to GND at power-on enters the install state ([hw/README.md, Hardware recovery](../../hw/README.md#hardware-recovery)) |
+| opendm40 hangs | FWDGT reset (~20 s), opendm40 boots again, every time | once its USB is up: `DBG:LOADER`, `DBG:UPDATE` or the on-meter update |
+| opendm40 hangs before its USB is up (every boot) | a reboot every ~20 s | the power-key hold at power-on (the shim runs before the hang) or TX (PA2) to GND at power-on ([hw/README.md, Hardware recovery](../../hw/README.md#hardware-recovery)); neither works if the shim itself hangs |
 | SPI-flash FAT unreadable | the loader fast-formats it on `FR_NO_FILESYSTEM` (`stock/re/docs/fsloader-install-trigger.md`, "Install state, call order") | an empty FAT on the loader's disk takes a new file |
 | Wrong-model update file | installs; the model comes from the calibration record (`0x080C0000` +0x168, [model-variants.md](model-variants.md)) | labels / ranges only |
 
@@ -147,15 +239,15 @@ is exposed.
 | [`link-native.x`](../link-native.x) | the image layout (below), the only linker script |
 | [`build.sh`](../build.sh) | builds and packs the image, checks the budgets (`native` accepted as a no-op argument) |
 | [`src/shim.rs`](../src/shim.rs) | vector table, `reset` (asm), `shim_main`; all in region A |
-| [`src/boot.rs`](../src/boot.rs) | shim decision `shim()`, reset flags, power key, power hold on/off, backup-SRAM words, loader marker check + `zero_marker()` (FMC), `DBG:BOOT?` text |
+| [`src/boot.rs`](../src/boot.rs) | shim decision `shim()`, key-hold gesture, PA2 entry `loader_pa2()`, reset flags, power-key pin, power hold on/off, backup-SRAM words, loader marker check + `zero_marker()` (FMC), `DBG:BOOT?` text |
 | [`src/native.rs`](../src/native.rs) | after the decision: `.data`/`.bss` init, then recovery, or `pre_main` + `main` |
 | [`src/board.rs`](../src/board.rs) | board bring-up (everything the stock firmware used to do before opendm40 ran) |
-| [`src/recovery.rs`](../src/recovery.rs) | recovery: zero the loader marker + SYSRESETREQ; features `recovery-file` (`DM40RCVR.BIN` + power off) and `recovery-usb` (own USB-MSC) keep the earlier variants for tests |
+| [`src/recovery.rs`](../src/recovery.rs) | recovery (only on the request word, set by nobody now): zero the loader marker + SYSRESETREQ; features `recovery-file` (`DM40RCVR.BIN` + power off) and `recovery-usb` (own USB-MSC) keep the earlier variants for tests |
 | [`src/fatren.rs`](../src/fatren.rs) | FAT16 root-directory edits: rename the installed image, remove a leftover `DM40RCVR.BIN`; with `recovery-file`, create `DM40RCVR.BIN` |
 | [`src/clock.rs`](../src/clock.rs) | `init_core(Src)`: measured stock values, bounded waits, IRC16M fallback, no FLASH_ACR write |
 | [`src/wdt.rs`](../src/wdt.rs) | `start::fwdgt()` (shim); `powered_off()` (end of the app's power-off) |
 | [`src/msc.rs`](../src/msc.rs) | `STOP_UNIT` flag on SCSI START STOP UNIT |
-| [`src/scpi.rs`](../src/scpi.rs) | `DBG:BOOT?`; `DBG:UPDATE` = `DBG:RECOVER`: zero the marker + reset |
+| [`src/scpi.rs`](../src/scpi.rs) | `DBG:BOOT?`; `DBG:UPDATE`: zero the marker + reset; `DBG:LOADER` = `DBG:RECOVER`: PA2 entry |
 | [`tools/fatren-test/run.sh`](../tools/fatren-test/run.sh) | host tests of fatren, calbackup, fatdir, upload, vdisk and vwrite on mkfs.fat images (fsck.fat + mtools) |
 
 Cargo features ([`Cargo.toml`](../Cargo.toml); the stock fonts are always
@@ -194,7 +286,7 @@ file's header there), and only the low 512 KiB of the flash are zero-wait
             end of image below 0x080A0000 (FS-loader above)
 RAM: TCM  0x10000000 .data/.bss, then the stack down from 0x10010000;
      SRAM 0x20000000 .dmabuf (DMA buffers, the scope record, the disk
-          scratch arena, the logger ring, ...), then .sram_bss (CPU-only, zeroed)
+          buffer arena, the logger ring, ...), then .sram_bss (CPU-only, zeroed)
 ```
 
 ### Memory budget (2026-10-22 rework)
@@ -230,8 +322,8 @@ the FFT / screenshot sharing below):
   worst case. stackdepth.py follows the dyn calls (its `INDIRECT` list).
 - **FFT work buffer** (superseded the same day, [ram-budget.md](ram-budget.md): the
   screenshot capture buffer CAP is gone, the screenshot streams from the
-  panel, and the FFT work buffer lives in the disk scratch arena
-  `calbackup::SCRATCH` with an ownership check; SRAM free 10.9 -> 60.7 KB.
+  panel, and the FFT work buffer lives in the disk buffer arena
+  `diskbuf::ARENA` (then `calbackup::SCRATCH`) with an ownership check; SRAM free 10.9 -> 60.7 KB.
   As it was before that:) (8 KiB of the 12 KB `scope_page::FFT` in TCM): an
   arena with an explicit owner, the last 8 KiB of the screenshot capture
   buffer (`screenshot::CAP`, 48 KiB). The FFT renews a lease every time it
@@ -705,6 +797,415 @@ The variants (tools/build-variants/run.sh), B / C free and stack headroom
 | keep-screen | 16 428 / 4 724 / 20 500 B | 50 924 / 7 932 / 21 196 B |
 | mute (`--features mute`, not in build-variants) | | 50 572 / 7 808 / 21 196 B |
 
+### Region C audit #3 (2026-10-29, chore/region-c-headroom)
+
+On 3b142426 (0.3.1, `--features mute`) region C had 7 720 B free (below
+the 8 KiB warning), region B 50 572 B. The AD2 experiment DBG code goes
+back to region B, where region C audit #1 had put it (133f81e) and region
+B audit #4 took it out of (B at 15 KB then): `ad2exp` (DBG:AD2:TORN? /
+NOISE? / DCV? / N7?, E7's `dc_enter` / `dcv_row`), `main.rs` `dbg_dcv` /
+`dbg_n7`, `scpi::dcv_arg` / `n7_arg` (C +5 632 B, B -5 648 B). Their patterns are gone
+from [`link-native.x`](../link-native.x); no source changed. An nm diff
+of the two images: only these 21 symbols changed region (the
+`OUTLINED_FUNCTION_*` are renumbered, 8 B smaller in all). Code moved into
+B cannot stall the AD2 stream ISR (B is zero-wait), so the region C rule
+is not touched; `dc_enter` (in `Logger::start`, before the stream takes
+the bus) now runs from zero-wait flash.
+
+| | before (3b142426) | after |
+|---|---|---|
+| region A2 free | 2 396 B | 2 396 B |
+| region B free | 50 572 B | 44 924 B |
+| region C free | 7 720 B | 13 352 B |
+| stack headroom (static worst path) | 21 196 B | 21 196 B |
+| SRAM free | 43 912 B | 43 912 B |
+
+The variants (tools/build-variants/run.sh) after the move, B / C free and
+stack headroom (each gains the same ~5.6 KB of C):
+
+| variant | after |
+|---|---|
+| recovery-usb | 44 284 / 13 544 / 21 708 B |
+| recovery-file | 45 092 / 13 004 / 21 196 B |
+| no-ad2-isr | 54 736 / 14 568 / 21 640 B |
+| spi-disk | 63 028 / 23 480 / 22 692 B |
+| fatren-dry-run | 45 228 / 13 932 / 21 196 B |
+| keep-screen | 45 292 / 13 484 / 21 196 B |
+
+Next candidates if C gets tight again (DBG-only, still in C): `hyspi`
+(DBG:HYSPI:SELF? / WR?, 2.3 KB), `boot::put_info` (DBG:BOOT?, 1.6 KB).
+
+### Region B audit #9 (2026-10-30, feat/region-b-profile)
+
+Asked for: why so much code is in region B, and room for the decoder's
+`dec-log` / `dec-modbus` on test/scope-chain-0.4 (#174). Tool:
+[`tools/region-profile/rprof.py`](../tools/region-profile/rprof.py). It
+charges every byte of B to a function, a named static or a piece of
+anonymous rodata (cut at every address that code or data refers to, and
+charged to the referrers), with the innermost inlined callee and its
+module, and puts each item in a class:
+- `isr`: reachable from `ad2_stream_irq`;
+- `traced`: executed while `hy3131::HANDED` was set in an emulator run
+  (`DM40_BTRACE=DIR`, [`emu/peripherals/BTrace.cs`](../../emu/peripherals/BTrace.cs)),
+  or data such code refers to;
+- `loop`: reachable from `run` without passing through region C code, and
+  not executed under the stream in these runs: not exercised, not proven
+  cold;
+- `c-only`: reachable only through region C code, so it never runs under
+  the stream while the region C rule holds.
+
+Profile of #174 (e7c11934) with this branch merged, `--features
+dec-log,dec-modbus`. Traces: decodetest (MCX UART / Modbus, the Wave view)
+and an MCX scope page with CH2 on (timebases 1 ms .. 500 ms/div, STOP /
+RUN, a pan, the MF tabs, DEC:PROT UART) on the full-decoder build;
+wavetest on the default build (matched by function name).
+
+| class | code | data | total |
+|---|---|---|---|
+| `isr` | 6 234 | 114 | 6 348 |
+| `traced` | 233 344 | 48 568 | 281 912 |
+| `loop` | 169 830 | 8 503 | 178 333 |
+| `c-only` | 4 788 | 9 957 | 14 745 |
+| unreferenced (alignment) | | 294 | 294 |
+| `.data` load image | | 544 | 544 |
+| region B used | | | 482 176 |
+
+60 % of B ran under the stream in these runs. The largest `loop` items run
+under the stream in cases these runs do not reach: `App::gesture` / `tap`
+(touches in the Wave view and on the inrush page), `VDisk::read_block` and
+`dlog::Gen::*` (a host reading the USB volume during a stream),
+`gen::plan` / `Gen::apply` (SOUR:* from a host). `DmmView::reading` (7.7
+KB) is the DMM view, which the stream pauses. A move of a `loop` function
+to C needs a reason why it never runs under the stream.
+
+Not found: `core::fmt`; generic copies (every function with several
+monomorphisations: < 1 KB above the largest copy); compiler settings that
+help (the release profile is opt-level "z" already, so a separate "z"
+crate gains nothing; LLVM `-inline-threshold` 25 / 50 and opt-level "s"
+grow the image by 6 / 32 KB, -20 grows region B by 2 KB;
+`-Zinline-mir=no` changes nothing).
+
+Rodata: 16.3 KB of B are printable string runs. 10.0 KB of B's rodata is
+referred to only by region C code. It cannot move: region C is the fuller
+region, and an anonymous string has no section name for a link-native.x
+pattern (each would need a named static in a `.rodata.cold*` section, as
+`fastlog::JOB0`).
+
+Done:
+
+| change | region B | region C |
+|---|---|---|
+| README.TXT of the USB disk: one line per folder, the version and a link to the manual (3 075 -> 314 B of text; the file stays 2 048 B) | | |
+| on-screen help: 2 pages of 5 rows (gestures, keys) instead of 7 pages of 8 rows (1 359 -> 230 B of text) | +3 984 (both texts) | +36 |
+| DBG:HYSPI ([`src/hyspi.rs`](../src/hyspi.rs)) and DBG:ACDC? behind cargo features `dbg-hyspi`, `dbg-acdc` (without them: undefined header) | +432 | +3 132 |
+
+| | release/0.4.0 (ae0dc031) | this branch |
+|---|---|---|
+| region A2 free | 2 208 B | 2 208 B |
+| region B free | 8 728 B | 13 144 B |
+| region C free | 13 036 B | 16 204 B |
+| stack headroom (static worst path) | 20 744 B | 20 744 B |
+| SRAM free | 24 244 B | 24 244 B |
+
+#174 (e7c11934) with `--features dec-log,dec-modbus`:
+
+| | #174 | #174 + this branch |
+|---|---|---|
+| region A2 free | 156 B | 156 B |
+| region B free | 3 888 B (no link) | 9 328 B |
+| region C free | 1 536 B (no link) | 4 216 B |
+| stack headroom (static worst path) | 20 644 B | 20 644 B |
+| SRAM free | 8 308 B | 8 308 B |
+
+`dec-log` costs ~5 KB of region C (`.text.log_cold`), so with both
+features region C, not B, is the tighter region. Next, not done (bytes
+per decision):
+- more DBG replies behind features (region C): `boot::put_info` (DBG:BOOT?,
+  1.5 KB; a dozen emu tests read it), `touch_diag` (DBG:DIAG?, 0.7 KB),
+  `acdctr::Trace::text` (0.6 KB), `Dmm::ohm600_dbg` (DBG:OHM6, 0.5 KB),
+  `Sentinel::diag_text` (DBG:SENT?, 0.5 KB);
+- texts over ~300 B in B, unchanged: the power meter's zero / V cal
+  messages (487 B, `c-only`), the jack / overload codes (462 B), the
+  generator notes (450 B), the settings file keys (428 B, a file format),
+  the DBG:PROF? labels (368 B);
+- with room in region C: the `c-only` code (4.8 KB: `dlog::SEnc`,
+  `cring::min_max`, the gallery's `dlog` decoder copies, ...) and the
+  named `c-only` rodata, function by function under the region C hooks.
+
+### Region C audit #4 (2026-10-30, feat/dbg-shrink)
+
+The owner's decisions after region B audit #9: the remaining debug replies
+behind features, a smaller DBG:BOOT?, shorter texts.
+
+| change | region B | region C |
+|---|---|---|
+| `dbg-diag`: DBG:DIAG? (`touch_diag`, `Touch::diag`, `scope::debug`) | +520 | +652 |
+| `dbg-ohm6`: DBG:OHM6 (`Dmm::ohm600_dbg`) | +536 | +504 |
+| `dbg-sent`: DBG:SENTinel? / :REG? (`Sentinel::diag_text`, `Dmm::reg_text`) | -56 | +824 |
+| `dbg-src`: DBG:SRC (`dbgsrc_dmm`, `Dmm::src_text`; the same lines as test/scope-chain-0.4's feature) | +2 768 | +704 |
+| the four together | +3 528 | +2 688 |
+| DBG:BOOT? as `B2` + 57 hex words, one formatter loop, no PD6 fields | +624 | +1 128 |
+| power meter status lines, the generator's limit note, the fast log's header comment | +392 | +156 |
+
+Each feature's row: the build with that feature alone against the build
+with none (LTO places code differently per build, so the rows do not add
+up exactly). Without its feature a command is an undefined header; the emu
+tests that read one probe it and skip those checks. DBG:ACDC:TRACE is
+`acdc-trace` (feat/sram-extra-areas).
+
+| | release/0.4.0 (4cce2a4b) | this branch |
+|---|---|---|
+| region A2 free | 2 208 B | 2 208 B |
+| region B free | 17 592 B | 22 136 B |
+| region C free | 16 608 B | 20 580 B |
+
+### SRAM audit (2026-10-30, feat/sram-overlays)
+
+Goal: room for the long scope record (`scope::CAP` 42 K u16) next to
+0.4.0's GEN / CH2. The firmware runs DMM + scope + generator together, with
+the USB disk and BT at any time, so a buffer is overlaid only where the code
+rules out both being live. Who is live when:
+[ram-budget.md](ram-budget.md#every-static-of-1-kib-or-more).
+
+| change | SRAM | TCM |
+|---|---|---|
+| `csvlog::CAT` reply into the row FIFO (below) | +6 156 | -12 |
+| `bt::TX` 8 192 -> 6 656 B (below) | +1 536 | |
+| `touch::LOG` 160 -> 16 entries without `dbg-touch` | | +1 728 |
+| `prof::P` and the profiler hooks only with `dbg-prof` | | +984 |
+| `dmm::REC_COPY`, `vdisk::CSV_CUR2`, `lcd::DEFER` from `.sram_bss` to TCM `.bss` (CPU only, no DMA) | +2 688 | -2 688 |
+
+The profiler hooks also leave region B (+4.2 KB). DBG:TOUCH? / DBG:TOUCH 0
+and DBG:PROF? / DBG:PROF:RESET are undefined headers without their
+features. A `--features dbg-touch,dbg-prof` build puts both buffers in
+`.sram_bss` (TCM has no room for them next to the stack); host tests build
+touch.rs with `dbg-touch`.
+
+**MMEM:CAT? cache in the row FIFO.** `Cat` keeps only `ok` / `stamp` /
+`len`; the reply is in `FIFO_BUF[..CAT_MAX]`
+([csvlog.rs](../src/csvlog.rs) `Cat`).
+- Writers of the FIFO: a CSV recording (`fifo()`, main loop) and a fast-log
+  session (`lend_fifo()`, main loop: `Job::run`, the drain / flush,
+  `run_begin`). No ISR touches it: the AD2 stream ISR writes only
+  `logger::RING`.
+- Both accessors clear `ok`. The cache is written only while `fifo_idle()`
+  (`!csvlog::active() && !fastlog::active()`): in `catalog_warm` and after
+  a scan in `catalog_scpi`. It is read only while `ok`.
+- A fast-log session holds the disk (`gallery_free` false: MMEM:CAT? is
+  Busy) and writes it, so it loses no valid cache.
+- During a CSV recording every MMEM:CAT? reads the disk (~10 block reads).
+  Before, a second query between two commits (every commit writes the
+  flash, at most 60 s apart) was a copy. No stream that the cache is for
+  runs then: the Wave view and inrush refuse to start during a recording,
+  CH2 stops for one ([app_wave.rs](../src/app_wave.rs),
+  [app_inrush.rs](../src/app_inrush.rs), [app_ch2.rs](../src/app_ch2.rs)
+  `csvlog::active`), and the inrush page and `fastlog::begin` also refuse
+  a fast-log session. An SCPI LOG:STATe ON session never warmed the
+  cache.
+
+**`bt::TX` not at 4 KiB.** A BT reply goes into the ring whole (`send`).
+`Bt::respond_with` builds it on the stack and returns, so a 6 145-byte
+reply (MMEM:CAT?, MMEM:DATA?, LOG:DATA?, INRush:DATA?, WAV:DATA?) has nowhere
+else to wait. Sending it in parts would need one of:
+- a wait in the main loop (~0.2 s at 115 200 baud): the Wave view's ring
+  drops samples, which the MMEM:CAT? cache exists to prevent;
+- building the reply again per part: LOG:DATA? takes records out of the
+  logger's ring, so it cannot be built twice;
+- a shorter BT block: `tools/dm40scpi.py get` takes an MMEM:DATA? piece
+  under 6 000 bytes as the end of the file.
+
+The ring is now REPLY_MAX + TX_SLACK + 255 B.
+
+Pairs checked and not overlaid (each can be live with the other):
+
+| pair | why both can be live |
+|---|---|
+| `vdisk::TAB` / `dlog::CSV` with any scope buffer | the host reads the USB volume at any time, also while the scope page draws |
+| `logger::RING` with `csvlog::FIFO_BUF` | a fast-log session drains the ring into the FIFO (`fastlog` `Job::run`) |
+| `logger::RING` with `csvlog::TAIL` | LOG:STATe ON does not refuse a recording, nor LOG:CSV ON a host session or CH2 (`App::rec_conflict` covers the Wave view and the inrush page only) |
+| `scope_ch2::STORE` with `csvlog::TAIL` / `FIFO_BUF` | a recording can start while CH2 streams (as above); the FIFO head is the MMEM:CAT? cache that CH2 streams use |
+| `diskbuf::ARENA` with `csvlog::TAIL` | a commit uses ARENA [0] / [1] and TAIL together |
+| `fastlog::JOB` with `csvlog::JOB` | the sessions exclude each other, but each job keeps its result for LOG:CSV? / the fast logger's status after it ends |
+| `bt::TX` with the USBTMC reply buffer | both transports answer at the same time |
+| `scope_ui::GRAPH`, `scope_page::CACHE` with the inrush page | no inrush-only buffer to put there (the inrush record is `scope::BUF`, lent) |
+| `gen::WAVE` | the DAC's circular DMA source while the generator outputs, with everything |
+
+Not changed here: `dmm::acdctr::TR` (5 388 B, DBG:ACDC:TRACE); the next
+section puts it behind a feature.
+
+| | before (release/0.4.0, e3229f7a) | after |
+|---|---|---|
+| region A2 free | 2 208 B | 2 208 B |
+| region B free | 8 280 B | 12 400 B |
+| region C free | 13 556 B | 13 996 B |
+| stack headroom (static worst path) | 20 744 B | 20 760 B |
+| SRAM free | 24 244 B | 34 628 B |
+
+### AC+DC trace behind a feature (2026-10-30, feat/sram-extra-areas)
+
+The owner does not want DBG:ACDC:TRACE in the firmware. The cargo feature
+`acdc-trace` ([Cargo.toml](../Cargo.toml), off by default; the same feature
+as on `test/scope-chain-0.4`, commit 33dd4cb9) builds it:
+- without it [acdctr.rs](../src/acdctr.rs) keeps one ring entry, `live()`
+  is constant false and the `Dmm` hooks test `acdctr::ON` first, so their
+  code is dropped; DBG:ACDC:TRACE[?] is an undefined header;
+- with it the ring has 64 entries (was 192) and 32 events after the
+  trigger (was 48).
+
+| | before (0e7ffa6e) | after |
+|---|---|---|
+| region B free | 12 872 B | 13 912 B |
+| region C free | 13 476 B | 14 188 B |
+| SRAM free | 34 628 B | 39 980 B |
+
+`--features acdc-trace`: SRAM 38 212 B, B 12 888 B, C 13 508 B.
+
+### AC+DC methods behind a feature (2026-10-31, feat/acdc-meth)
+
+The AC+DC prototype methods B and C ([acdcm.rs](../src/acdcm.rs),
+[acdc-approaches.md](acdc-approaches.md) section 10) are debug code: the
+cargo feature `acdc-meth` (off by default) builds them. Without it
+`dmm.rs` has an empty `am` module (`am_on()` constant false, so method A's
+code is as before and the hooks are dropped), no `AM` static, and
+DBG:ACDC:METH / STAT? / ZERO / R0 are an undefined header. DBG:ACDC:RANG
+stays.
+
+| | before (fe59a782) | after |
+|---|---|---|
+| region B free | 25 032 B | 31 536 B |
+| region C free | 21 216 B | 24 316 B |
+| SRAM free | 45 460 B | 45 940 B |
+
+`--features acdc-meth`: SRAM 45 460 B, B 24 840 B, C 21 216 B.
+
+### Extra RAM areas (2026-10-30, feat/sram-extra-areas)
+
+The device probe of [PR #183](https://github.com/opendm40/opendm40/pull/183)
+found two RAMs outside [link-native.x](../link-native.x)'s TCM + SRAM, both
+~5 cycles a load:
+
+| area | range | size | kept over |
+|---|---|---|---|
+| backup SRAM after the settings record | `0x40024124..0x40024FE7` | 3 780 B | a reset and an update, not a power-off |
+| USBHS FIFO RAM (the DM40 has no USBHS port) | `0x40060000..0x40060FFF` | 4 KiB | needs `RCU_AHB1EN` bit 29 (USBHSEN); **32-bit stores only** |
+
+**The USBHS FIFO RAM ignores the store size.** A byte store writes the
+whole 32-bit word, the stored byte in all four lanes (a halfword store
+both halves: *inferred*). A CSV
+recording with `csvlog::TAIL` written byte by byte left every word of the
+DLG as one byte ×4 (`DLG1` → `31 31 31 31`), and `MMEM:DATA?` of its CSV
+answered -250 "Mass storage error". Reads of any size and word stores
+work. So a buffer there is a `WordRam` ([wordram.rs](../src/wordram.rs)):
+declared only by its `usbhs_static!`, reached only by `read(i)` /
+`write(i, u32)`, one volatile word access each; partial words are merged
+in a register and written whole. build.sh fails when `.usbhs_bss` is
+named outside wordram.rs. The probe results:
+[PR #183](https://github.com/opendm40/opendm40/pull/183) `hidden-memory.md`.
+
+**Link.** Two `MEMORY` regions and three NOLOAD sections:
+- `.bkp_record` holds `persist::RECORD_SPACE`, a `[u32; WORDS + 3]` that
+  is never accessed: it puts the settings record's size from
+  [persist.rs](../src/persist.rs) into the link. Asserted at 0x40024000 and
+  non-empty.
+- `.bkp_bss` follows it; asserted to start at or after the record's end and
+  to end at or below `0x40024FE8` (`persist::BKP_SEQ`: the sequence words,
+  then the boot words; persist.rs asserts the same constant).
+- `.usbhs_bss`, asserted inside the 4 KiB; only `wordram::usbhs_static!`
+  places anything there (build.sh).
+
+**Boot.** `native::extra_ram_init`, right after `init_ram` and before the
+recovery / normal split: `boot::bkp_enable` (PMU clock, BKPWEN, BKPSRAM
+clock), USBHSEN, then both sections zeroed word by word. `.bss` zeroing
+does not cover them; the backup SRAM keeps the previous image's bytes over
+a reset; the FIFO RAM is random after power-up. `board::init` sets USBHSEN
+too. The record and the words above `.bkp_bss` are never written.
+
+**What moved.** CPU-only buffers, none touched by DMA and none on the AD2
+stream ISR's paths:
+
+| buffer | size | area | from | who touches it |
+|---|---|---|---|---|
+| `csvlog::TAIL` (`WordRam<1024>`) | 4 096 | USBHS | SRAM `.dmabuf` | `rec_start` (C: 0xFFFFFFFF word fill); `csvlog::poll` while a CSV recording commits: the FIFO bytes packed into words (`put_bytes`: the partial first / last word read, merged, written back), then `write_step`, which reads it word by word (wordram.rs `BlockSrc`; the SPI flash takes it by CPU writes) |
+| `screenshot::JOB` | 452 | backup | SRAM `.dmabuf` | `init`; per pass `busy` / `frozen` flags (tick, run, msc poll); the shot itself is C (`step`, `finish`) |
+| `vdisk::MIR` | 144 | backup | `.sram_bss` | `mir_read` (a host read of the mirror file), `Scpi::handle`, `mirror_boot` (C) |
+| `vdisk::STATE` | 372 | backup | SRAM `.dmabuf` | `init` (C); a few field loads per 512-byte sector in `read_block` / `read_busy` / `read_wait` |
+| `upload::UP` | 368 | backup | `.sram_bss` | per pass `active` flag; the upload is C (`begin`, `data_msg`, `flush`, `end`) |
+| `scope_csv::PLAN` | 264 | backup | SRAM `.dmabuf` | C only (`sp_save_csv`, `screenshot::step`) |
+| `app_touchtest::TT` | 168 | backup | `.sram_bss` | C only (the touch test page) |
+| `prof::P` (`dbg-prof` builds) | 984 | backup | `.sram_bss` | the profiler hooks (debug) |
+
+Proofs:
+- **DMA.** Every DMA memory address the firmware programs: `bt::RX` /
+  `bt::TX` (bt.rs, `*_M0ADDR`), `scope::LATCH` and the scope record
+  (scope.rs, S3 / S4; `scope::BUF` or the inrush record lent from it),
+  `gen::WAVE` (gen.rs, S5), and the HY3131 SPI frames `TXI` / `RXI` /
+  `TXB` / `RXB` (logger.rs → hy3131.rs `dma_arm`). None of the buffers
+  above. (`.dmabuf` held PLAN, JOB, STATE only as NOLOAD SRAM.) USBFS moves
+  its FIFO by CPU, the LCD is CPU writes over FSMC, the SPI flash has no DMA.
+- **The AD2 stream ISR.** build.sh disassembles every function reachable
+  from `ad2_stream_irq` (34 today) and fails when one holds an address in
+  `.bkp_bss` or `.usbhs_bss` (literal-pool word or movw / movt pair). The
+  addresses the ISR loads are TCM / SRAM statics (`logger::isr::*`, its
+  DMA frames) and peripherals. In the `no-ad2-isr` variant the main-loop
+  sampler (`Logger::poll` / `sample`, inlined into `run`; `Producer::push`
+  / `tick`) names none of the moved modules, and push / tick hold no such
+  address.
+- **Hot paths.** Region C code never runs while a stream does
+  ("The slow flash bank while an AD2 stream runs"), so the C-only buffers
+  are idle then. The rest cost a few 5-cycle loads per main-loop pass
+  (flags) or per USB sector. `csvlog::TAIL` is touched once per commit of
+  a CSV recording: the bytes are packed in a register, one 5-cycle word
+  store per 4 bytes (before: a 5-cycle store per byte), and `write_step`
+  reads 1 024 words per pass (compare, program, read back) through a
+  `BlockSrc` call. *Estimated* ≤ 40 000 cycles (0.2 ms) per 4 KiB block,
+  spread over the `write_step` slices, next to the 3 × 4 096 SPI byte
+  transfers and a block program of several ms. A recording refuses the Wave view and
+  inrush and stops CH2; only an SCPI LOG:STATe ON session can stream
+  meanwhile, and the ISR does not wait for the main loop.
+- **Size.** The link asserts above; build.sh prints both areas' free bytes.
+
+Checked and left where they are:
+
+| buffer | why not |
+|---|---|
+| `lcd::DEFER` | read by every `fill_rect` / `set_window_cmd` (the drawing hot path, also while the scope streams) |
+| `dlog::CSV` | the CSV generators of the USB volume and MMEM:DATA? that run in place, per byte of a host read |
+| `fastlog::JOB`, `csvlog::JOB`, `scope_wav::SCREEN` | per sample / row / frame while a stream or a recording runs |
+| `vwrite::W0` (1 376) | read on every pass and every USB sector read by many region B functions; the next candidate if SRAM gets short |
+| `ui::GEN_SP`, `dmm::REC_COPY`, `gallery::G`, `scope_csv::SNAP` | fit and are cold, but they are in TCM on the scope chain, where SRAM is short; room kept for `prof::P` |
+| `touch::LOG` (`dbg-touch`, 1 924), `acdctr::TR` (`acdc-trace`, 1 804) | do not fit next to `prof::P`; stay in `.sram_bss` |
+
+`emu/dm40.repl` maps the FIFO RAM as
+[WordOnlyRam.cs](../../emu/peripherals/WordOnlyRam.cs): a byte store writes
+the byte into all four lanes of its word, as on the device (a halfword
+store both halves: *inferred*); the clock gate is not modelled. The backup
+SRAM was already plain memory, kept over DBG:RESET, zero in a new run.
+[emu/xramtest.py](../../emu/xramtest.py) fills both areas with 0xA5 before
+the firmware starts, saves a setting, takes a screenshot, records a CSV
+long enough for several commits and a second 4 KiB block, reads its DLG
+and CSV with MMEM:DATA? and compares the CSV with
+[dlog.py](../tools/dlog.py) of the DLG byte for byte, opens the touch test
+page, then DBG:RESET: SETTINGS,BKP with the same record sequence number,
+the setting kept, and the same steps work again. The byte-written TAIL
+fails it.
+
+| | before (11eb22cc) | after |
+|---|---|---|
+| region B free | 13 912 B | 13 912 B |
+| region C free | 14 188 B | 14 104 B |
+| stack headroom (static worst path) | 20 760 B | 20 736 B |
+| SRAM free | 39 980 B | 45 852 B |
+| backup SRAM free | | 2 008 B |
+| USBHS RAM free | | 0 B |
+
+Feature builds (SRAM / backup SRAM free): `dbg-prof` 45 852 / 1 016,
+`dbg-touch` 43 932 / 2 008, `acdc-trace` 44 084 / 2 008, all three
+42 164 / 1 016 (region B 8 688).
+
+Device checks still open:
+- The supply current with USBHSEN on (*unknown*).
+- The settings record and file over power cycles with this image.
+
 ### Flash outside the image (2026-10-22, from the 2026-10-13 dump; not tried)
 
 The GD32F427 here has 1 MiB (flash density 0x0400 at `0x1FFF7A22`, as
@@ -771,9 +1272,11 @@ The letter-number tags (B2, H2, ...) are items of the safety review
 4. FPU on (CPACR).
 5. `SP = 0x10010000`.
 6. `VTOR = 0x08004000`.
-7. Call `shim_main` → `boot::shim(false)`. This uses only the stack, no
+7. Call `shim_main` → `boot::shim()`. This uses only the stack, no
    `.data`/`.bss`:
 
+0. **PA2 entry:** backup SRAM on; if `BKP_REQ` = `0x4C324150`,
+   `loader_pa2()` ("PA2 entry" above); it does not return.
 1. **Watchdog:** `wdt::start::fwdgt()` writes `0xCCCC`, `0x5555`, waits
    (bounded) for PUD/RUD, sets PSC = 6 (/256) and RLD = 2500 (~16–20 s), then
    `0xAAAA`. From here on any hang resets into the shim. Every wait below
@@ -786,8 +1289,7 @@ The letter-number tags (B2, H2, ...) are items of the safety review
        so one of them holds the power (which one is unknown:
        [hw/README.md, Power and battery](../../hw/README.md#power-and-battery)).
    - **Light:** the backlight goes full on right away, as plain GPIO PA6 high
-     (H2). A normal power-on press therefore lights the screen within
-     milliseconds and the user lets go.
+     (H2): the power-on press lights the screen within milliseconds.
    - `board::init` later hands PA6 to TIM13 with the duty at 0, until
      `App::new` sets the level.
 3. **Reset flags:** read `RCU_RSTSCK` (`0x40023874`), write RSTFC (bit 24),
@@ -799,7 +1301,8 @@ The letter-number tags (B2, H2, ...) are items of the safety review
    (`FUN_0800b7e0` in `stock/re/analysis/app_decompile.c`:
    input, PUPD = 2). Then about 10 µs for the pull to settle.
    - The ROM and loader leave PD6 floating, so without this a floating 1
-     would read as a held key.
+     would read as a held key (the `recovery-usb` variant reads the key
+     without `board::init`).
    - Pressed = 1 is confirmed in the stock code.
 5. **Clock:** try `init_core(Hxtal)`, then `init_core(Irc16m)`. If both fail,
    SYSCLK stays on the 16 MHz RC (`clock` = FAILED).
@@ -817,36 +1320,15 @@ The letter-number tags (B2, H2, ...) are items of the safety review
    - Every wait is a bounded poll.
    - The ROM and the loader spin forever on a dead HXTAL. So a failure here
      can only be transient (M4).
-6. **DWT cycle counter on.**
-7. **Backup SRAM:** enable access, then:
-   - read and **consume** the request word;
-   - read the previous-mode word;
-   - read the crash counter.
-8. **Key gesture** (H2). It applies only if PD6 reads pressed:
-   - Wait while the key stays pressed for up to **4 s** (`HOLD_MS`). A release
-     counts after 30 ms (bounce). A cycle-counter-independent iteration cap
-     also bounds the wait (L1).
-   - **The cap fails safe** (review N1): reaching it means the cycle counter
-     does not advance, so it is treated as a **release**, never as "held". It
-     is checked before the time limit. A stopped counter therefore cannot
-     confirm the gesture or zero the marker: the first window ends in a normal
-     boot reported as `KEY_HOLD_ABORTED` with `hold_ms` = 4000 and no cue (an
-     abort with no beep heard means a stuck DWT counter); in the confirm
-     window it is an abort. The cap is `(limit + 100) × cyc_per_ms / 8` passes;
-     a pass is about 20 cycles, so with a running counter
-     the time limit always comes first. With a stopped counter the first
-     window ends after about 10 s of holding (watchdog fed).
-   - The cue's per-half-period pass cap is `half / 2`, so even a counter that
-     stops during the cue ends it after about 1 s. The cue decides nothing.
-   - Released earlier → normal boot.
-   - At 4 s comes the **cue**: the backlight goes off, a ~0.3 s beep sounds
-     (buzzer PA7 toggled as GPIO at ~2.7 kHz), then the backlight comes back.
-   - The key must then **still be held for 0.5 s** (`CONFIRM_MS`):
-     - still held → recovery;
-     - released in that window → **aborted** → normal boot (`KEY_HOLD_ABORTED`).
-   - **Final gesture:** hold the power key from power-on until the beep, about
-     4 s, and keep holding at least 0.5 s after it.
-9. **Decide.** The first matching row wins.
+6. **Backup SRAM:** read and **consume** the request word; read the
+   previous-mode word and the crash counter.
+   **Key hold** (`key_gesture`, DWT cycle counter): key held 4 s after the
+   shim started → cue (backlight off, ~0.3 s beep on PA7 as plain GPIO,
+   backlight on); still held 0.5 s more → `BKP_REQ` = `0x4C324150`,
+   SYSRESETREQ → step 0 on the next pass. Released in the 0.5 s →
+   `KEY_HOLD_ABORTED`, normal boot. Every wait has a pass cap that counts as
+   a release (N1).
+7. **Decide.** The first matching row wins.
 
    A watchdog reset is **genuine** (one of our own hangs) when FWDGTRSTF is set,
    neither SWRSTF nor PORRSTF is set, and `BKP_LAST` = NRML (H3). The shim
@@ -856,41 +1338,33 @@ The letter-number tags (B2, H2, ...) are items of the safety review
 
 | Condition | Mode | `reason` |
 |---|---|---|
-| `BKP_REQ` = `0x52454356` (consumed) | recovery | `REQUESTED` |
-| key gesture confirmed | recovery | `KEY_HOLD` |
-| key held to the cue, released within 0.5 s | normal | `KEY_HOLD_ABORTED` |
-| clock failed or genuine watchdog, crash counter +1 reaches `CRASH_MAX` (2) | recovery | `CLOCK_FAIL` / `WATCHDOG` |
-| clock failed, counter below 2 | **SYSRESETREQ**, retry the boot | (`CLOCK_FAIL`) |
-| genuine watchdog, counter below 2 | **normal** | `WDT_RETRY` |
+| `BKP_REQ` = `0x52454356` (consumed; set by nobody now) | recovery | `REQUESTED` |
+| key held to the cue, released in the 0.5 s | normal | `KEY_HOLD_ABORTED` |
+| clock failed, crash counter +1 below `CLOCK_RETRIES` (2) | **SYSRESETREQ**, retry the boot | (`CLOCK_FAIL`) |
+| clock failed, counter +1 at 2 or more | normal, on the clock it has | `CLOCK_FAIL` |
+| genuine watchdog (crash counter +1) | **normal** | `WDT_RETRY` |
 | FWDGTRSTF, previous mode = recovery | normal | `WDT_AFTER_RECOVERY` |
 | FWDGTRSTF otherwise (stale / with SW or POR / unknown previous mode) | normal | `WDT_STALE` |
 | otherwise | normal | `NONE` |
 
-10. **Hand over:** the previous-mode word and the crash counter are updated
-    as follows:
-    - Write the chosen mode to `BKP_LAST`.
-    - On recovery, clear the crash counter: a fresh start after the
-      reinstall.
-    - Call `native::start`.
+8. **Hand over:** the previous-mode word and the crash counter are updated
+   as follows:
+   - Write the chosen mode to `BKP_LAST`.
+   - On recovery, clear the crash counter: a fresh start after the
+     reinstall.
+   - Call `native::start`.
 
-**Crash counter** (M1, M4):
-- **Single hang or panic:** the first genuine watchdog reset only reboots
-  normally (`WDT_RETRY`). The counter shows in `DBG:BOOT?`. A panic stops
-  feeding, so it ends in the same watchdog reset.
-- **Second crash:** a second one without 60 s of healthy main loop in between
-  takes recovery.
-- **Healthy clear:** `boot::mark_healthy(now_ms)` clears the counter once after
-  60 s of main loop (called at the top of the main loop in
-  [`src/main.rs`](../src/main.rs)). `now` counts from the start of `main` (after `pre_main`), so the
-  window is **60 s of running main loop since the last boot**, not 60 s
-  between two resets: a watchdog reset comes ~20 s after the hang, so two
-  resets up to ~80 s apart (minus the boot time) still take recovery, and
-  with DBG:RELEASE (the loop keeps running, unfed) the clear can also land
-  inside the 20 s. Emulator test: [`emu/recoverytest.py`](../../emu/recoverytest.py)
-  (wdt-two, wdt-two-70, wdt-healthy).
-- **Clock failure:** handled the same way. The first one retries the boot with
-  a SYSRESETREQ, which redoes the ROM/loader clock set-up. Only a repeat takes
-  recovery.
+**Crash counter** (M1, M4): a diagnostic only (`DBG:BOOT?` `crash_word`).
+- Every genuine watchdog reset adds 1 and reboots normally (`WDT_RETRY`);
+  no count leads to the loader (removed in 0.4.0, owner 2026-10-29). A
+  panic stops feeding, so it ends in the same watchdog reset.
+- `boot::mark_healthy(now_ms)` clears it once after 60 s of running main
+  loop since the boot ([`src/main.rs`](../src/main.rs)), so it shows the
+  hangs in a row. Emulator test: [`emu/recoverytest.py`](../../emu/recoverytest.py)
+  (wdt-one, wdt-two, wdt-three, wdt-healthy, release).
+- **Clock failure** counts too: while the count is below 2 it retries the
+  boot with a SYSRESETREQ, which redoes the ROM/loader clock set-up; after
+  that opendm40 runs on the clock it has (`CLOCK_FAIL`).
 
 **Backup-SRAM words** (4 KiB at `0x40024000`; [`src/persist.rs`](../src/persist.rs)
 keeps the settings record from `0x40024000` and two sequence words at
@@ -899,17 +1373,17 @@ keeps the settings record from `0x40024000` and two sequence words at
 | Address | Use |
 |---|---|
 | `0x40024FF0` `BKP_CRASH` | crash counter `0x435200nn` |
-| `0x40024FF4` `BKP_TRIG` | last recovery result: `0x54520010` marker zeroed, `0x54520011` failed |
-| `0x40024FF8` `BKP_REQ` | recovery request word (`0x52454356`), consumed by the shim; currently set by nobody |
-| `0x40024FFC` `BKP_LAST` | mode of the previous boot: `0x4C4D524E` normal / `0x52564352` recovery; **cleared by `DBG:UPDATE`/`DBG:RECOVER`** (H3) |
+| `0x40024FF4` `BKP_TRIG` | last loader entry: `0x54520010` marker zeroed, `0x54520011` failed, `0x54520012` PA2 entry, `0x54520013` PA2 entry without the lock read back |
+| `0x40024FF8` `BKP_REQ` | request word, consumed by the shim: `0x4C324150` PA2 entry (`DBG:LOADER`, key hold); `0x52454356` recovery (set by nobody now) |
+| `0x40024FFC` `BKP_LAST` | mode of the previous boot: `0x4C4D524E` normal / `0x52564352` recovery or PA2 entry; **cleared by `DBG:UPDATE`** (H3) |
 
-**No reset loop takes control away from the user:**
-- **A broken recovery does not repeat itself.** A hang in recovery
-  (previous mode = recovery) is followed by a normal boot.
-- **Hangs in normal mode retry first.** They reboot normally once, then
-  recovery takes over.
-- **Recovery itself is three flash word writes plus a reset.** After it, the
-  vendor loader owns the unit until a valid install.
+**A hang that repeats on every boot** (opendm40 dies before its USB is
+up) is a reboot every ~20 s. The key hold at power-on still reaches the
+loader, because the shim reads the key before `native::start`; if the shim
+itself hangs, only the TX-GND short is left
+([hw/README.md, Hardware recovery](../../hw/README.md#hardware-recovery)).
+A broken recovery (request word) does not repeat itself: a hang in recovery
+(previous mode = recovery) is followed by a normal boot.
 
 **First boot after an install:**
 - After a loader install (SW reset) or a power-on, FWDGT is never "genuine",
@@ -977,7 +1451,7 @@ but nothing can make that installed copy bootable again except a vendor install
 [the manual, Install a file from the update loader](../../docs/manual/README.md#install-a-file-from-the-update-loader).
 
 **Other entries** to the same state from a running native opendm40:
-- `DBG:UPDATE`, or its alias `DBG:RECOVER`:
+- `DBG:UPDATE`:
   - Clear `BKP_LAST` (H3), zero the marker, then the deferred SYSRESETREQ.
   - "Flash error" with no reset only if the marker did not read back as zero.
   - **Sync and eject** a just-copied file first (L5).
@@ -1058,53 +1532,36 @@ pins: [hw/README.md, Pin table](../../hw/README.md#pin-table)):
 **Watchdog policy:**
 - **Main loop feeds while it runs:** `INITIAL_HOLD_MS` = `u64::MAX/4`, so the
   loop feeds the FWDGT for as long as it runs.
-- **Hang or panic → retry, then recovery:** a panic shows the magenta bar and
-  stops feeding; a hang stops feeding too.
-  - The first FWDGT reset reboots normally (`WDT_RETRY`, crash counter 1).
-  - A second one without 60 s of healthy main loop in between goes to recovery.
+- **Hang or panic → reboot:** a panic shows the magenta bar and stops
+  feeding; a hang stops feeding too. Every FWDGT reset reboots normally
+  (`WDT_RETRY`, crash counter +1).
 - **`DBG:RELEASE`:** stop feeding, so a WDT reset follows after about 20 s.
-  - It counts as a crash, the same as a hang.
-  - Twice in a row it zeroes the marker.
+  It counts as a crash, the same as a hang.
 - **`DBG:RESET`:** SYSRESETREQ → normal boot.
 - **`DBG:UPDATE` / `DBG:RECOVER`:** `boot::enter_loader_update`: clear the
   previous-mode word `BKP_LAST` (H3) **and reset the crash counter**
-  `BKP_CRASH` to `0x43520000` (N2: a count of 1 left from this session must not
-  survive the stock interlude and turn the first hang after the reinstall into
-  recovery), zero the loader marker, then SYSRESETREQ → the vendor update
+  `BKP_CRASH` to `0x43520000` (N2: the count starts at 0 after the
+  reinstall), zero the loader marker, then SYSRESETREQ → the vendor update
   screen with its USB disk (see Recovery).
-- **`DBG:BOOT?`** returns, in order:
-  - `rstsck`, `rstsck_after`, `NORMAL|RECOVERY`, `reason`,
-    `HXTAL|IRC16M|FAILED`, `last`, `hold_ms`;
-  - `bcr1`, `btr1`, `bwtr1`, `lcd_id`: the FSMC values found before
-    `board::init` rewrote them;
-  - `fatren_status`, `found`, `renamed_8.3`, `old_backup`, `old_deleted`,
-    `freed_clusters`, `others`, `rcvr_deleted`, `last_trigger`;
-  - `marker_w0`, `marker_w1`, `marker_w2`, `VALID|INVALID`;
-  - `crash_word` (`0x435200nn`), `HEALTHY|-`, `fmc_last` (0 = clean);
-  - `PD6`, `moder`, `pupd`, `idr`: the power-key pin, read live at query time:
-    `MODER[13:12]` (0 = input), `PUPD[13:12]` (**2 = pull-down**, B2),
-    `IDR` bit 6 (1 = pressed); the pull-down is the shim's `pd6_input`.
-    Expected `PD6,0,2,0` with the key released;
-  - then `native::put_extra`: `STAGED,<n>`, `CALBK,<status>,<written>,<conflict>,<differs>`,
-    `STACK,<used>,<size>`, `CALMS,<ms>`, `SPICLK,<div>,<check>`,
-    `FATDIR,<ok>,<created>,<failed>`, `CALREC,<OK|BADCRC>` (the calibration
-    record's CRC at start-up, dmm.rs `load_record`), `SETTINGS,...` ("Stack depth" and "Unit
-    data" below), then the start-up phase times in ms (`native::put_times`):
-    `BOOTMS,<board>,<fatren>,<calbk>,<fatdir>,<setfile>,<mirror>,<vdisk>,<refresh>`
-    (each phase's own time; `board` includes the splash; `vdisk` and
-    `refresh` run after the first frame, before USB attaches) and
-    `MAINMS,<app>,<frame>,<touch>` (main's clock after App::new, the first
-    frame and the touch reset). [`tools/dm40dbg.py`](../tools/dm40dbg.py) `boot` decodes it.
-  
+- **`DBG:BOOT?`** returns `B2`, 57 hex words and fatren's renamed 8.3 name
+  (field list: [SCPI reference, DBG:BOOT?](../../docs/manual/scpi-reference.md#dbgboot);
+  [`tools/dm40dbg.py`](../tools/dm40dbg.py) `boot` decodes it): mode,
+  reason, clock, reset flags, `last`, `last_trigger`, the marker words and
+  their validity, `crash_word` (`435200nn`), healthy, `fmc_last`, the FSMC
+  values found before `board::init` rewrote them, fatren's result, the
+  calibration safety copy, the stack high-water mark, the SPI-flash clock,
+  fatdir, the calibration record's CRC, the settings fields and the
+  start-up phase times (`native::boot_words`).
+
   `last_trigger` codes: `0x54520010` = marker zeroed, `0x54520011` = zeroing
   failed. With `recovery-file`, `0x5452000n`, n = 0 Created, 1 AlreadyThere,
   2 NoMedium, 3 BadBpb, 4 NoSpace, 5 Error.
-- **`DBG:PING?`:** its `keepalive_left` field means nothing (it is a
-  truncated `u64::MAX/4`).
+- **`DBG:PING?`:** its `keepalive_left` field saturates at `4294967295`
+  (`u32::MAX`): the boot hold (`u64::MAX/4`) reads as no limit.
 - **Power-off** (key held 1.5 s, or idle timeout): if the unit stays
   powered (USB), `wdt::powered_off()` turns the backlight off and keeps
   feeding. The next key press after a release reboots normally. Without this,
-  a charging meter would land in recovery 20 s after the idle shutdown.
+  a charging meter would reboot 20 s after the idle shutdown.
 
 ## fatren (`src/fatren.rs`)
 
@@ -1253,8 +1710,8 @@ create = clusters zeroed (`.` / `..` in the first block) → chain in every
 FAT copy → root entry (attribute 0x10, size 0); grow = new clusters zeroed →
 their chain → the old last cluster linked. A power cut anywhere = at worst
 lost clusters (host-tested with a cut before every block write).
-`DBG:BOOT?` appends `FATDIR,<ok>,<created>,<failed>` (bit i = LOGS, SHOTS,
-SCOPE).
+`DBG:BOOT?` reports fatdir's ok / created / failed masks (bit i = LOGS,
+SHOTS, SCOPE).
 
 **Files of ours from earlier builds stay in the root** (no boot-time move:
 a move is two directory writes with a window in which either two live
@@ -1353,10 +1810,10 @@ first cluster: allocation is append-only, a compaction keeps the order); a
 subdirectory sector = `.` / `..` + the files of that directory by slot; data
 → the owning file (MCU regions by byte loads, `BACKUP.TXT` / `README.TXT`
 through a windowed text writer, `FIRMWARE.BIN` encoded per 128-byte block,
-SPIFLASH by raw SPI reads, a CSV through the cached `dlog::Gen`, a BMP
+SPIFLASH by raw SPI reads, a CSV through a cached `dlog::Gen` (`dlog::CSV`: two, shared with MMEM:DATA?), a BMP
 through a cached FAT chain cursor). `DBG:VDISK:STAT?` → `<files>,<next free
 cluster>,<files left out>`; `DBG:VDISK:RD?` → `<read_block calls>,<their
-total ms>,<max us>,<CSV generator opens>,<SPI flash reads>,<their bytes>,<kind-3
+total ms>,<max us>,<CSV generator opens (USB and MMEM:DATA?)>,<SPI flash reads>,<their bytes>,<kind-3
 seeks not from the cursor>,<chunk headers read>,<rows decoded>`
 (cumulative since boot; diff two readings around a copy); `DBG:VDISK:EJECT n` = "no medium" for n commands,
 then a UNIT ATTENTION (the earlier ADD / FORCE experiment hooks are gone).
@@ -1865,10 +2322,9 @@ accepts it; a name taken by a directory or volume label is skipped
 (`conflict`); not enough free clusters / root slots → `NOSPACE`, nothing
 written.
 
-**Status** (`calbackup::result()`), appended to `DBG:BOOT?` by
-`native::put_extra`: `CALBK,<status>,<written>,<conflict>,<differs>`, status
-`NOTRUN|NOMEDIUM|BADBPB|SAFECOPY_PRESENT|SAFECOPY_WRITTEN|NOSPACE|ERROR`;
-written / conflict / differs = decimal bit masks (bit 0 CALIB, 1 BOOTDATA,
+**Status** (`calbackup::result()`), in `DBG:BOOT?` (`native::boot_words`):
+status `NOTRUN|NOMEDIUM|BADBPB|SAFECOPY_PRESENT|SAFECOPY_WRITTEN|NOSPACE|ERROR`
+(as numbers 0..6); written / conflict / differs = bit masks (bit 0 CALIB, 1 BOOTDATA,
 2 UID); `differs` = a kept copy no longer equals the flash. Then
 `CALMS,<ms>` = `calbackup::boot` duration. `tools/dm40dbg.py boot` decodes it
 (and recognises the old `UNCHANGED` / `WRITTEN` / `_NOFW` statuses of earlier
@@ -1887,8 +2343,9 @@ newest slot's sequence is higher than `persist::seq`; without a valid
 backup SRAM record the newest valid slot; else the defaults. Saves: 5 s
 after the last change (main loop, `setfile::poll`), deferred while another
 disk writer, an AD1 logger session or the AD2 stream runs; at every
-power-off (`power_off`, after `finish_disk_writes`). `DBG:BOOT?` appends
-`SETTINGS,<BKP|FILE|DEFAULTS>,<slot|->,<seq>,SETFILE,<state>,SAVE,<status>,<saves>,<seq>`.
+power-off (`power_off`, after `finish_disk_writes`). `DBG:BOOT?` reports
+where the settings came from, the slot and sequence, the file's state, the
+last save, the saves this boot and the newest sequence.
 Host test: fatren-test "setfile"; emulator: [`emu/settingstest.py`](../../emu/settingstest.py).
 
 ### Host tests (`tools/fatren-test/run.sh`, every check fatal)
@@ -1963,17 +2420,17 @@ setfile, vdisk) are popped before `main()`'s frame is pushed (review B1).
 **Run-time check:** `native::init_ram` paints the free stack
 (`__bss_end` .. SP − 256) with `0x53544B21`; `native::stack_use()` returns the
 high-water mark (first non-paint word from `__bss_end` up) and the stack size,
-reported in `DBG:BOOT?` as `STACK,<used>,<size>` (`used == size` means it
-reached `.bss`).
+reported in `DBG:BOOT?` as `stack_used`, `stack_size` (`used == size` means
+it reached `.bss`).
 
-The other `native::put_extra` fields of `DBG:BOOT?`: `STAGED` = fatren's
-count of `dm40*.bin` left because their header is not the marker; `CALMS` =
-`calbackup::boot`'s time in ms; `SPICLK` = the SPI-flash divider in use (4 or
-16) and the boot self-check verdict of [`src/spiflash.rs`](../src/spiflash.rs):
+The other `native::boot_words` fields of `DBG:BOOT?`: `staged` = fatren's
+count of `dm40*.bin` left because their header is not the marker; `calbk_ms`
+= `calbackup::boot`'s time in ms; `spiclk_div` / `spiclk_check` = the
+SPI-flash divider in use (4 or 16) and the boot self-check verdict of [`src/spiflash.rs`](../src/spiflash.rs):
 `OK` = block 0 and the first FAT block read identically at /16 and twice at
 /4 with 0x55AA, else /16 for this boot because of `DIFF1` / `DIFF2` (a /4
 read differed), `NOSIG` (no 0x55AA at /16), `NOCHIP` or `FORCED`
-(`spiflash::FORCE_SLOW`); `FATDIR` and `SETTINGS`: "The SPI disk" and
+(`spiflash::FORCE_SLOW`); fatdir and the settings: "The SPI disk" and
 "Settings copy" above.
 
 ## Risks / open items
@@ -1987,64 +2444,47 @@ read differed), `NOSIG` (no 0x55AA at /16), `NOCHIP` or `FORCED`
 - **Review L4** (power loss during a fatren root-block rewrite) is described
   in the review.
 - **Zeroing the marker is irreversible** without a vendor install. It is used
-  only on purpose: the recovery decision, or `DBG:UPDATE` / `DBG:RECOVER`.
-- **Recovery triggers on the device:** the key gesture and the watchdog path
-  are tested in the emulator only (next section).
+  only where a staged image must be installed: `DBG:UPDATE`, the on-meter
+  update, or the request word (set by nobody now). `DBG:LOADER` and the key
+  hold use the PA2 entry instead.
+- **The PA2 entry depends on the GPIO lock** (device: the staged-file
+  install through it, "PA2 entry"); without it the meter reboots into
+  opendm40 (`last_trigger` `0x54520013`).
+- **A hang inside the shim on every boot** has no software way out: the
+  TX-GND short (case open) is the only one.
 
-## T3 recovery triggers: owner steps (2026-10-24)
+## Boot and watchdog: owner steps (2026-10-29)
 
-What the shim does, checked in the emulator with the real ROM and FS-loader
-([`emu/recoverytest.py`](../../emu/recoverytest.py), all PASS on image sha256 `1372e957…`, built from
-37d3252):
+What the shim does since 0.4.0, checked in the emulator with the real ROM
+and FS-loader ([`emu/recoverytest.py`](../../emu/recoverytest.py)): a power
+key held 4.5 s at power-on opens the loader through PA2 (marker kept);
+every hang (or `DBG:RELEASE`) is a reboot ~20 s later (`WDT_RETRY`, the crash word counts
+up, cleared after 60 s of main loop). The crash count, last trigger and
+previous mode are in backup SRAM (`0x40024FF0`, `FF4`, `FFC`); they survive
+resets, not necessarily a power-off without battery.
 
-- **Key:** opendm40 is entered ~0.7 s after power-on (emulator; ROM + loader).
-  The shim lights the backlight at once, waits up to 4 s with the key held,
-  then blinks the backlight + beeps (~0.3 s), then needs 0.5 s more. Full
-  gesture ≈ 5.5 s from power-on. Released earlier, or within the 0.5 s after
-  the beep: normal boot.
-- **Watchdog:** one hang (or DBG:RELEASE) = a reboot ~20 s later
-  (`WDT_RETRY`, crash word `0x43520001`). A second one before opendm40 has run
-  60 s (main loop) since that reboot = recovery. After 60 s of running the
-  count is cleared (`HEALTHY`, `0x43520000`), so a later hang only reboots.
-- **Recovery** = the 12 marker bytes at `0x08008000` zeroed, then a SW reset:
-  the loader's "open file error / Update" screen with its USB disk (the SPI
-  disk), on every power-on until a good file is installed.
-- Stored in backup SRAM (`0x40024FF0` crash count, `FF4` last trigger, `FFC`
-  previous mode). It survives resets, not necessarily a power-off without
-  battery.
+Before: opendm40 running, USB connected; on the PC a copy of the installed
+image (`firmware/opendm40.bin` of the installed build, or
+`INFO/FIRMWARE.BIN` from the opendm40 USB drive).
 
-Before: opendm40 running, USB connected; on the PC a copy of the installed image
-(`firmware/opendm40.bin` of the installed build, or `INFO/FIRMWARE.BIN`
-from the opendm40 USB drive) to reinstall after each recovery. Reinstall: copy
-it onto the loader's USB disk under any `dm40*.bin` name ([the only `dm40*.bin`](../../docs/manual/README.md#install-a-file-from-the-update-loader)),
-`sync`, eject, press "Update".
-
-1. **Short press (normal start).** Power off. Press the power key ~0.5 s.
-   Expect the backlight at once, opendm40 normally.
-   `tools/dm40dbg.py boot`: `NORMAL`, reason `NONE`, `hold_ms` < 1000.
-2. **Abort.** Power off. Hold the key; ~4.7 s after power-on the backlight blinks and it
-   beeps; let go right at the beep (within 0.5 s). Expect opendm40 normally;
-   `boot`: `KEY_HOLD_ABORTED`, `hold_ms` 4000..4500.
-3. **Key recovery.** Power off. Hold the key through the beep and keep
-   holding until the loader's "open file error / Update" screen appears
-   (emulator: ~5.5 s after power-on; on the device the shim's 4 s start only
-   after the ROM / loader hand-off, so it may be later). Holding longer is
-   harmless: once the 0.5 s after the beep have passed, recovery runs whether
-   the key is still down or not. Expect that screen and its USB disk. Reinstall opendm40. `boot`: `last` = `0x52564352` (RCVR),
-   `last_trigger` `0x54520010`, marker `VALID`.
-4. **One hang.** `tools/dm40dbg.py release`. ~20 s later opendm40 reboots.
-   `boot`: `WDT_RETRY`, crash word `0x43520001`, `-` (not yet healthy).
-5. **Healthy clear.** Wait 70 s, then `boot`: `HEALTHY`, `0x43520000`.
-   `release` again: reboot, `WDT_RETRY`, `0x43520001` (no recovery).
-6. **Two hangs.** Right after step 5's reboot (within ~30 s of it),
-   `release` once more. ~20 s later: the loader's update screen. The budget:
-   uptime at the `release` + 20 s must stay under 60 s; sent later,
-   `mark_healthy` clears the count during the unfed 20 s and the result is a
-   plain `WDT_RETRY` reboot, which is correct behaviour, not a failure. Reinstall.
-   `boot`: `last` = RCVR, `last_trigger` `0x54520010`, crash `0x43520000`.
-7. Note anything that differs, especially the time from power-on to the
-   beep in step 2/3 (emulator ≈ 4.7 s) and whether the loader screen in step
-   3 comes up while the key is still held.
+1. **Short press.** Power off, press the power key ~0.5 s. Expect the
+   backlight at once, opendm40 normally; `tools/dm40dbg.py boot`: `NORMAL`,
+   reason `NONE`.
+2. **Long press.** Power off, hold the key ~7 s from power-on. Expect a
+   beep at ~4 s, then the loader's update screen and its USB disk
+   (28e9:028f). Power-cycle (the loader's key switches off): opendm40;
+   `boot`: marker `VALID`, `last_trigger` `0x54520012`. Letting go right
+   after the beep instead: opendm40, reason `KEY_HOLD_ABORTED`.
+3. **Hangs in a row.** `tools/dm40dbg.py release`; ~20 s later opendm40
+   reboots: `boot` `WDT_RETRY`, crash word `0x43520001`. Right away
+   `release` again: another reboot, `WDT_RETRY`, `0x43520002`, no loader.
+4. **Healthy clear.** Wait 70 s, then `boot`: `HEALTHY`, `0x43520000`.
+5. **Loader, marker kept.** `tools/dm40dbg.py loader`: the update screen;
+   power-cycle: opendm40, marker `VALID`.
+6. **Loader on request.** `tools/dm40dbg.py update` with no file staged:
+   the loader's "open file error / Update" screen and its USB disk.
+   Reinstall the image (copy it as the only `dm40*.bin`, `sync`, eject,
+   press "Update"); `boot`: marker `VALID`, crash `0x43520000`.
 
 ## Developer workflow
 

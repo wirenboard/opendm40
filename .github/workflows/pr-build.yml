@@ -1,0 +1,68 @@
+# Pull request test builds (firmware/README.md "PR builds"): after CI on a
+# PR, its image goes to the shared prerelease `pr-builds` (one current file
+# per PR) and a comment on the PR links it; a closed PR's file is removed.
+# CI (ci.yml, pull_request) builds the PR's code with a read-only token and
+# uploads the image as an artifact. These jobs have write permission and
+# never check out or run PR code: they run tools/pr-build.sh from the
+# default branch, which only reads the artifact as data.
+# workflow_run and pull_request_target start only the default branch's copy
+# of this file; workflow_dispatch (a CI run id) publishes by hand.
+name: PR build
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: CI run id (a pull_request run)
+        required: true
+
+permissions:
+  actions: read # the CI run's artifacts
+  contents: write # the pr-builds release
+  pull-requests: write # the comment
+
+concurrency:
+  group: pr-build-${{ github.event.workflow_run.head_sha || github.event.pull_request.number || inputs.run_id }}
+
+jobs:
+  publish:
+    name: Publish the test build
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+    runs-on: ubuntu-24.04
+    steps:
+      # The default branch's script, not the PR's.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: firmware/tools/pr-build.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: tools/pr-build.sh publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: firmware/tools/pr-build.sh publish "$RUN_ID"
+
+  remove:
+    name: Remove the closed PR's build
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: firmware/tools/pr-build.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: tools/pr-build.sh remove
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: firmware/tools/pr-build.sh remove "$PR"

@@ -3,7 +3,7 @@
 //! tools/mkstockfont.py), so no stock app in flash is needed.
 //! Stock format and placement rules: stock/re/analysis/gui_v2_6.h sec. 5;
 //! our storage (docs/fonts.md): CJK glyphs dropped, 4 bpp glyphs as
-//! row-major nibble runs (RLE4), 1 bpp glyphs cropped to their ink rows;
+//! Huffman-coded row tokens (HUF), 1 bpp glyphs cropped to their ink rows;
 //! the drawn pixels are the stock ones (tools/font-matrix).
 //!
 //! Placement: glyph top = line_top + line_h - descent - h - yoff;
@@ -28,19 +28,31 @@ mod data {
     /// Glyph bitmap formats. BIT1: 1 bpp, column-major MSB-first, only the
     /// glyph's ink rows t .. t + ih stored (ih per column). RAW4: 4 bpp
     /// column-major, high nibble first (our own glyphs, stockfont_w.rs).
-    /// RLE4: 4 bpp row-major nibble runs (tools/mkstockfont.py rle_glyph):
-    /// 1..14 = one pixel; 0|15, n: n + 1 pixels of 0|15 (n <= 13), n = 14:
-    /// 15 + the next two nibbles; 0, 15, k at a row start: the last literal
-    /// row k + 1 more times. No run crosses a row end. docs/fonts.md.
+    /// HUF: 4 bpp row tokens, Huffman coded (tools/mkstockfont.py; docs/fonts.md):
+    /// per row L(v) one pixel of coverage 1..14, F0(n) / F15(n) n pixels of
+    /// 0 / 15, C(E) as a row's first token: the row above again; n = a
+    /// length class (CLS_LO, CLS_EB extra bits) or EOL (to the row end).
+    /// Each token is a canonical Huffman code of its context (the previous
+    /// token's kind in the row, HUF_CNT / HUF_SYM), then its extra bits, MSB
+    /// first. No token crosses a row end; a glyph starts at a byte boundary.
     pub const BIT1: u8 = 0;
     pub const RAW4: u8 = 1;
-    pub const RLE4: u8 = 2;
+    pub const HUF: u8 = 2;
+
+    /// Token kinds (symbol >> 4).
+    const K_L: u8 = 0;
+    const K_F15: u8 = 2;
+    /// Run length classes: first length and extra bits; class EOL = to the
+    /// end of the row.
+    const CLS_LO: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 9, 13, 21, 37, 0];
+    const CLS_EB: [u8; 12] = [0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 0];
+    const EOL: u8 = 11;
 
     /// Widest glyph (F78 'O' = 64; the generator asserts it): row buffer size.
     pub const MAXW: usize = 64;
 
     /// 10 bytes per glyph: code, byte offset into the font's blob, box w x h,
-    /// advance, yoff, first ink row t and ink rows ih (BIT1; RLE4: 0, h).
+    /// advance, yoff, first ink row t and ink rows ih (BIT1; HUF: 0, h).
     #[derive(Clone, Copy)]
     pub struct Entry {
         pub code: u16,
@@ -87,16 +99,74 @@ mod data {
         ih: u8,
     }
 
-    /// Row cursor of one RLE4 glyph: rows are decoded in order (a label
+    /// Row cursor of one HUF glyph: rows are decoded in order (a label
     /// draws top to bottom), so no per-row index is stored. `next` = the row
-    /// the next token starts, `src` = nibble index of the last literal row,
-    /// `rep` = repeats of it still pending.
+    /// the next token starts, `pos` = bit index of the next token, `src` =
+    /// bit index of the last literal row (a copied row is decoded from there).
     #[derive(Clone, Copy, Default)]
     pub struct Cur {
         pos: u16,
         src: u16,
-        rep: u8,
         next: u8,
+    }
+
+    /// Bits of the first-level decode table: 95 % of the tokens have a
+    /// code this short (tools/mkstockfont.py prints the share).
+    const LUTK: u32 = 6;
+
+    /// Per context, per LUTK-bit prefix: len << 8 | symbol of the code it
+    /// starts with, 0 = a longer code. Built from HUF_CNT / HUF_SYM at the
+    /// first glyph lookup (lut_init); 512 bytes in SRAM (TCM is the stack).
+    #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+    static mut LUT: [[u16; 1 << LUTK]; HUF_CNT.len()] = [[0; 1 << LUTK]; HUF_CNT.len()];
+    #[cfg_attr(target_os = "none", link_section = ".sram_bss")]
+    static mut LUT_OK: bool = false;
+
+    fn lut_init() {
+        // Single-threaded, never from the ISR.
+        let lut = unsafe { &mut *core::ptr::addr_of_mut!(LUT) };
+        for (ctx, t) in lut.iter_mut().enumerate() {
+            let (mut code, mut idx) = (0usize, HUF_SOFF[ctx] as usize);
+            for (l, &n) in HUF_CNT[ctx].iter().enumerate() {
+                let l = l + 1;
+                for _ in 0..n {
+                    if l <= LUTK as usize {
+                        let sh = LUTK as usize - l;
+                        let e = (l as u16) << 8 | HUF_SYM.get(idx).copied().unwrap_or(0) as u16;
+                        for v in t.iter_mut().skip(code << sh).take(1 << sh) {
+                            *v = e;
+                        }
+                    }
+                    code += 1;
+                    idx += 1;
+                }
+                code <<= 1;
+            }
+        }
+        unsafe { *core::ptr::addr_of_mut!(LUT_OK) = true };
+    }
+
+    /// Canonical decode bit by bit from the per-length counts: (symbol,
+    /// code length) of the code at the top of `win`; a code that is not in
+    /// the table reads as symbol 0 (one pixel of coverage 0).
+    #[inline(never)]
+    fn slow(mut win: u32, ctx: usize) -> (u8, u32) {
+        let (mut code, mut first, mut idx) = (0u32, 0u32, 0u32);
+        let mut l = 0u32;
+        for &c in HUF_CNT[ctx].iter() {
+            code |= win >> 31;
+            win <<= 1;
+            l += 1;
+            let c = c as u32;
+            let d = code.wrapping_sub(first);
+            if d < c {
+                return (HUF_SYM.get(HUF_SOFF[ctx] as usize + (idx + d) as usize).copied().unwrap_or(0), l);
+            }
+            idx += c;
+            first = (first + c) << 1;
+            code <<= 1;
+        }
+        (0, l)
     }
 
     impl Glyph {
@@ -108,7 +178,7 @@ mod data {
         }
 
         /// Coverage 0..15 of pixel (x, y) inside the glyph box, random access
-        /// (Ink::at, the scope markers: 1 bpp fonts). An RLE4 glyph decodes
+        /// (Ink::at, the scope markers: 1 bpp fonts). A HUF glyph decodes
         /// its rows up to y (slow; the drawing paths use `row`).
         pub fn alpha(&self, x: u32, y: u32) -> u8 {
             match self.fmt {
@@ -137,7 +207,7 @@ mod data {
         }
 
         /// Column walk of row `y` for the formats with random access (not
-        /// RLE4): Some((index of column 0, step per column)) for `at`, None
+        /// HUF): Some((index of column 0, step per column)) for `at`, None
         /// when the row has no ink (BIT1 rows outside t .. t + ih).
         #[inline(always)]
         pub fn col_walk(&self, y: u32) -> Option<Option<(u32, u32)>> {
@@ -170,7 +240,7 @@ mod data {
             if p & 1 == 0 { b >> 4 } else { b & 0xF }
         }
 
-        /// Coverage of row `y` (0..h) into buf[..w]. RLE4 walks forward from
+        /// Coverage of row `y` (0..h) into buf[..w]. HUF walks forward from
         /// `c` (asking the same row again or any later row is cheap, an
         /// earlier one restarts from the top); the other formats ignore it.
         pub fn row(&self, c: &mut Cur, y: u32, buf: &mut [u8; MAXW]) {
@@ -209,19 +279,22 @@ mod data {
             }
         }
 
-        /// RLE4 only: hand the coverage of columns x0 .. x1 of row `y` to
-        /// `f`, decoded straight from the runs (no row buffer). Same cursor
-        /// rules as `row`.
+        /// HUF only: hand the coverage of columns x0 .. x1 of row `y` to
+        /// `f` as runs, f(coverage, count), decoded straight from the runs
+        /// (no row buffer). Same cursor rules as `row`.
         #[inline(always)]
-        pub fn row_emit<F: FnMut(u8)>(&self, c: &mut Cur, y: u32, x0: usize, x1: usize, mut f: F) {
+        pub fn row_runs<F: FnMut(u8, u16)>(&self, c: &mut Cur, y: u32, x0: usize, x1: usize, mut f: F) {
             let w = (self.w as usize).min(MAXW);
             let (mut p, lit) = self.seek(c, y, w);
             let mut x = 0usize;
+            let mut ctx = 0usize;
             while x < w {
-                let (v, l) = self.token(&mut p);
+                let (k, v, l) = self.token(&mut p, ctx, x, w);
+                ctx = (1 + k as usize) & 3;
                 let e = (x + l).min(w);
-                for _ in x.max(x0)..e.min(x1) {
-                    f(v);
+                let (a, b) = (x.max(x0), e.min(x1));
+                if a < b {
+                    f(v, (b - a) as u16);
                 }
                 x = e;
             }
@@ -230,7 +303,7 @@ mod data {
             }
         }
 
-        /// Move the cursor to row `y`: (nibble index where row y's runs
+        /// Move the cursor to row `y`: (bit index where row y's tokens
         /// start, true if that is a new literal row whose end the caller
         /// stores in c.pos). Same row again: its start; a later row: skips
         /// the rows between; an earlier row: from the top.
@@ -251,51 +324,73 @@ mod data {
             self.begin(c)
         }
 
-        /// Start the next row: a pending or new repeat of the last literal
-        /// row (its start, false), else a literal row at c.pos (true).
+        /// Start the next row: a copy of the last literal row (C(E): its
+        /// start, false), else a literal row at c.pos (true).
         fn begin(&self, c: &mut Cur) -> (u32, bool) {
             c.next = c.next.wrapping_add(1);
-            if c.rep > 0 {
-                c.rep -= 1;
-                return (c.src as u32, false);
-            }
             let p = c.pos as u32;
-            if self.nib(p) == 0 && self.nib(p + 1) == 15 {
-                c.rep = self.nib(p + 2);
-                c.pos += 3;
+            if HUF_COPY_LEN > 0 && self.peek(p) >> (32 - HUF_COPY_LEN) == HUF_COPY_CODE {
+                c.pos += HUF_COPY_LEN as u16;
                 return (c.src as u32, false);
             }
             c.src = c.pos;
             (p, true)
         }
 
-        /// One run token at nibble `p` (advanced past it): (coverage, pixels).
+        /// 32 bits of the blob from bit `p` on, MSB first (zeros past the end).
         #[inline(always)]
-        fn token(&self, p: &mut u32) -> (u8, usize) {
-            let v = self.nib(*p);
-            *p += 1;
-            if v != 0 && v != 15 {
-                return (v, 1);
-            }
-            let n = self.nib(*p) as usize;
-            *p += 1;
-            if n == 14 {
-                let l = 15 + ((self.nib(*p) as usize) << 4 | self.nib(*p + 1) as usize);
-                *p += 2;
-                (v, l)
-            } else {
-                (v, n + 1)
-            }
+        fn peek(&self, p: u32) -> u32 {
+            let i = (p >> 3) as usize;
+            let v = match self.blob.get(i..i + 4) {
+                Some(s) => u32::from_be_bytes([s[0], s[1], s[2], s[3]]),
+                None => {
+                    let mut v = 0u32;
+                    for k in 0..4 {
+                        v = v << 8 | self.blob.get(i + k).copied().unwrap_or(0) as u32;
+                    }
+                    v
+                }
+            };
+            v << (p & 7)
         }
 
-        /// One row of runs from nibble `p` into o[..w] (if PUT); returns the
-        /// nibble index after the row.
+        /// One token at bit `p` (advanced past it) in context `ctx`, at
+        /// column x of a w-pixel row: (kind, coverage, pixels). A code that
+        /// is not in the table reads as one pixel of coverage 0.
+        #[inline(always)]
+        fn token(&self, p: &mut u32, ctx: usize, x: usize, w: usize) -> (u8, u8, usize) {
+            let ctx = ctx % HUF_CNT.len();
+            let w0 = self.peek(*p);
+            // Codes of up to LUTK bits from the table (lut_init), longer
+            // ones bit by bit from the per-length counts.
+            let e = unsafe { (*core::ptr::addr_of!(LUT))[ctx][(w0 >> (32 - LUTK)) as usize] };
+            let (s, l) = if e != 0 { (e as u8, (e >> 8) as u32) } else { slow(w0, ctx) };
+            let win = w0 << l;
+            *p += l;
+            let kind = s >> 4;
+            if kind == K_L {
+                return (kind, s & 15, 1);
+            }
+            let c = (s & 15).min(EOL) as usize;
+            let n = if c == EOL as usize {
+                w.saturating_sub(x)
+            } else {
+                let e = CLS_EB[c] as u32;
+                *p += e;
+                CLS_LO[c] as usize + if e > 0 { (win >> (32 - e)) as usize } else { 0 }
+            };
+            (kind, if kind == K_F15 { 15 } else { 0 }, n)
+        }
+
+        /// One literal row of tokens from bit `p` into o[..w] (if PUT);
+        /// returns the bit index after the row.
         #[inline(always)]
         fn runs<const PUT: bool>(&self, mut p: u32, w: usize, o: &mut [u8; MAXW]) -> u32 {
             let w = w.min(MAXW);
             let mut x = 0usize;
+            let mut ctx = 0usize;
             while x < w {
-                let (v, l) = self.token(&mut p);
+                let (k, v, l) = self.token(&mut p, ctx, x, w);
                 let e = (x + l).min(w);
                 if PUT {
                     for d in &mut o[x..e] {
@@ -303,6 +398,7 @@ mod data {
                     }
                 }
                 x = e;
+                ctx = (1 + k as usize) & 3;
             }
             p
         }
@@ -319,6 +415,9 @@ mod data {
 
         pub fn glyph(&self, code: u32) -> Option<Glyph> {
             let fd = font_data(self.0)?;
+            if fd.fmt == HUF && !unsafe { *core::ptr::addr_of!(LUT_OK) } {
+                lut_init();
+            }
             let code = u16::try_from(code).ok()?;
             let e = fd.entries;
             let (mut lo, mut hi) = (0usize, e.len());
@@ -361,7 +460,7 @@ pub const MODE: Font = Font(0x0805_9D00); // 0x04 DC .. 0x08 diode, 32 px
 pub const BTN_GLYPH: Font = Font(0x0805_A9FC); // 04..08, 0x10 Hz, 0x11 cap, ohm, C
 pub const BATTERY: Font = Font(0x0804_FA4C); // 0x22..0x27
 pub const LOCK: Font = Font(0x0806_BF24); // 0x20 closed, 0x21 open
-pub const SAVE_BT: Font = Font(0x0805_B2E8); // 0x21 Bluetooth
+pub const SAVE_BT: Font = Font(0x0805_B2E8); // 0x21 Bluetooth, 0x22 USB (ours)
 pub const ON_TAG: Font = Font(0x0806_C724);
 pub const LIGHTNING: Font = Font(0x0805_A0E0);
 pub const TEXT22: Font = Font(0x0806_B13C); // menu text, class B, 1 bpp
@@ -389,7 +488,7 @@ struct Placed {
     /// Synthesised glyph (`glyph_or_twin`): the bitmap drawn a second time
     /// `twin` px to the right (max coverage of the two); 0 = plain.
     twin: i16,
-    /// Row cursor (RLE4 glyphs decode their rows in order).
+    /// Row cursor (HUF glyphs decode their rows in order).
     cur: Cur,
 }
 
@@ -400,6 +499,18 @@ pub fn has_all(font: Font, s: &str) -> bool {
 
 // Glyphs of our own for the stock DMM fonts without them (tools/mkwglyph.py).
 include!("stockfont_w.rs");
+// The USB symbol for the status bar (tools/mkusbglyph.py).
+include!("stockfont_usb.rs");
+
+/// Hand-drawn 1 bpp glyphs for SC_F12 (the scope bar's 12 px font has ASCII
+/// only): Ω and ° for the REC mark's function (scope_ui::rec_unit), drawn on
+/// the font's cap rows (2..10) with its 2 px stems; column-major, MSB first.
+///   Ω  ...###..  ..##.##.  .##...##  .##...##  .##...##  ..##.##.
+///      ...#.#..  ...#.#..  .###.###        °  ..##.  .#..#  .#..#  ..##.
+static F12_GLYPHS: [(u32, char, bool, u8, u8, u8, i8, &[u8]); 2] = [
+    (0x0804_F24C, '\u{3a9}', false, 8, 9, 8, 1, &[0x00, 0x1c, 0x5f, 0x38, 0xf8, 0x06, 0x3d, 0xf2, 0x71]),
+    (0x0804_F24C, '\u{b0}', false, 5, 4, 6, 6, &[0x06, 0x99, 0x60]),
+];
 
 /// Glyph of `ch`. The stock DMM fonts have only the units they need: no W in
 /// UNIT / LETTERS / SC_DIGITS / HIST (power meter, dmm::pw), no k in LETTERS
@@ -410,7 +521,7 @@ fn glyph_or_twin(font: Font, ch: char) -> Option<(Glyph, i16)> {
     if let Some(g) = font.glyph(ch as u32) {
         return Some((g, 0));
     }
-    match OWN_GLYPHS.iter().find(|o| o.0 == font.0 && o.1 == ch) {
+    match OWN_GLYPHS.iter().chain(USB_GLYPHS.iter()).chain(F12_GLYPHS.iter()).find(|o| o.0 == font.0 && o.1 == ch) {
         Some(&(_, _, four, w, h, adv, yoff, b)) => Some((Glyph::own(b, four, w, h, adv, yoff), 0)),
         None if ch == 'W' => font.glyph('V' as u32).map(|g| (g, (g.w as i16 * 9 + 8) / 16)),
         None => None,
@@ -563,11 +674,14 @@ pub fn label(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, s
     if r.w <= 0 || r.h <= 0 {
         return;
     }
+    // A strip pass (lcd.rs "strip rendering"): only the strip's rows.
+    let Some((ya, yb)) = lcd::clip_rows(r.y.max(0), (r.y + r.h - 1).min(lcd::H as i16 - 1)) else {
+        return;
+    };
     let mut pl: [Option<Placed>; MAXG] = [const { None }; MAXG];
     let n = layout(font, r, text, align, spacing, &mut pl);
     let x1 = (r.x + r.w - 1).min(lcd::W as i16 - 1);
-    let y1 = (r.y + r.h - 1).min(lcd::H as i16 - 1);
-    let (x0, y0) = (r.x.max(0), r.y.max(0));
+    let (x0, y0, y1) = (r.x.max(0), ya, yb);
     // Per column: the glyph covering it (last one wins on 1-2 px overlaps of
     // negative spacing), so each pixel needs one lookup instead of a scan.
     let mut cover = [u8::MAX; 480];
@@ -593,6 +707,7 @@ pub fn label(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, s
         // a plain fill, glyph runs read the glyph's row y.
         let mut bi = u8::MAX;
         let mut x = x0;
+        let mut out = lcd::row_out(y, x0);
         while x <= x1 {
             let gi = cover[x as usize];
             let mut e = x + 1;
@@ -612,21 +727,17 @@ pub fn label(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, s
                     Some((i0, st)) => {
                         let mut i = i0 + (x - p.x) as u32 * st;
                         for _ in x..e {
-                            lcd::data(lut[p.g.at(i) as usize]);
+                            out.px(lut[p.g.at(i) as usize]);
                             i += st;
                         }
                     }
-                    None => {
-                        for _ in x..e {
-                            lcd::data(lut[0]);
-                        }
-                    }
+                    None => out.run(lut[0], (e - x) as u16),
                 },
-                // RLE4: the glyph's row y straight from its runs; a twin W
+                // HUF: the glyph's row y straight from its runs; a twin W
                 // through the row buffer.
                 Some(p) if p.twin == 0 => {
                     let gx = (x - p.x) as usize;
-                    p.g.row_emit(&mut p.cur, (y - p.y) as u32, gx, gx + (e - x) as usize, |a| lcd::data(lut[a as usize]));
+                    p.g.row_runs(&mut p.cur, (y - p.y) as u32, gx, gx + (e - x) as usize, |a, n| out.run(lut[a as usize], n));
                 }
                 Some(p) => {
                     if bi != gi {
@@ -635,14 +746,10 @@ pub fn label(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, s
                     }
                     let gx = (x - p.x) as usize;
                     for (k, _) in (x..e).enumerate() {
-                        lcd::data(lut[twin_buf(&buf, p.g.w, p.twin, gx + k) as usize]);
+                        out.px(lut[twin_buf(&buf, p.g.w, p.twin, gx + k) as usize]);
                     }
                 }
-                None => {
-                    for _ in x..e {
-                        lcd::data(bg);
-                    }
-                }
+                None => out.run(bg, (e - x) as u16),
             }
             x = e;
         }
@@ -663,6 +770,9 @@ pub fn label_half(font: Font, r: Rect, c: char, base: i16, fg: Color, bg: Color)
     if r.w <= 0 || r.h <= 0 {
         return;
     }
+    let Some((ya, yb)) = lcd::clip_rows(r.y.max(0), (r.y + r.h - 1).min(lcd::H as i16 - 1)) else {
+        return;
+    };
     let g = font.glyph(c as u32);
     // Full-size row of glyph row 0, relative to the baseline; left x of the
     // half-size glyph.
@@ -671,8 +781,7 @@ pub fn label_half(font: Font, r: Rect, c: char, base: i16, fg: Color, bg: Color)
         None => (0, 0),
     };
     let x1 = (r.x + r.w - 1).min(lcd::W as i16 - 1);
-    let y1 = (r.y + r.h - 1).min(lcd::H as i16 - 1);
-    let (x0, y0) = (r.x.max(0), r.y.max(0));
+    let (x0, y0, y1) = (r.x.max(0), ya, yb);
     let lut = ramp(fg, bg);
     #[cfg(test)]
     crate::probe::begin(crate::probe::TEXT, bg);
@@ -756,16 +865,35 @@ pub fn cells_diff(font: Font, r: Rect, text: &str, prev: &str, widths: &[u8], fg
 
 /// Rounded box (corners cut at `radius`, no anti-aliasing).
 pub fn rbox(r: Rect, radius: i16, color: Color, outside: Color) {
-    let (x0, y0) = (r.x.max(0), r.y.max(0));
+    let x0 = r.x.max(0);
+    let Some((ya, yb)) = lcd::clip_rows(r.y.max(0), r.y + r.h - 1) else {
+        return;
+    };
     #[cfg(test)]
     crate::probe::begin(crate::probe::SHAPE, outside);
-    lcd::set_window(x0 as u16, y0 as u16, (r.x + r.w - 1) as u16, (r.y + r.h - 1) as u16);
-    for y in 0..r.h {
+    lcd::set_window(x0 as u16, ya as u16, (r.x + r.w - 1) as u16, yb as u16);
+    let rr = radius as i32 * radius as i32;
+    for y in ya - r.y..=yb - r.y {
+        // Into the strip in a strip pass (lcd.rs), when the box is on the screen.
+        let mut out = if r.x >= 0 && r.x + r.w <= lcd::W as i16 { lcd::row_out(r.y + y, r.x) } else { lcd::Out::panel() };
+        let dy = if y < radius { radius - y } else if y >= r.h - radius { y - (r.h - radius - 1) } else { 0 };
+        if radius >= 0 && r.w >= 2 * radius {
+            // The row as three runs: `k` corner pixels outside on each side
+            // (the same test as below, symmetric: dx = radius - k on both).
+            let mut k = 0;
+            while k < radius && (radius - k) as i32 * (radius - k) as i32 + dy as i32 * dy as i32 > rr {
+                k += 1;
+            }
+            out.run(outside, k as u16);
+            out.run(color, (r.w - 2 * k) as u16);
+            out.run(outside, k as u16);
+            continue;
+        }
         for x in 0..r.w {
             let dx = if x < radius { radius - x } else if x >= r.w - radius { x - (r.w - radius - 1) } else { 0 };
             let dy = if y < radius { radius - y } else if y >= r.h - radius { y - (r.h - radius - 1) } else { 0 };
             let inside = (dx as i32 * dx as i32 + dy as i32 * dy as i32) <= radius as i32 * radius as i32;
-            lcd::data(if inside { color } else { outside });
+            out.px(if inside { color } else { outside });
         }
     }
     #[cfg(test)]
@@ -775,6 +903,9 @@ pub fn rbox(r: Rect, radius: i16, color: Color, outside: Color) {
 /// Draw only the glyph boxes of `text` placed in `r` (pixels outside the
 /// glyphs are left alone): for text over shapes such as rounded buttons.
 pub fn glyphs(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, spacing: i8) {
+    if !lcd::rows_hit(r.y, r.y + r.h - 1) {
+        return;
+    }
     let mut pl: [Option<Placed>; MAXG] = [const { None }; MAXG];
     let n = layout(font, r, text, align, spacing, &mut pl);
     #[cfg(test)]
@@ -784,27 +915,32 @@ pub fn glyphs(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, 
         if p.g.w == 0 || p.g.h == 0 || p.x < 0 || p.y < 0 {
             continue;
         }
+        // A strip pass (lcd.rs "strip rendering"): the strip's rows.
+        let Some((ya, yb)) = lcd::clip_rows(p.y, p.y + p.g.h as i16 - 1) else {
+            continue;
+        };
         #[cfg(test)]
         crate::probe::sub(_i as u8);
-        let (x, y) = (p.x as u16, p.y as u16);
+        let x = p.x as u16;
         let lut = ramp(fg, bg);
         let w = p.g.w as u16 + p.twin as u16;
-        lcd::set_window(x, y, x + w - 1, y + p.g.h as u16 - 1);
+        lcd::set_window(x, ya as u16, x + w - 1, yb as u16);
         let mut buf = [0u8; MAXW];
         let mut cur = Cur::default();
-        for gy in 0..p.g.h as u32 {
+        for gy in (ya - p.y) as u32..=(yb - p.y) as u32 {
+            let mut out = if x + w <= lcd::W { lcd::row_out(p.y + gy as i16, x as i16) } else { lcd::Out::panel() };
             if p.twin == 0 {
                 match p.g.col_walk(gy) {
-                    None => p.g.row_emit(&mut cur, gy, 0, w as usize, |a| lcd::data(lut[a as usize])),
+                    None => p.g.row_runs(&mut cur, gy, 0, w as usize, |a, n| out.run(lut[a as usize], n)),
                     Some(Some((mut i, st))) => {
                         for _ in 0..w {
-                            lcd::data(lut[p.g.at(i) as usize]);
+                            out.px(lut[p.g.at(i) as usize]);
                             i += st;
                         }
                     }
                     Some(None) => {
                         for _ in 0..w {
-                            lcd::data(lut[0]);
+                            out.px(lut[0]);
                         }
                     }
                 }
@@ -812,7 +948,7 @@ pub fn glyphs(font: Font, r: Rect, text: &str, fg: Color, bg: Color, align: u8, 
             }
             p.g.row(&mut cur, gy, &mut buf);
             for gx in 0..w as usize {
-                lcd::data(lut[twin_buf(&buf, p.g.w, p.twin, gx) as usize]);
+                out.px(lut[twin_buf(&buf, p.g.w, p.twin, gx) as usize]);
             }
         }
     }
@@ -1105,6 +1241,21 @@ pub fn paint(r: Rect, layers: &[(u8, Color)], mut f: impl FnMut(i16, i16) -> (Co
     let x1 = (r.x + r.w - 1).min(lcd::W as i16 - 1);
     let y1 = (r.y + r.h - 1).min(lcd::H as i16 - 1);
     if x1 < x0 || y1 < y0 {
+        return;
+    }
+    // A strip pass (lcd.rs "strip rendering"): only the strip's rows.
+    let Some((y0, y1)) = lcd::clip_rows(y0, y1) else {
+        return;
+    };
+    // A strip pass: straight into the strip's rows (no layout probes).
+    if lcd::in_strip() {
+        for y in y0..=y1 {
+            if let Some(row) = lcd::strip_span(y, x0, x1) {
+                for (p, x) in row.iter_mut().zip(x0..=x1) {
+                    *p = f(x, y).0;
+                }
+            }
+        }
         return;
     }
     #[cfg(test)]

@@ -56,6 +56,9 @@ fn main() {
         }
     }
     check("AC+DC: no row", acc::spec(1, 0, true, true, false).is_none(), String::new());
+    // The experimental 600 Mohm (ohm r7): no row; 60 Mohm (r6) keeps its own.
+    check("ohm 600 Mohm: no row", acc::spec(10, 7, false, true, false).is_none(), String::new());
+    check("ohm 60 Mohm: row 7", acc::spec(10, 6, false, true, false).map(|s| (s.pct, s.n)) == Some((20, 10)), String::new());
     let t = acc::spec(15, 0, false, true, false).unwrap();
     check("TC K deg C", (t.pct, t.n, t.abs) == (100, 5, true), format!("{t:?}"));
     let t = acc::spec(15, 0, false, true, true).unwrap();
@@ -154,6 +157,20 @@ fn main() {
         ("cap 0.005 nF (leading digit)", 13, 0, 0.005, 3, 2, "  0.00", "5"),
         ("cap 0.050 nF", 13, 0, 0.05, 3, 2, "  0.05", "0"),
         ("cap 44.44 mF", 13, 7, 44.44, 2, 2, "  44", ".44"),
+        // Every capacitance range as dmm.rs cap_val shows it (the 6 / 60 mF
+        // ranges in uF): the uncertainty's leading place stays orange.
+        // 60 nF (merged), below 6 nF: 3 decimals, +-0.14 nF
+        ("cap 4.444 nF on 60 nF", 13, 1, 4.444, 3, 2, "  4.4", "44"),
+        // 60 nF: +-1.5 nF
+        ("cap 47.30 nF", 13, 1, 47.3, 2, 2, "  47", ".30"),
+        // 6 uF: +-0.12 uF
+        ("cap 3.499 uF", 13, 3, 3.499, 3, 2, "  3.4", "99"),
+        // 600 uF: +-19 uF
+        ("cap 444.4 uF", 13, 5, 444.4, 1, 2, "  44", "4.4"),
+        // 6 mF in uF: d = 1 uF (the stock's 1.018 mF), +-70 uF
+        ("cap 1018 uF", 13, 6, 1018.0, 0, 2, "   101", "8"),
+        // 60 mF in uF: d = 10 uF (the stock's 44.44 mF), +-1900 uF
+        ("cap 44440 uF", 13, 7, 44440.0, 0, 2, "  44", "440"),
         // +-0.006 MHz: every digit
         ("Hz 9.999 MHz", 14, 6, 9.999, 3, 2, "  9.999", ""),
         ("Hz 50.000 kHz", 14, 3, 50.0, 3, 2, " 50.00", "0"),

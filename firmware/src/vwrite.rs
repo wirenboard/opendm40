@@ -856,7 +856,7 @@ fn stage(c: u32, s: u32, d: &[u8]) -> R {
         return Ok(true);
     }
     let dev = dev().ok_or(E_IO)?;
-    let [buf, fat, tmp] = crate::calbackup::scratch();
+    let [buf, fat, tmp] = crate::diskbuf::blocks();
     if !dev.read_block(0, tmp) {
         return Err(E_IO);
     }
@@ -957,7 +957,7 @@ pub fn poll(now: u64, blocked: bool) {
     }
     // 2. Firmware declined: the loader must not find it.
     if w.fw == Fw::Decline {
-        let [buf, tmp, _] = crate::calbackup::scratch();
+        let [buf, tmp, _] = crate::diskbuf::blocks();
         if crate::fatren::delete_updates(dev, buf, tmp).is_some() {
             dlog::set_stale();
         }
@@ -1036,7 +1036,7 @@ fn park(dev: &mut dyn BlockDevice) -> bool {
 /// then their chains (a power cut: lost clusters at worst).
 #[inline(never)] // .cold (link-native.x): once per session start / purge request
 fn purge_tmp(dev: &mut dyn BlockDevice) -> bool {
-    let [buf, fat1, tmp] = crate::calbackup::scratch();
+    let [buf, fat1, tmp] = crate::diskbuf::blocks();
     if !dev.read_block(0, tmp) {
         return false;
     }
@@ -1234,7 +1234,7 @@ fn commit(dev: &mut dyn BlockDevice, chain: &[u8], size: u32) -> bool {
     if nb > cl.len() {
         return false;
     }
-    let [buf, fat, tmp] = crate::calbackup::scratch();
+    let [buf, fat, tmp] = crate::diskbuf::blocks();
     if !dev.read_block(0, tmp) {
         return false;
     }

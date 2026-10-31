@@ -60,9 +60,14 @@ pub fn emu() -> &'static mut Emu {
     }
 }
 
+/// `reset` fills the screen with a pixel hash instead of its colour (an
+/// arbitrary previous screen: the deferred-fill check, main.rs).
+pub static mut PATTERN: bool = false;
+
 pub fn reset(bg: u16) {
     let e = emu();
-    e.fb.iter_mut().for_each(|p| *p = bg);
+    let pat = unsafe { PATTERN };
+    e.fb.iter_mut().enumerate().for_each(|(i, p)| *p = if pat { (i as u32).wrapping_mul(2654435761).rotate_right(13) as u16 } else { bg });
     e.owner.iter_mut().for_each(|p| *p = 0);
     e.call = None;
     e.kinds.clear();

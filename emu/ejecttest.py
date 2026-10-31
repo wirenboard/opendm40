@@ -61,6 +61,7 @@ sys.path.insert(0, os.path.join(ROOT, 'firmware/tools'))
 import dm40dbg  # noqa: E402
 sys.path.insert(0, HERE)
 import run  # noqa: E402  (emu/run.py: emu_uid, UID, free_port)
+import bootinfo  # noqa: E402
 if A.port is None:
     A.port = run.free_port()
 print('emulator USB/IP port %d' % A.port, flush=True)
@@ -397,7 +398,7 @@ try:
             check(m.q('DBG:VDISK:RO?') == '0,0', 'install: still writable after the re-plug')
             back_ok(m, 'install, re-plugged', readme)
     b = m.q('DBG:BOOT?')
-    check('WDT' not in b.split(',')[3], 'no watchdog reset (DBG:BOOT? %s)' % b)
+    check('WDT' not in str(bootinfo.fields(b).get('reason')), 'no watchdog reset (DBG:BOOT? %s)' % b)
 except Exception as e:
     check(False, 'the test ran: %r' % e)
 finally:

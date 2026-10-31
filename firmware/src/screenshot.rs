@@ -63,7 +63,7 @@
 //! Frozen image, streamed from the panel: there is no frame buffer and no
 //! capture buffer; each data block's pixels are read from the panel's GRAM
 //! (RAMRD, lcd::read_span) when the block is filled, straight into the block
-//! buffer (calbackup::scratch()[0]) that is then programmed. So nothing may
+//! buffer (diskbuf::blocks()[0]) that is then programmed. So nothing may
 //! draw over the panel until the last row is read: `frozen()` is true from
 //! `start` until the last data block is filled (main.rs then passes
 //! can_draw = false; App::gesture drops input), i.e. for the Start .. Data
@@ -92,6 +92,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::calbackup::{self, crc32_upd};
+use crate::diskbuf;
 use crate::fatdir;
 use crate::fatren::{le16, parse_bpb, sfn_is, Vol};
 use crate::lcd;
@@ -202,7 +203,7 @@ struct Job {
     nblk: u32,
     ncl: u32,
     got: u32,
-    /// scratch[0] holds the block being written (`lba`), step `st`.
+    /// blocks()[0] holds the block being written (`lba`), step `st`.
     filled: bool,
     /// Scope record: bytes of the current data block filled so far (it is
     /// filled in CSV_PIECE pieces, one per pass).
@@ -215,7 +216,7 @@ struct Job {
     /// Fat phase: copy, block.
     fat_k: u32,
     fat_fb: u32,
-    /// FAT 1 block cached in scratch[1].
+    /// FAT 1 block cached in blocks()[1].
     cur: u32,
     /// Verify: current cluster, and its link from the previous one checked.
     vc: u32,
@@ -267,11 +268,12 @@ const JOB0: Job = Job {
     retried: false,
 };
 
-/// In .dmabuf, not TCM .bss (review 60605d2 B1: 1.7 KB of stack margin, and
-/// the target LBAs / cluster list out of the stack-overflow path). .dmabuf is
-/// NOLOAD (not zeroed at reset): `init` must run before anything reads it
-/// (`busy`, `frozen`, `poll`, msc.rs).
-#[cfg_attr(target_os = "none", link_section = ".dmabuf")]
+/// Not TCM .bss (review 60605d2 B1: 1.7 KB of stack margin, and the target
+/// LBAs / cluster list out of the stack-overflow path). In the backup SRAM
+/// (.bkp_bss, link-native.x; CPU only, docs/native-boot.md "Extra RAM
+/// areas"; zeroed at reset, not JOB0): `init` must run before anything reads
+/// it (`busy`, `frozen`, `poll`, msc.rs).
+#[cfg_attr(target_os = "none", link_section = ".bkp_bss")]
 static mut JOB: Job = JOB0;
 /// The last finished shot, not yet shown (`take_result`); the last scope
 /// CSV (`take_csv_result`).
@@ -429,7 +431,7 @@ pub fn abort_on(disk: &mut dyn BlockDevice) {
         return;
     }
     // read_block waits for BUSY to clear first (spiflash.rs).
-    let _ = disk.read_block(0, &mut calbackup::scratch()[2]);
+    let _ = disk.read_block(0, &mut diskbuf::blocks()[2]);
     finish(job(), Shot::Error);
 }
 
@@ -474,7 +476,7 @@ fn step(disk: &mut dyn BlockDevice) -> Option<Shot> {
                 (j.kind == K_BMP && (crate::fastlog::holds_disk() || crate::upload::busy())).then_some(Shot::Busy)
             }
         }
-        // A csvlog commit holds the disk (and calbackup::scratch): wait. It
+        // A csvlog commit holds the disk (and diskbuf::blocks): wait. It
         // is bounded (a few blocks) and never starts while we are busy. An
         // update-file upload (upload.rs) likewise, until it ends / times out.
         // The fast logger (fastlog.rs) holds the disk for its whole session.
@@ -525,7 +527,7 @@ impl Job {
     }
 
     fn bpb(&mut self, disk: &mut dyn BlockDevice) -> Option<Shot> {
-        let buf = &mut calbackup::scratch()[0];
+        let buf = &mut diskbuf::blocks()[0];
         if !disk.read_block(0, buf) {
             return Some(Shot::Error);
         }
@@ -533,10 +535,10 @@ impl Job {
             return Some(Shot::NoDisk);
         };
         // The file's directory (fatdir.rs; created at boot, here only if it
-        // went missing: synchronous, ~1 s once). scratch[1] (FAT cache) is
+        // went missing: synchronous, ~1 s once). blocks()[1] (FAT cache) is
         // overwritten: `cur` is NONE until Alloc.
         let dir = if self.kind == K_CSV { &fatdir::SCOPE } else { &fatdir::SHOTS };
-        let v = match fatdir::ensure(disk, &v, dir, calbackup::scratch()) {
+        let v = match fatdir::ensure(disk, &v, dir, diskbuf::blocks()) {
             Ok(d) => d,
             Err(fatdir::Err::Io) => return Some(Shot::Error),
             Err(_) => return Some(Shot::Full),
@@ -555,7 +557,7 @@ impl Job {
     fn root(&mut self, disk: &mut dyn BlockDevice) -> Option<Shot> {
         let v = self.vol();
         let (lba, sub, base, lim) = fatdir::seq(&v, self.i);
-        let buf = &mut calbackup::scratch()[0];
+        let buf = &mut diskbuf::blocks()[0];
         if !disk.read_block(lba, buf) {
             return Some(Shot::Error);
         }
@@ -609,10 +611,10 @@ impl Job {
         None
     }
 
-    /// FAT 1 entry `c` through the one-block cache in scratch[1].
+    /// FAT 1 entry `c` through the one-block cache in blocks()[1].
     fn fat_get(&mut self, disk: &mut dyn BlockDevice, c: u32) -> Option<u32> {
         let v = self.vol();
-        let fat = &mut calbackup::scratch()[1];
+        let fat = &mut diskbuf::blocks()[1];
         let fb = c / FPER;
         if fb >= v.fat_blocks {
             return None;
@@ -682,11 +684,11 @@ impl Job {
         if !self.filled {
             let off = self.i * BLK as u32;
             let len = (self.len - off).min(BLK as u32) as usize;
-            let buf = &mut calbackup::scratch()[0];
+            let buf = &mut diskbuf::blocks()[0];
             if self.kind == K_CSV {
                 // The coded record (scope_csv.rs) in pieces: ~1 ms of coding
                 // per pass at most, not a whole 4 KiB block (~20000 samples
-                // of a well-compressed record) in one. scratch[0] is ours
+                // of a well-compressed record) in one. blocks()[0] is ours
                 // across the passes (busy() holds the disk).
                 let p = self.part as usize;
                 let n = (len - p).min(CSV_PIECE);
@@ -715,11 +717,11 @@ impl Job {
                 unsafe { (*core::ptr::addr_of_mut!(STATS))[0] = ms_since(self.t0) };
             }
         }
-        let buf = &calbackup::scratch()[0];
-        match disk.write_step(self.lba, &buf[..], &mut self.st)? {
+        let buf = &diskbuf::blocks()[0];
+        match disk.write_step(self.lba, buf, &mut self.st)? {
             // A block that read blank but did not take the program (a
             // sector whose erase a power cut interrupted, `prep_step`):
-            // once more, erased first. scratch[0] still holds the block.
+            // once more, erased first. blocks()[0] still holds the block.
             false if !self.retried => {
                 self.retried = true;
                 self.st = Step { erase: true, ..STEP0 };
@@ -753,7 +755,7 @@ impl Job {
                 self.fat_fb += 1;
             }
             self.lba = v.fat_start + self.fat_k * v.fat_blocks + self.fat_fb;
-            let buf = &mut calbackup::scratch()[0];
+            let buf = &mut diskbuf::blocks()[0];
             if !disk.read_block(self.lba, buf) {
                 return Some(Shot::Error);
             }
@@ -773,7 +775,7 @@ impl Job {
             return None; // the write from the next pass (one block read per pass)
         }
         // Whole block in one call (H1: never left erased across a pass).
-        let buf = &calbackup::scratch()[0];
+        let buf = &diskbuf::blocks()[0];
         match disk.write_block(self.lba, &buf[..]) {
             false => Some(Shot::Error),
             true => {
@@ -796,7 +798,7 @@ impl Job {
         let v = self.vol();
         if !self.filled {
             self.lba = v.dlba(self.slot / PER);
-            let buf = &mut calbackup::scratch()[0];
+            let buf = &mut diskbuf::blocks()[0];
             if !disk.read_block(self.lba, buf) {
                 return Some(Shot::Error);
             }
@@ -818,7 +820,7 @@ impl Job {
             return None; // the write from the next pass
         }
         // Whole block in one call (H1: never left erased across a pass).
-        let buf = &calbackup::scratch()[0];
+        let buf = &diskbuf::blocks()[0];
         match disk.write_block(self.lba, &buf[..]) {
             false => Some(Shot::Error),
             true => {
@@ -850,7 +852,7 @@ impl Job {
         self.linked = false;
         let off = self.i * BLK as u32;
         let len = (self.len - off).min(BLK as u32) as usize;
-        let buf = &mut calbackup::scratch()[2];
+        let buf = &mut diskbuf::blocks()[2];
         if !disk.read_block(v.data_start + (self.vc - 2) * v.spc + self.i % v.spc, buf) {
             return Some(Shot::Error);
         }

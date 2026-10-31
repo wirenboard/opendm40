@@ -1,4 +1,6 @@
-//! Recovery mode (the shim decision).
+//! Recovery mode (the shim decision). The shim takes it only on the
+//! backup-SRAM request word (boot::REQ_MAGIC), which nothing sets now; the
+//! recovery-file / recovery-usb variants below replace this action.
 //!
 //! Hands recovery to the vendor FS-loader's update mode by zeroing the 12-byte
 //! app marker at 0x08008000 (boot::zero_marker: FMC word programs of 0, no

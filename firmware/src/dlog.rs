@@ -2249,35 +2249,96 @@ static mut DISK: FnRaw = FnRaw(flash_read);
 
 /// A cached generator in zero-initialised RAM (.bss): an `Option<Gen>`
 /// static would be ~0.45 KiB of .data (its None is not all zero bits).
-pub struct Slot<K: Copy + PartialEq> {
+pub struct Slot {
     ok: bool,
-    key: core::mem::MaybeUninit<K>,
+    key: core::mem::MaybeUninit<CsvKey>,
     gen: core::mem::MaybeUninit<DiskGen>,
 }
 
-impl<K: Copy + PartialEq> Slot<K> {
+impl Slot {
     pub const fn new() -> Self {
         Slot { ok: false, key: core::mem::MaybeUninit::uninit(), gen: core::mem::MaybeUninit::uninit() }
     }
     /// The cached generator's key and CSV cursor (`Gen::pos`), if any.
     #[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
-    pub fn peek(&self) -> Option<(K, u32)> {
+    pub fn peek(&self) -> Option<(CsvKey, u32)> {
         self.ok.then(|| unsafe { (self.key.assume_init(), self.gen.assume_init_ref().pos()) })
     }
-    pub fn clear(&mut self) {
-        self.ok = false;
-    }
-    /// The generator for `key`, opened with `open` when it is not the cached one.
+}
+
+/// A DLG's CSV generator key: its start cluster and size on the SPI disk
+/// (one file's directory entry: no two live files share a start cluster).
+/// vdisk.rs takes them as `VF::src` / `ssize` from `scan`'s `Ent`, `data`
+/// from `find`'s.
+pub type CsvKey = (u16, u32);
+
+/// The CSV generators (TCM .bss), shared by the USB volume's reads
+/// (vdisk.rs `file_read`) and MMEM:DATA? (`data`). Two with the volume: a
+/// host that reads two places in turn (an indexer at a file's head while a
+/// copy runs further on) keeps one each; one file read over USB and SCPI at
+/// once is correct, only reopened more often. One without it.
+const NCUR: usize = if cfg!(feature = "vdisk") { 2 } else { 1 };
+static mut CSV: [Slot; NCUR] = [const { Slot::new() }; NCUR];
+/// The least recently used slot of `CSV`.
+static mut CSV_LRU: u8 = 0;
+/// A cursor at most this far before a read goes on from there.
+const CUR_NEAR: u32 = 1 << 20;
+/// CSV generator opens (DBG:VDISK:RD?).
+pub static CSV_OPENS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How far cursor `c` is behind `off` when it holds file `key` (within
+/// CUR_NEAR). A fn, not a closure in `csv_gen`: a closure's section name
+/// carries its module's path, so the .cold rule put it in region C (device
+/// d8e249d: DBG:ISR? lat_pc = `vdisk::file_read::{closure#0}`, max_lat 9 us
+/// while a host read the volume during an AD2 19200 stream).
 #[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
-    pub fn get(&mut self, key: K, open: impl FnOnce() -> Option<DiskGen>) -> Option<&mut DiskGen> {
-        if !(self.ok && unsafe { self.key.assume_init() } == key) {
-            self.ok = false;
-            self.gen.write(open()?);
-            self.key.write(key);
-            self.ok = true;
-        }
-        Some(unsafe { self.gen.assume_init_mut() })
+fn near(c: &Slot, key: CsvKey, off: u32) -> Option<u32> {
+    match c.peek() {
+        Some((k, p)) if k == key && p <= off && off - p < CUR_NEAR => Some(off - p),
+        _ => None,
     }
+}
+
+/// The generator of DLG `key` for a read at `off`: the slot just behind
+/// `off` (within CUR_NEAR) holding this file, else the least recently used
+/// one, reopened. None: no disk / not a DLG.
+#[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
+pub fn csv_gen(key: CsvKey, off: u32) -> Option<&'static mut DiskGen> {
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(CSV) };
+    let lru = unsafe { &mut *core::ptr::addr_of_mut!(CSV_LRU) };
+    let mut i = (*lru as usize).min(NCUR - 1);
+    let mut best = u32::MAX;
+    let mut j = 0;
+    // No iterator: its generics would be placed with this module (.cold).
+    while j < NCUR {
+        match near(&slots[j], key, off) {
+            Some(d) if d < best => (i, best) = (j, d),
+            _ => {}
+        }
+        j += 1;
+    }
+    *lru = (i == 0) as u8; // the other one is now the least recent
+    let c = &mut slots[i];
+    if !(c.ok && unsafe { c.key.assume_init() } == key) {
+        c.ok = false;
+        CSV_OPENS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let mut d = disk();
+        let g = geometry(&mut d)?;
+        c.gen.write(Gen::open(FatFile::new(d, g, key.0 as u32, key.1), key.1)?);
+        c.key.write(key);
+        c.ok = true;
+    }
+    Some(unsafe { c.gen.assume_init_mut() })
+}
+
+/// A DLG was deleted (csvlog::delete_on, fastlog's dropped file): forget
+/// every generator, as a new file may get its start cluster and size.
+pub fn csv_forget() {
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(CSV) };
+    for c in slots.iter_mut() {
+        c.ok = false;
+    }
+    unsafe { *core::ptr::addr_of_mut!(CSV_LRU) = 0 };
 }
 
 /// Host tests: read the "SPI disk" through `f`.
@@ -2344,13 +2405,10 @@ pub enum DataErr {
     Read,
 }
 
-/// The SCPI generator, kept between MMEM:DATA? calls (a host reads a file
-/// in 6000-byte pieces: sequential, O(1) each) while the entry is unchanged.
-static mut SCPI_GEN: Slot<Ent> = Slot::new();
-
 /// MMEM:DATA?: bytes `off..` of root file `name` into `out` (count
 /// returned, 0 at the end). "LOGnnn.CSV" with a LOGnnn.DLG next to it =
-/// the CSV generated from the DLG; else the file's raw bytes.
+/// the CSV generated from the DLG (`csv_gen`: a host reads a file in
+/// 6000-byte pieces, sequential, O(1) each); else the file's raw bytes.
 #[inline(never)] // .cold (link-native.x): not inlined into the hot caller
 #[cfg_attr(target_os = "none", link_section = ".text.vdisk_rd")]
 pub fn data(name: &[u8; 11], off: u32, out: &mut [u8]) -> Result<usize, DataErr> {
@@ -2360,8 +2418,7 @@ pub fn data(name: &[u8; 11], off: u32, out: &mut [u8]) -> Result<usize, DataErr>
         let mut dn = *name;
         dn[8..].copy_from_slice(b"DLG");
         if let Some(e) = find(&mut d, &g, &dn) {
-            let cache = unsafe { &mut *core::ptr::addr_of_mut!(SCPI_GEN) };
-            let gen = cache.get(e, || Gen::open(FatFile::new(d, g, e.start, e.size), e.size)).ok_or(DataErr::Read)?;
+            let gen = csv_gen((e.start as u16, e.size), off).ok_or(DataErr::Read)?;
             let n = (gen.info.csv.saturating_sub(off) as usize).min(out.len());
             gen.read(off, &mut out[..n]);
             return Ok(n);

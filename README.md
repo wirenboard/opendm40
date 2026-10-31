@@ -1,3 +1,5 @@
+**English** | [Русский](README.ru.md)
+
 # opendm40
 
 Open-source replacement firmware for the Alientek DM40 multimeter,
@@ -20,8 +22,8 @@ go back to the stock firmware.
 
 ## Status
 
-Experimental. Developed and tested on one DM40A. DM40B and DM40C ran only in
-the emulator. Everything that has not run on a real meter yet, chiefly
+Experimental. Developed on a DM40A and tested on DM40A, DM40B and DM40C.
+Everything that has not run on a real meter yet, chiefly
 everything with a current through the A jack, is listed in the manual under
 [Known limitations](docs/manual/README.md#known-limitations).
 Measured accuracy against calibrators (DC V, DC A, frequency, resistance):
@@ -76,10 +78,6 @@ You need a DM40 with the stock firmware, a USB cable and a charged battery.
    not switch off in the first 10 seconds.
 5. Back up your meter: copy the `INFO/` folder from the opendm40 USB disk to
    your computer and keep it ([Back up](#back-up-with-opendm40)).
-
-Installing over the stock **USB Connect** disk has not been tried with an
-opendm40 image yet. If the meter stops on the loader's update screen,
-[install the file from there](docs/manual/README.md#install-a-file-from-the-update-loader).
 
 The same steps with pictures, and updating from a running opendm40:
 [the manual, Getting started](docs/manual/README.md#getting-started).

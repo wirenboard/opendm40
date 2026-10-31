@@ -7,6 +7,172 @@ section named after the tag as the release notes; how to cut a release:
 
 ## Unreleased
 
+### New
+
+- **SD in the MIN/MAX/AVG column:** the standard deviation of the readings
+  since the statistics started; SCPI `CALCulate:AVERage:SDEViation?`.
+- **Mode Remember** (Settings > More > More, as the stock's; default OFF):
+  ON restarts the multimeter after a power-off in the function, range, rate
+  and trend timebase you left. SCPI `MEMory:STATe:RECall:AUTO`.
+- **Trend chart:** two slower timebases, 1.28 and 2.56 s/div.
+- **Russian README and user manual:** [README.ru.md](README.ru.md) and
+  [docs/manual/README.ru.md](docs/manual/README.ru.md), with a language
+  switch at the top of each.
+- **600 MΩ range, experimental:** on the range page or SCPI
+  `RES:RANG 600E6` only, never in AUTO; accuracy not specified. Leave the
+  leads open once: it learns the meter's own leakage
+  ([manual](docs/manual/README.md#resistance)).
+
+  ![The 600 MΩ range page and reading](docs/changelog/v0.4.0/ohm-600m.png)
+- **Continuity and diode: a green SHORT band** above the reading and green
+  digits while the beeper sounds, also at volume 0 %; **BEEP** for a diode
+  pattern ([manual](docs/manual/README.md#continuity)).
+
+  ![Continuity before and with a short](docs/changelog/v0.4.0/cont-short.png)
+- **Scope: the generator as a trigger source** (MF > Trigger > Source GEN):
+  the trigger is computed from the generator's timers, no wire needed;
+  and a **GEN trace** (MF > Display) showing the generator's output under
+  CH1 ([manual](docs/manual/README.md#trigger)). SCPI `TRIGger:SOURce`.
+- **Scope: the multimeter as CH2** (MF > Display > CH2 (DMM)): the
+  multimeter's input drawn over CH1 on the same time axis, in V, mV and
+  AC A ([manual](docs/manual/README.md#display-settings)). The multimeter
+  reading pauses while it is on.
+
+### Changed
+
+- **Test builds of pull requests:** each pull request gets a comment with
+  its update file to try (version `0.4.0-pr<N>.<commit>`)
+  ([manual](docs/manual/README.md#install)).
+- **Record button on the range pages:** MF, then **Record** opens the Record
+  page (red while recording); **Hold/Limits** is now **Limits**
+  ([manual](docs/manual/README.md#the-record-page)).
+
+  ![Before and after: the current range page](docs/changelog/v0.4.0/record-button.png)
+- **The update loader no longer opens by itself** after repeated hangs (a
+  hang restarts the meter).
+- **Leaving the update loader:** opened with the power-key hold or
+  `DBG:LOADER`, the loader now lets the installed firmware start again when
+  you switch the meter off and on; no reinstall is needed.
+  [How to reach it](docs/manual/README.md#reach-the-update-loader).
+- Smoother screen changes: pages, popups and DMM functions draw over the old
+  screen, not over a blank one; an MF menu tab redraws only the menu.
+- The menu, settings, range, help, generator and oscilloscope pages appear
+  top to bottom in one pass, with no half-drawn widgets.
+- **Continuity says OPEN** next to the big `0L` with open leads (Overflow
+  when the reading climbed there, e.g. a charging capacitor); diode and the
+  other functions say "Overflow" where "Overload" was
+  ([manual](docs/manual/README.md#overflow)).
+- `DBG:TOUCH?`, `DBG:PROF?` and `DBG:ACDC:TRACE` (debug) are only in
+  builds with the `dbg-touch` / `dbg-prof` / `acdc-trace` features
+  ([SCPI reference](docs/manual/scpi-reference.md#debug-commands)).
+- **Auto power-off on battery only:** with USB power (a computer or a
+  charger) the meter never switches itself off; after the unplug the
+  **Shutdown** time counts afresh
+  ([manual](docs/manual/README.md#power-battery-and-sleep)).
+
+### Fixed
+
+- Capacitance AUTO: a small capacitor measured after a large one (600 µF and
+  up) gets its own range again instead of a wrong µF value; open leads or a
+  short after a large capacitor no longer leave **0L mF** / **0.0 mF** on the
+  screen.
+- Capacitance: 6 mF and up read in µF (4700 µF, not 4.700 mF).
+- Capacitance ranges on the meter: MF chooses 60 nF .. 60000 µF or AUTO; the
+  AUTO key steps and resets them as in V / A / Ω. The 6 nF and 60 nF ranges
+  are one (below 6 nF with 3 decimals).
+- Capacitance: 1 .. 47 mF show their first value in about 1.5 to 5 s (was
+  9 to 20 s; 47 mF did not settle); AUTO starts on the last value's range;
+  the value stays grey until the slope settles (electrolytics); another
+  capacitor on 6 / 60 mF starts the range choice again.
+- Capacitance on 600 µF and up: a value every 0.25 s (the median of the
+  last polls, corrected for the ramp's two directions), grey until the ramp
+  has run both ways; "Discharging" with a rough grey value while the meter
+  discharges, orange "Charged cap: discharge first" above ~1.2 V; a charged
+  capacitor (up to 5 V) discharges about twice as fast.
+- Capacitance: the bargraph spans the range (600 nF on the 600 nF range), not
+  ten times it.
+- Power meter: **Vb 0.000** no longer in the warning colour with open leads.
+- Power meter AC+DC: with no current PF reads "--" (SCPI `+9.91E37`), not 0.
+- Generator: the square wave's preview follows the duty cycle; it always showed 50 %
+  ([#81](https://github.com/opendm40/opendm40/issues/81)).
+- Scope Save CSV after a timebase change while stopped: the file header names the timebase the record was
+  taken at, not the one shown.
+- Scope: a setting changed over SCPI while a popup is open shows at once in the top bar, the right
+  panel and the trace beside the popup, not only after it closes ([#82](https://github.com/opendm40/opendm40/issues/82)).
+- **Battery charging** is shown: on the charger the battery is green, its top bar blinks while it charges
+  and stays when full; a USB symbol (also on the scope page) while a computer has the meter connected
+  ([manual](docs/manual/README.md#the-status-bar)).
+- Scope page and combined view: the top bar shows the **Bluetooth symbol** while a phone or a computer is
+  connected over Bluetooth, beside the USB symbol when both are connected ([#167](https://github.com/opendm40/opendm40/issues/167)).
+- **Bluetooth SCPI:** a host that disconnects during a query no longer leaves
+  that reply for the next host to connect.
+- **Bluetooth SCPI:** pipelined block queries (`WAV:DATA?`, `LOG:DATA?`) no
+  longer lose the last reply; input lost to a full receive buffer is reported
+  (-363) instead of running cut commands.
+- **USB SCPI:** long replies such as `MMEM:DATA?` go out at full USB speed
+  while the scope page draws (with CH2 on they were several times slower).
+- **SCPI:** `SCOPe:MEASure:...?` without a value answers `+9.91E37` (no
+  value), not `+0.000000E-03`.
+- **SCPI:** a number outside a setting's range queues `-222 Data out of range`, as documented
+  (`SYST:BEEP:VOL`, `SYST:ALER:ENAB`, `LOG:OSR`, `LOG:DUR`, `LOG:SRAT`, `LOG:CSV:INT` / `DUR`);
+  `LOG:SOUR` takes `ad1` / `ad2` in any case; `MMEM:DATA?` without a name queues `-109`.
+- SCPI: `ACQ:SRAT?` of a stopped scope after a zoom answers the stored record's sample rate, as
+  the record preamble (`WAV:POIN MAX`) and Save CSV use, not the shown timebase's ([#158](https://github.com/opendm40/opendm40/issues/158)).
+- SCPI: `INRush:THReshold` and `POWer:PHASe` with a number out of range queue
+  `-222 Data out of range`, not `-224 Illegal parameter value`.
+- `DBG:PING?`: the keepalive field reads `4294967295` (no limit) after boot
+  instead of a wrapped number ([#97](https://github.com/opendm40/opendm40/issues/97)).
+- **Limits:** a huge limit set over SCPI (`CALC:LIM:UPP 1E20`) no longer restarts
+  the meter when the Hold/Limits page opens.
+- Multimeter: a value that rounds to zero shows no minus sign (open DC V
+  leads showed "-0.0000").
+- **SCPI:** `TRIGger:LEVel` keeps the level as given; it was up to one screen
+  row lower (0.1 V became 0.113 V at 500 mV/div).
+- SCPI: `WAVeform:DATA?` in BYTE format is no longer 1.5 codes low on
+  average (the preamble's `yorig` is the middle of a byte's four codes).
+- Scope: the V/div label is right with x2, x5 and the other non-decade
+  probes (x5 at 2.5 V/div showed 2V).
+- Recording: a red dot blinking every second and **REC** in the status bar;
+  on the scope page and the combined view a red dot and **DMM** in the top
+  bar, in place of MCX | DMM
+  ([#101](https://github.com/opendm40/opendm40/issues/101)).
+- **Gallery:** the recording in progress reads **Recording** instead of **No data**, and its
+  **Delete** says **Stop the recording** instead of **Disk busy, try again**.
+- A function change over USB / Bluetooth closes the power meter's wiring
+  and "Reset energy?" dialogs and the fuse check dialog (they stayed over a
+  page no longer updated).
+- Hold & Limits: MENU and Back return to the range page (Power Settings)
+  it was opened from, not to the multimeter page.
+- Temperature page: the cold junction line follows the readings and the
+  offset while the page is open.
+- Inrush: the Trigger - / + no longer step the wrong way from a threshold
+  set over SCPI below 0.2 A or above 10 A.
+- Bargraph scale: the unit spelled as the reading beside it (600 KΩ, not
+  600 kOhm).
+- **Scope, stopped:** a zoom, or a Single capture that ended, right after a
+  screenshot kept the old trace on the screen.
+- Scope: Duty, Wid, Vtop, Vbas and Vamp are right on triangle and ramp
+  signals (they jumped, e.g. 65 % duty on a triangle).
+- Scope roll mode: the measurements show -- instead of the values from
+  before roll started; `WAV:DATA?` follows the rolling trace.
+- Scope: text stays readable in every channel colour (dark on a yellow, gold
+  or pink math panel; white on a blue or purple CH1; a lighter blue, purple or
+  brown for the trigger level, measurements and FFT labels).
+- DMM trend chart: a range change to another unit that reads OL (6 V to
+  600 mV on 3.3 V) starts the chart over in the new unit.
+- Power meter: no multimeter MAX / AVG / REL / MIN column while the page
+  shows "I ranging...".
+- **Key/alert volume 0 %** also silences the continuity and diode beeper
+  ([manual](docs/manual/README.md#settings-page-1)).
+- Combined view: the meter strip shows **POWER**, the range and dashes while
+  the power meter ranges, not an empty strip.
+- **Inrush:** the automatic power-off no longer switches the meter off while
+  the page is armed and waits for a load to start
+  ([#144](https://github.com/opendm40/opendm40/issues/144)).
+- Settings: **Backlight** - / + keep to the 10, 15, 25 ... 95, 100 % steps
+  after an end (10 + gave 20 %, and 55 % was out of reach)
+  ([#91](https://github.com/opendm40/opendm40/issues/91)).
+
 ## v0.3.0 (2026-10-27)
 
 ### New

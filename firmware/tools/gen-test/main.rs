@@ -338,6 +338,52 @@ fn main() {
     check!(o.duty == 3500 && pwm_ccr(&o.timing, 3333) == 7, "PWM 10 MHz 33 %: {}", o.duty);
     check!(pwm_ccr(&o.timing, 10000) == 20 && pwm_ccr(&o.timing, 0) == 0, "PWM 0/100 %");
 
+    // The scope's GEN channel (docs/scope-gen-channel.md): crossings, spans,
+    // trigger instants.
+    for w in Wave::ALL {
+        let sh = Shape { wave: w, lo_v: 0.5, hi_v: 2.5, duty: 0.3 };
+        for &(v, rising) in &[(1.0f32, true), (1.0, false), (2.2, true), (2.2, false), (0.6, true)] {
+            let p = sh.crossing(v, rising);
+            check!(p.is_some_and(|p| (0.0..1.0).contains(&p)), "{w:?} crossing {v} {rising}: {p:?}");
+            let p = p.unwrap_or(0.0);
+            let (b, a) = (sh.volts(p - 1e-4), sh.volts(p + 1e-4));
+            let ok = if rising { b <= v + 1e-3 && a >= v - 1e-3 && a > b } else { b >= v - 1e-3 && a <= v + 1e-3 && a < b };
+            check!(ok, "{w:?} crossing {v} {rising} at {p}: {b} -> {a}");
+        }
+        check!(sh.crossing(0.4, true).is_none() && sh.crossing(2.6, false).is_none() && sh.crossing(0.5, true).is_none(), "{w:?} out of range");
+        check!(sh.span(0.37, 1.0) == (0.5, 2.5) && sh.span(0.1, 3.0) == (0.5, 2.5), "{w:?} full span");
+        // A span covers every sampled value inside it.
+        for k in 0..50 {
+            let (a, l) = (k as f32 * 0.0731, (k % 7) as f32 * 0.09);
+            let (lo, hi) = sh.span(a, l);
+            for j in 0..=20 {
+                let v = sh.volts(a + l * j as f32 / 20.0);
+                check!(v >= lo - 1e-4 && v <= hi + 1e-4, "{w:?} span {a} {l}: {v} outside {lo}..{hi}");
+            }
+        }
+    }
+    // Sync: 1 kHz sine table against a 1 MS/s record (200 ticks / sample).
+    let s = Settings { on: true, wave: Wave::Sine, freq_hz: 1000, ..Settings::DEFAULT };
+    let o = compute(&s);
+    let (q, k) = loop_ticks(&o.timing);
+    check!(q as f64 / k as f64 == 200_000.0, "1 kHz loop {q} / {k}");
+    let sy = Sync { t0: 12_345.0, s: 200.0, q: q as f64, k: k as f64, shape: Shape::of(&s, &o) };
+    check!(sy.period_samples() == 1000.0, "period samples {}", sy.period_samples());
+    let ph = sy.shape.crossing(1.5, true).unwrap();
+    let mut n0 = 0u64;
+    for _ in 0..5 {
+        let n = sy.next(n0, ph);
+        let d = (sy.phase(n as f64) - ph).rem_euclid(1.0);
+        // The first sample at or past the instant: within one sample after it.
+        check!(n >= n0 && (d as f64) < 1.0 / sy.period_samples() + 1e-6, "next {n0} -> {n}: phase past {d}");
+        check!(n - n0 <= 1000, "next {n0} -> {n}: more than a period");
+        n0 = n + 1;
+    }
+    // PWM path: 1 MHz square, D = 200 ticks.
+    let s = Settings { on: true, freq_hz: 1_000_000, ..Settings::DEFAULT };
+    let o = compute(&s);
+    check!(loop_ticks(&o.timing) == (200, 1) && Shape::of(&s, &o).hi_v == PWM_HIGH_V, "PWM loop / level");
+
     let fails = unsafe { FAILS };
     if fails == 0 {
         println!("ALL OK");

@@ -143,6 +143,20 @@ def app_from_file(path):
     return (w0, ln, w2), body
 
 
+def elf_symbol(path, prefix):
+    """Address of the first symbol of ELF `path` whose demangled name starts
+    with `prefix`, or None."""
+    nm = shutil.which('llvm-nm') or (sorted(glob.glob(os.path.join(
+        ROOT, 'toolchain/rustup/toolchains/*/lib/rustlib/*/bin/llvm-nm'))) or [None])[0]
+    if not nm:
+        return None
+    for l in subprocess.run([nm, '-C', path], capture_output=True, text=True).stdout.splitlines():
+        p = l.split(None, 2)
+        if len(p) == 3 and p[2].startswith(prefix):
+            return int(p[0], 16)
+    return None
+
+
 def elf_body(path):
     objcopy = shutil.which('arm-none-eabi-objcopy') or shutil.which('llvm-objcopy')
     if not objcopy:
@@ -449,6 +463,19 @@ def main(argv=None):
         s.add('sysbus WriteDoubleWord 0x%08X 0x%08X' % (0x1FFF7A10 + 4 * i, struct.unpack_from('<I', uid, 4 * i)[0]))
     print('chip UID:   ', uid.hex().upper(), '(opendm40 USB serial)')
     s.add('sysbus WriteWord 0x1FFF7A22 0x0400')
+    # DM40_BTRACE=DIR (firmware/tools/region-profile/rprof.py --trace): record
+    # the code blocks executed while hy3131::HANDED is set (the AD2 stream
+    # ISR owns the bus) into DIR/<name>-<pid>.btrace (peripherals/BTrace.cs).
+    # Needs an ELF --app (the HANDED address from its symbols).
+    if os.environ.get('DM40_BTRACE') and a.app and read(a.app)[:4] == b'\x7fELF':
+        handed = elf_symbol(a.app, 'opendm40::hy3131::HANDED')
+        if handed is None:
+            print('DM40_BTRACE: no hy3131::HANDED in %s' % a.app)
+        else:
+            os.makedirs(os.environ['DM40_BTRACE'], exist_ok=True)
+            path = os.path.join(os.path.abspath(os.environ['DM40_BTRACE']), '%s-%d.btrace' % (name, os.getpid()))
+            s.add('sysbus.btrace Arm 0x%08X %s' % (handed, q(path)))
+            print('btrace:     ', rel(path))
     s.add('sysbus.spi2.spiflash Load %s' % q(disk))
     # The disk bus's write-wait-read byte as on the device (~0.97 us at 12.5
     # MHz, opendm40 spiflash.rs `xfer`; peripherals/GD32_SPI.cs IdleStartNs).

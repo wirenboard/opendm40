@@ -59,7 +59,10 @@ const V8_WORDS: usize = 59;
 pub const W_POWER_ZD: usize = 59;
 const V7_WORDS: usize = 58;
 /// Record page (decision 2026-10-22 #1): bits 0..3 the row interval
-/// (csvlog::INTERVALS_S index), bits 4..7 the duration (DURATIONS_S index).
+/// (csvlog::INTERVALS_S index; csvlog::ON_CHANGE = On change), bits 4..7
+/// the duration (DURATIONS_S index), bits 8..9 the On change threshold
+/// (0 = 1 %, the default, 1 = 0.1 %, 2 = 5 %; app.rs swap01). Older
+/// records read 0 there = the defaults: no version change.
 pub const W_REC: usize = 58;
 const V6_WORDS: usize = 52;
 /// First word of the power-meter block (app_power::PW_WORDS words).
@@ -83,6 +86,18 @@ const BKP_SEQ: u32 = 0x4002_4FE8;
 /// BKP_CRASH..BKP_LAST).
 const _: () = assert!(BKP + 4 * (WORDS as u32 + 3) <= BKP_SEQ, "persist record overlaps the sequence words");
 const _: () = assert!(BKP_SEQ + 8 <= 0x4002_4FF0, "persist sequence words overlap the boot words");
+/// link-native.x ends the backup SRAM region (`BKPSRAM`) at the sequence words.
+const _: () = assert!(BKP_SEQ == 0x4002_4FE8, "link-native.x BKPSRAM ends at BKP_SEQ: change both");
+/// The record's place at the start of the backup SRAM, for the linker only:
+/// link-native.x puts this first in `BKPSRAM` (section `.bkp_record`,
+/// asserted at 0x40024000), so the CPU-only buffers in `.bkp_bss` start
+/// after the record whatever `WORDS` is. Never read or written through this
+/// static (the record is accessed at `BKP` + offsets); NOLOAD, so the image
+/// does not touch the record either.
+#[cfg(target_os = "none")]
+#[used]
+#[link_section = ".bkp_record"]
+static RECORD_SPACE: [u32; WORDS + 3] = [0; WORDS + 3];
 const V2_WORDS: usize = 16;
 
 /// Payload words of a record of format `version` (2..VERSION), None for a

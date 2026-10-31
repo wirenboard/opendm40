@@ -141,7 +141,10 @@ pub fn query(app: &App, cmd: Cmd, out: &mut Scpi) {
                 _ => b"WAIT",
             }
         }),
-        Cmd::AcqSrate => out.put_f32(sc.sample_rate() as f32),
+        // Stopped with a stored record: its rate (what WAV:PRE? x increment,
+        // the screen and Save CSV use), not the timebase shown after a zoom
+        // (#158).
+        Cmd::AcqSrate => out.put_f32(if record(app).is_empty() { sc.sample_rate() } else { sc.record_info().0 } as f32),
         _ => out.put_f32(-(sc.s.pos as f32) * 4.0 * sc.vdiv() / 141.0),
     }
 }
@@ -164,8 +167,11 @@ pub fn preamble(app: &App, out: &mut Scpi) {
     };
     // Volts per code over 1000 codes (f32: a one-code difference near
     // yorig would lose ~5 digits of the slope).
-    let y0 = sc.volts(0.0);
-    let k = (sc.volts(1000.0) - y0) / 1000.0 * if word { 1.0 } else { 4.0 };
+    // BYTE: a byte stands for codes 4b .. 4b + 3; yorig is the middle of
+    // them (code 1.5), not code 0 (1.5 codes low on average, #130).
+    let c0 = sc.volts(0.0);
+    let k1 = (sc.volts(1000.0) - c0) / 1000.0;
+    let (k, y0) = if word { (k1, c0) } else { (4.0 * k1, c0 + 1.5 * k1) };
     out.put_bytes(if word { b"1,".as_slice() } else { b"0,".as_slice() });
     out.put_u32(ty);
     out.put_bytes(b",");

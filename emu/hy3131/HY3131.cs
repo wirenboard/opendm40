@@ -859,6 +859,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case "ohmexitlo": OhmExitLow = o.Value; break;
                 case "ohmexitrst": OhmExitRst = o.Value != 0; break;
                 case "ohmtau": OhmTauMs = o.Value; break;
+                case "capda": CapDaK = o.Value; break;
+                case "capdatau": CapDaTau = o.Value; break;
+                case "capasym": CapAsym = o.Value; break;
+                case "capcmpw": CapCmpW = o.Value; break;
+                case "capvavg": CapVAvg = o.Value; break;
                 case "pb5drift": Pb5DriftV = o.Value; break;
                 case "pb5tau": Pb5DriftTau = o.Value; break;
                 case "senseneg": SenseNegV = o.Value; break;
@@ -1829,7 +1834,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             case Role.CapRamp: case Role.CapDischarge:
                 // node volts -> code with the stock scale 1000 * 1.25 / 0.9 / 8388606 mV per code
-                code = rampV / (1.25 / 0.9 / 8388606.0) * (ig / rowIg) / (rg / rowRg);
+                code = (role == Role.CapRamp && CapVAvg > 0 ? RampMean(ad1Last) : rampV) / (1.25 / 0.9 / 8388606.0) * (ig / rowIg) / (rg / rowRg);
                 break;
             case Role.Temp:
             {
@@ -2086,11 +2091,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 rampV *= Math.Exp(-dt / 0.02);
                 rampUp = true;
+                rampHt.Clear(); rampHv.Clear();
                 return;
             }
             if(role != Role.CapRamp) return;
+            if(CapVAvg > 0 && rampHt.Count == 0) RampMark(rampLast - dt);
             var vh = CmpHighThreshold; var vl = CmpLowThreshold;
             if(vh < vl) { var x = vh; vh = vl; vl = x; }
+            if(CapCmpW != 1.0) { var m = 0.5 * (vh + vl); var h = 0.5 * (vh - vl) * CapCmpW; vh = m + h; vl = m - h; }
             var cf = Fe.CapRampC(CapK[roleRange] * 1e-6, vh);
             if(double.IsNaN(cf))
             {
@@ -2101,9 +2109,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var c = cf * 1e6; // uF
             if(c <= 0) c = 1e-4;   // open: ramps instantly to the threshold
             var slope = CalGain(0x170 + 4 * roleRange) * CapK[roleRange] / c; // V/s at the AD1 node
+            // Dielectric absorption (opt-in "capda:k;capdatau:s", CHOSEN, not measured): after
+            // the discharge the slope is (1 - k e^(-t / tau)) of I / C, t from the ramp's start
+            // (device 832f89a4, ~1 mF electrolytic: the early slope read the capacitor 50 % high
+            // and more on 600 uF and 60 mF).
+            if(CapDaK > 0 && CapDaTau > 0)
+                slope *= Math.Max(0.05, 1 - CapDaK * Math.Exp(-(now - capDaT0) / CapDaTau));
+            var slope0 = slope;
             var remaining = dt;
             while(remaining > 0)
             {
+                // Up / down asymmetry (opt-in "capasym:a", CHOSEN, not measured): the up ramp
+                // (1 + a), the down ramp (1 - a) of the slope (device 40c25e2b, ~1 mF: the
+                // results alternated 1227 / 974 / 1044 / 982 uF).
+                slope = slope0 * (rampUp ? 1 + CapAsym : 1 - CapAsym);
                 var target = rampUp ? vh : vl;
                 var dist = Math.Abs(target - rampV);
                 var tt = dist / slope;
@@ -2113,10 +2132,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     break;
                 }
                 rampV = target;
+                if(CapVAvg > 0) RampMark(now - remaining + tt);
                 rampUp = !rampUp;
                 acpo = !rampUp; // high after reaching the high threshold
                 remaining -= tt;
             }
+            if(CapVAvg > 0) RampMark(now);
         }
 
         // ------------------------------------------------------------ comparator
@@ -2619,7 +2640,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(newRole == Role.Temp && Sad1I == 1) newRole = Role.None;
             if(newRole != role || newMode != roleMode || newRange != roleRange)
             {
-                if(newRole == Role.CapRamp && role != Role.CapRamp) { rampUp = true; }
+                if(newRole == Role.CapRamp && role != Role.CapRamp) { rampUp = true; if(role == Role.CapDischarge || lastRole == Role.CapDischarge) capDaT0 = now; }
                 // (the quiesce writes pass through no-role states: the last real role counts)
                 if(newRole == Role.AcA && lastRole != Role.AcA) acaT0 = now;
                 if(newRole == Role.AcV && lastRole != Role.AcV) acvT0 = now;
@@ -2746,6 +2767,53 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private double ctEnableTime, ctStart, ctStop, ctPhase;
         private int ctInit, ctA, ctB, ctC;
         private double rampV, rampLast;
+        /// Dielectric absorption of the capacitor on the ramp rows ("capda:k;capdatau:s").
+        public double CapDaK, CapDaTau = 1.0, CapAsym;
+        /// The ramp comparator's window (high - low threshold) scaled by this around its middle
+        /// ("capcmpw:k", CHOSEN, not measured): device 19b6e3b7, ~1 mF on 6 mF after a charge, the
+        /// class-1 ramp turned between -20 and -36 mV (~60 mV wide on a clean start).
+        public double CapCmpW = 1.0;
+        /// The AD1 ramp reading as the node's mean over the last this many s ("capvavg:s",
+        /// CHOSEN, not measured; 0: the node at the conversion's end): device 19b6e3b7 read a part
+        /// of a poll's dV in the poll after a comparator turn, with no turn seen in that poll.
+        public double CapVAvg;
+        private readonly List<double> rampHt = new List<double>(), rampHv = new List<double>();
+        private void RampMark(double t)
+        {
+            var k = rampHt.Count;
+            if(k > 0 && t < rampHt[k - 1]) { rampHt.Clear(); rampHv.Clear(); k = 0; }
+            // (open leads turn the ramp ~10^5 times a second: at most one point per 0.1 ms)
+            if(k > 1 && t - rampHt[k - 2] < 1e-4) { rampHt[k - 1] = t; rampHv[k - 1] = rampV; return; }
+            rampHt.Add(t); rampHv.Add(rampV);
+            var old = 0;
+            while(old < rampHt.Count - 2 && rampHt[old + 1] < t - CapVAvg - 1) old++;
+            if(old > 0) { rampHt.RemoveRange(0, old); rampHv.RemoveRange(0, old); }
+        }
+        /// The node's mean over [t - CapVAvg, t] from the marked breakpoints (piecewise linear).
+        private double RampMean(double t)
+        {
+            var n = rampHt.Count;
+            if(n < 2) return rampV;
+            Func<double, double> at = x =>
+            {
+                if(x <= rampHt[0]) return rampHv[0];
+                for(var i = 1; i < n; i++)
+                    if(x <= rampHt[i]) return rampHv[i - 1] + (rampHv[i] - rampHv[i - 1]) * (x - rampHt[i - 1]) / Math.Max(1e-12, rampHt[i] - rampHt[i - 1]);
+                return rampHv[n - 1];
+            };
+            var a = t - CapVAvg;
+            double sum = 0, x0 = a, v0 = at(a);
+            for(var i = 0; i < n && rampHt[i] < t; i++)
+            {
+                if(rampHt[i] <= a) continue;
+                sum += 0.5 * (v0 + rampHv[i]) * (rampHt[i] - x0);
+                x0 = rampHt[i]; v0 = rampHv[i];
+            }
+            var vt = at(t);
+            sum += 0.5 * (v0 + vt) * (t - x0);
+            return sum / CapVAvg;
+        }
+        private double capDaT0;
         private bool rampUp;
         private double vc, vcLast;
         private Role role;

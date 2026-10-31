@@ -46,9 +46,12 @@ jobs:
           test -f "$name"
           sha256sum "$name" | tee SHA256SUMS
       - name: Release notes
+        # The previous v* tag named explicitly: never the pr-builds prerelease
+        # (pr-build.yml).
         run: |
+          prev=$(git describe --tags --match 'v*' --abbrev=0 "$TAG^" 2>/dev/null || true)
           gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-              -f tag_name="$TAG" --jq .body > auto-notes.md
+              -f tag_name="$TAG" ${prev:+-f previous_tag_name="$prev"} --jq .body > auto-notes.md
           firmware/tools/release-notes.sh "$TAG" "$(git rev-parse HEAD)" auto-notes.md > notes.md
           cat notes.md
       - name: Create the release

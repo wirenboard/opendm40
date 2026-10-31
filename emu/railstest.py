@@ -34,6 +34,7 @@ ap.add_argument('--port', type=int, default=None, help='USB/IP port (default: a 
 A = ap.parse_args()
 sys.path.insert(0, HERE)
 import run  # noqa: E402
+import bootinfo  # noqa: E402
 if A.port is None:
     A.port = run.free_port(50000, 50999)
 print('USB/IP port %d' % A.port, flush=True)
@@ -100,8 +101,7 @@ def stop(emu):
 
 
 def save_ok(l):
-    p = l.q('DBG:BOOT?').split(',')
-    return p[p.index('SAVE') + 1] == 'OK'
+    return bootinfo.fields(l.q('DBG:BOOT?')).get('save') == 'OK'
 
 
 os.makedirs(OUT, exist_ok=True)

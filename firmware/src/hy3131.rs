@@ -37,7 +37,7 @@
 //! stream; feasibility 11.3); the DMM reads at /16 mode 0.
 
 use crate::mmio::{modify32, r32, spin, w16, w32};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed};
 
 const GPIOC: u32 = 0x4002_0800;
 const GPIOD: u32 = 0x4002_0C00;
@@ -114,11 +114,48 @@ pub fn write(reg: u8, data: &[u8]) {
     guard();
     for (i, &d) in data.iter().enumerate() {
         let r = reg.wrapping_add(i as u8);
-        // `mute` (test builds): R20 bit 2 drives the CMP pin buffer, the
-        // continuity / diode beeper in hardware (CFG_F11 0x56, diode_beep
-        // 0xb4 / 0xb0); off, so no beep whatever the volume.
-        let d = if cfg!(feature = "mute") && r == 0x20 { d & !0x04 } else { d };
+        let d = if r == R_CFG {
+            R20_ASKED.store(d, Relaxed);
+            let d = if beeper_off() { d & !ENPCMPO } else { d };
+            R20_SENT.store(d, Relaxed);
+            d
+        } else {
+            d
+        };
         let _ = spi::write_cont(r, &[d], true);
+    }
+}
+
+/// R20 bit 2 (ENPCMPO): the CMP pin buffer. The comparator output on the
+/// CMP pin drives the continuity / diode beeper in hardware (CFG_F11 0x56,
+/// `diode_beep` 0xb4 / 0xb0; hw/README.md "Buzzer"); the comparator itself
+/// (ENCMP, bit 4) keeps running without it.
+const ENPCMPO: u8 = 0x04;
+/// The beeper is off (key & alert volume 0 %, `App`): `write` clears ENPCMPO.
+static BEEP_OFF: AtomicBool = AtomicBool::new(false);
+/// R20 as last asked for by the callers and as last sent (masked).
+static R20_ASKED: AtomicU8 = AtomicU8::new(0);
+static R20_SENT: AtomicU8 = AtomicU8::new(0);
+
+/// Off also in `mute` builds (whatever the volume).
+#[inline(always)]
+fn beeper_off() -> bool {
+    cfg!(feature = "mute") || BEEP_OFF.load(Relaxed)
+}
+
+/// Continuity / diode beeper on or off (the volume: 0 % = off; it has no
+/// loudness of its own). Takes effect at the next R20 write or `beeper_sync`.
+pub fn set_beeper(on: bool) {
+    BEEP_OFF.store(!on, Relaxed);
+}
+
+/// Rewrite R20 when the beeper was switched while a row with ENPCMPO is
+/// active (continuity writes R20 only at mode entry). Main loop, DMM owner.
+#[inline(always)]
+pub fn beeper_sync() {
+    let a = R20_ASKED.load(Relaxed);
+    if a & ENPCMPO != 0 && !streaming() && (R20_SENT.load(Relaxed) & ENPCMPO == 0) != beeper_off() {
+        write(R_CFG, &[a]);
     }
 }
 

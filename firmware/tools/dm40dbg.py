@@ -37,11 +37,14 @@
     dm40dbg.py image FILE                offline: validate a dm40*.bin update
                                          file (header CRC, body CRC, size)
     dm40dbg.py release                   stop feeding the watchdog: the WDT
-                                         reset (~20 s) = crash (2nd in a row ->
-                                         recovery, which ZEROES the app marker)
+                                         reset (~20 s) counts a crash and
+                                         reboots opendm40
     dm40dbg.py reset                     reboot opendm40
-    dm40dbg.py recover                   DESTRUCTIVE, = DBG:UPDATE without the
-                                         checks/wait of `update` (`recover -h`)
+    dm40dbg.py loader                    NATIVE: DBG:LOADER = reset into the
+                                         vendor update screen through PA2; the
+                                         marker is kept, a power cycle boots
+                                         opendm40 again (`loader -h`)
+    dm40dbg.py recover                   = loader (DBG:RECOVER)
 
 Debug commands are SCPI DBG:... (see firmware/src/scpi.rs); needs read/write
 access to /dev/usbtmcN (udev rule). Native boot: firmware/docs/native-boot.md.
@@ -65,16 +68,16 @@ FIRMWARE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.
 APP_BASE, APP_END = 0x08004000, 0x080A0000
 
 RECOVER_HELP = """\
-opendm40 (native image at 0x08004000, docs/native-boot.md): DBG:RECOVER is an
-alias of DBG:UPDATE and is DESTRUCTIVE (a one-way door into the vendor
-updater). It programs the 12-byte app marker at 0x08008000 to zero and resets.
-The ROM and the FS-loader then refuse to launch the app on every boot and show
-the loader's update screen with its own USB disk (28e9:028f) until a valid
-dm40*.bin is installed through it: copy one (e.g. dm40_opendm40_v0.1.0.bin or
-dm40_v_2_6.bin) onto that disk, press "update" (or power-cycle). If a
-dm40*.bin was already on the disk (copied, synced and ejected before the
-command), the loader installs it straight away. "Flash error" = the marker did
-not read back as zero; no reset was done.
+opendm40 (native image at 0x08004000, docs/native-boot.md "PA2 entry"):
+DBG:LOADER (alias DBG:RECOVER) resets; the shim then drives PA2 (the debug
+header's TX pad) low, locks it and jumps to the Alientek ROM, which with the
+FS-loader sees PA2 low as with a TX-GND short and shows the loader's update
+screen with its own USB disk (28e9:028f). The 12-byte app marker is not
+touched: copy a dm40*.bin (e.g. dm40_v_2_6.bin) onto that disk and press
+"update", or power-cycle the meter (the loader's key switches it off) to boot
+opendm40 again. A dm40*.bin already in the SPI disk's root is installed
+straight away. DBG:UPDATE (`update`) instead zeroes the marker: the loader
+then stays until a good install.
 
 Back to opendm40 from stock: firmware/tools/reload.sh --from-stock (stages the image
 on the stock disk).
@@ -313,21 +316,31 @@ def print_image(path):
 
 # ---- DBG:BOOT? -------------------------------------------------------------
 
-# Field order of boot::put_info + native::put_extra (docs/native-boot.md
-# "Normal native mode"). PD6 / STAGED / CALBK / STACK are in-band labels.
-BOOT_POS = ['rstsck', 'rstsck_after', 'mode', 'reason', 'clock', 'last', 'hold_ms',
-            'bcr1', 'btr1', 'bwtr1', 'lcd_id',
-            'fatren', 'found', 'renamed', 'old_backup', 'old_deleted', 'freed_clusters',
-            'others', 'rcvr_deleted', 'last_trigger',
-            'marker_w0', 'marker_w1', 'marker_w2', 'marker',
-            'crash_word', 'healthy', 'fmc_last']
-BOOT_LABELS = {'PD6': ['moder', 'pupd', 'idr'], 'STAGED': ['n'],
-               'CALBK': ['status', 'written', 'conflict', 'differs'], 'STACK': ['used', 'size'],
-               'CALMS': ['ms'], 'SPICLK': ['div', 'check'], 'FATDIR': ['ok', 'created', 'failed'],
-               'CALREC': ['crc'],
-               'BOOTMS': ['board', 'fatren', 'calbk', 'fatdir', 'setfile', 'mirror', 'vdisk', 'refresh'],
-               'MAINMS': ['app', 'frame', 'touch']}
-# spiflash.rs ClockCheck (DBG:BOOT? SPICLK,<div>,<check>).
+# DBG:BOOT? (boot.rs put_info + native.rs boot_words): "B2," then hex
+# words (no prefix) in this order, then fatren's renamed 8.3 name.
+BOOT_FIELDS = ['mode', 'reason', 'clock', 'rstsck', 'rstsck_after', 'last', 'last_trigger',
+               'marker_w0', 'marker_w1', 'marker_w2', 'marker_valid', 'crash_word', 'healthy', 'fmc_last',
+               'bcr1', 'btr1', 'bwtr1', 'lcd_id',
+               'fatren', 'found', 'old_backup', 'old_deleted', 'freed_clusters', 'others', 'rcvr_deleted', 'staged',
+               'calbk', 'calbk_written', 'calbk_conflict', 'calbk_differs', 'calbk_ms',
+               'stack_used', 'stack_size', 'spiclk_div', 'spiclk_check',
+               'fatdir_ok', 'fatdir_created', 'fatdir_failed', 'calrec_ok',
+               'settings_from', 'settings_slot', 'settings_seq', 'setfile', 'save', 'saves', 'save_top',
+               'ms_board', 'ms_fatren', 'ms_calbk', 'ms_fatdir', 'ms_setfile', 'ms_mirror', 'ms_vdisk', 'ms_refresh',
+               'main_app', 'main_frame', 'main_touch']
+# Enum fields: the firmware's declaration order (as u32).
+BOOT_ENUMS = {
+    'mode': ['NORMAL', 'RECOVERY'],
+    'reason': ['NONE', 'WDT_AFTER_RECOVERY', 'WDT_STALE', 'WDT_RETRY', 'KEY_HOLD_ABORTED', 'REQUESTED', 'CLOCK_FAIL'],
+    'clock': ['HXTAL', 'IRC16M', 'FAILED'],
+    'fatren': ['NOTRUN', 'NOMEDIUM', 'BADBPB', 'CLEAN', 'DRYRUN', 'RENAMED', 'ERROR'],
+    'calbk': ['NOTRUN', 'NOMEDIUM', 'BADBPB', 'SAFECOPY_PRESENT', 'SAFECOPY_WRITTEN', 'NOSPACE', 'ERROR'],
+    'spiclk_check': ['NOTRUN', 'OK', 'FORCED', 'NOCHIP', 'NOSIG', 'DIFF1', 'DIFF2'],
+    'settings_from': ['NOTRUN', 'BKP', 'FILE', 'DEFAULTS'],
+    'setfile': ['NOTRUN', 'PRESENT', 'CREATED', 'NOFILE', 'ERROR'],
+    'save': ['NONE', 'OK', 'DEFERRED', 'BADRECORD', 'ERROR', 'NOFILE'],
+}
+# spiflash.rs ClockCheck (spiclk_check).
 SPICLK_CHECK = {'OK': '/4 (12.5 MHz) read block 0 + FAT block equal to /16 twice',
                 'FORCED': 'spiflash::FORCE_SLOW: stock /16',
                 'NOCHIP': 'no known chip (JEDEC ID): /16',
@@ -336,9 +349,7 @@ SPICLK_CHECK = {'OK': '/4 (12.5 MHz) read block 0 + FAT block equal to /16 twice
                 'DIFF2': '2nd /4 read DIFFERED from /16: fell back to /16',
                 'NOTRUN': 'no SpiFlash created yet'}
 RST_FLAGS = [(31, 'LP'), (30, 'WWDGT'), (29, 'FWDGT'), (28, 'SW'), (27, 'POR'), (26, 'EP'), (25, 'BOR')]
-# calbackup (write-once safety copy) written / conflict / differs bits
-# (native.rs put_extra). Firmware before the information volume (USB LUN 1)
-# reported 9 files and 'freed' as the 4th field.
+# calbackup (write-once safety copy) written / conflict / differs bits.
 CALBK_FILES = ['CALIB', 'BOOTDATA', 'UID']
 CALBK_STATUS = {'SAFECOPY_PRESENT': 'safety copy on the SPI disk, nothing written',
                 'SAFECOPY_WRITTEN': 'missing safety-copy files written',
@@ -347,115 +358,85 @@ CALBK_STATUS = {'SAFECOPY_PRESENT': 'safety copy on the SPI disk, nothing writte
                 'NOMEDIUM': 'no SPI flash', 'ERROR': 'SPI disk read/write/verify failed',
                 'NOTRUN': 'not run'}
 TRIGGERS = {0x54520010: 'marker zeroed by recovery/update', 0x54520011: 'marker zeroing FAILED',
+            0x54520012: 'PA2 entry into the loader', 0x54520013: 'PA2 entry, GPIO lock NOT confirmed',
             0x54520000: 'rcvr file created', 0x54520001: 'rcvr file already there',
             0x54520002: 'rcvr: no medium', 0x54520003: 'rcvr: bad BPB',
             0x54520004: 'rcvr: no space', 0x54520005: 'rcvr: error'}
 
 
 def parse_boot(text):
-    """'a,b,...' -> (ordered dict name -> value, warnings)."""
-    t = text.strip().split(',')
-    f, warn = {}, []
-    n = t.index('PD6') if 'PD6' in t else len(t)
-    if n != len(BOOT_POS):
-        warn.append('%d fields before PD6, decoder knows %d: names may be off'
-                    % (n, len(BOOT_POS)))
-    for i, v in enumerate(t[:n]):
-        f[BOOT_POS[i] if i < len(BOOT_POS) else 'field%d' % i] = v
-    i = n
-    while i < len(t):
-        lab = t[i]
-        names = BOOT_LABELS.get(lab)
-        if names is None:  # unknown label: take the values up to the next label
-            j = i + 1
-            while j < len(t) and not t[j][:1].isalpha():
-                j += 1
-            f[lab] = ','.join(t[i + 1:j])
-            i = j
-            continue
-        for k, nm in enumerate(names):
-            if i + 1 + k < len(t):
-                f['%s.%s' % (lab, nm)] = t[i + 1 + k]
-        i += 1 + len(names)
+    """DBG:BOOT? -> (dict name -> int, with the enum fields as their names
+    and 'renamed' as text; warnings). None for 'NONE'."""
+    text = text.strip()
+    if text == 'NONE':
+        return None, []
+    t = text.split(',')
+    warn = []
+    if t[0] != 'B2':
+        return {}, ['not the B2 format (%s): firmware older or newer than this decoder' % t[0]]
+    vals, renamed = t[1:-1], t[-1]
+    if len(vals) != len(BOOT_FIELDS):
+        warn.append('%d words, decoder knows %d: names may be off' % (len(vals), len(BOOT_FIELDS)))
+    f = {}
+    for i, v in enumerate(vals):
+        name = BOOT_FIELDS[i] if i < len(BOOT_FIELDS) else 'word%d' % i
+        x = int(v, 16)
+        e = BOOT_ENUMS.get(name)
+        f[name] = (e[x] if x < len(e) else '?%d' % x) if e else x
+    f['renamed'] = renamed
     return f, warn
 
 
-def _int(v):
-    try:
-        return int(v, 0)
-    except (TypeError, ValueError):
-        return None
-
-
-def _note(name, v):
-    x = _int(v)
-    if name == 'STACK.used':
-        _note.used = v
-    if name in ('rstsck', 'rstsck_after') and x is not None:
+def _note(name, x, f):
+    if name in ('rstsck', 'rstsck_after'):
         return ' '.join(n for b, n in RST_FLAGS if x >> b & 1) or 'no flags'
-    if name == 'last' and x is not None:
+    if name == 'last':
         b = struct.pack('<I', x)
         return b.decode() if all(0x20 <= c < 0x7F for c in b) else ('none' if x == 0 else '')
-    if name == 'crash_word' and x is not None:
+    if name == 'crash_word':
         return 'count %d' % (x & 0xFF) if x >> 8 == 0x435200 else 'not initialised'
-    if name == 'fmc_last' and x is not None:
+    if name == 'fmc_last':
         return 'clean' if x == 0 else 'FMC error/timeout'
-    if name == 'last_trigger' and x is not None:
+    if name == 'last_trigger':
         return TRIGGERS.get(x, 'none' if x == 0 else '?')
-    if name in ('CALBK.written', 'CALBK.conflict', 'CALBK.differs') and x is not None:
+    if name in ('calbk_written', 'calbk_conflict', 'calbk_differs'):
         s = '+'.join(n for i, n in enumerate(CALBK_FILES) if x >> i & 1) or '-'
-        if name == 'CALBK.differs' and x:
+        if name == 'calbk_differs' and x:
             s += ' (copy kept: write-once; the flash changed after it was made)'
         return s
-    if name == 'CALBK.status':
-        return CALBK_STATUS.get(v, 'older firmware (per-boot backup)' if v in ('UNCHANGED', 'WRITTEN') or v.endswith('_NOFW') else '?')
-    if name == 'SPICLK.div':
-        return {'4': '12.5 MHz', '16': '3.125 MHz (stock)'}.get(v, '?')
-    if name == 'SPICLK.check':
-        return SPICLK_CHECK.get(v, '?')
-    if name == 'CALMS.ms':
-        return 'boot safety-copy time (DWT at 200 MHz; 12.5x low on IRC16M)'
-    if name == 'BOOTMS.board':
-        return 'ms: board::init + the splash'
-    if name.startswith('BOOTMS.'):
-        return 'ms'
-    if name.startswith('MAINMS.'):
-        return 'ms after main() started'
-    if name == 'PD6.moder':
-        return 'input' if v == '0' else 'NOT input'
-    if name == 'PD6.pupd':
-        return 'pull-down' if v == '2' else 'expected 2 (pull-down)'
-    if name == 'PD6.idr':
-        return 'pressed' if v == '1' else 'released'
-    if name == 'STACK.size' and _int(v) and _int(_note.used):
-        return '%.0f %% used' % (100.0 * _int(_note.used) / _int(v))
-    if name == 'hold_ms':
-        return 'power-key hold at power-on'
-    if name == 'renamed':
-        return ''
+    if name == 'calbk':
+        return CALBK_STATUS.get(x, '?')
+    if name == 'spiclk_div':
+        return {4: '12.5 MHz', 16: '3.125 MHz (stock)'}.get(x, '?')
+    if name == 'spiclk_check':
+        return SPICLK_CHECK.get(x, '?')
+    if name == 'calbk_ms':
+        return 'DWT at 200 MHz; 12.5x low on IRC16M'
+    if name == 'stack_size' and x and f.get('stack_used'):
+        return '%.0f %% used' % (100.0 * f['stack_used'] / x)
     return ''
 
 
-_note.used = None
-
 BOOT_GROUPS = [
-    ('boot', ['mode', 'reason', 'clock', 'hold_ms']),
+    ('boot', ['mode', 'reason', 'clock']),
     ('reset flags', ['rstsck', 'rstsck_after']),
     ('previous boot', ['last', 'last_trigger']),
     ('crash', ['crash_word', 'healthy', 'fmc_last']),
-    ('loader marker', ['marker_w0', 'marker_w1', 'marker_w2', 'marker']),
+    ('loader marker', ['marker_w0', 'marker_w1', 'marker_w2', 'marker_valid']),
     ('fatren', ['fatren', 'found', 'renamed', 'old_backup', 'old_deleted', 'freed_clusters',
-                'others', 'rcvr_deleted', 'STAGED.n']),
-    ('calbackup', ['CALBK.status', 'CALBK.written', 'CALBK.conflict', 'CALBK.differs', 'CALMS.ms']),
-    ('calibration record', ['CALREC.crc']),
-    ('boot phases', ['BOOTMS.board', 'BOOTMS.fatren', 'BOOTMS.calbk', 'BOOTMS.fatdir',
-                     'BOOTMS.setfile', 'BOOTMS.mirror', 'BOOTMS.vdisk', 'BOOTMS.refresh',
-                     'MAINMS.app', 'MAINMS.frame', 'MAINMS.touch']),
-    ('stack', ['STACK.used', 'STACK.size']),
-    ('SPI flash clock', ['SPICLK.div', 'SPICLK.check']),
-    ('power key PD6', ['PD6.moder', 'PD6.pupd', 'PD6.idr']),
+                'others', 'rcvr_deleted', 'staged']),
+    ('calbackup', ['calbk', 'calbk_written', 'calbk_conflict', 'calbk_differs', 'calbk_ms']),
+    ('calibration record', ['calrec_ok']),
+    ('settings', ['settings_from', 'settings_slot', 'settings_seq', 'setfile', 'save', 'saves', 'save_top']),
+    ('fatdir', ['fatdir_ok', 'fatdir_created', 'fatdir_failed']),
+    ('boot phases ms', ['ms_board', 'ms_fatren', 'ms_calbk', 'ms_fatdir', 'ms_setfile', 'ms_mirror',
+                        'ms_vdisk', 'ms_refresh', 'main_app', 'main_frame', 'main_touch']),
+    ('stack', ['stack_used', 'stack_size']),
+    ('SPI flash clock', ['spiclk_div', 'spiclk_check']),
     ('FSMC/LCD seen', ['bcr1', 'btr1', 'bwtr1', 'lcd_id']),
 ]
+HEX_FIELDS = {'rstsck', 'rstsck_after', 'last', 'last_trigger', 'marker_w0', 'marker_w1', 'marker_w2',
+              'crash_word', 'fmc_last', 'bcr1', 'btr1', 'bwtr1', 'lcd_id'}
 
 
 def print_boot(text, expect=None, raw=False):
@@ -463,10 +444,10 @@ def print_boot(text, expect=None, raw=False):
     (None without --expect)."""
     if raw:
         print(text)
-    if text.strip() == 'NONE':
+    f, warn = parse_boot(text)
+    if f is None:
         print('DBG:BOOT? -> NONE (no boot info: not booted through the shim)')
         return None if expect is None else False
-    f, warn = parse_boot(text)
     for w in warn:
         print('warning: ' + w)
     shown = set()
@@ -478,9 +459,13 @@ def print_boot(text, expect=None, raw=False):
             shown.add(nm)
             v = f[nm]
             if nm == 'renamed':
-                v = repr(v.strip()) if v.strip() else '-'
-            n = _note(nm, f[nm])
-            parts.append('%s=%s%s' % (nm.split('.')[-1], v, ' (%s)' % n if n else ''))
+                txt = repr(v.strip()) if v.strip() else '-'
+            elif isinstance(v, int) and nm in HEX_FIELDS:
+                txt = '0x%08X' % v
+            else:
+                txt = str(v)
+            n = _note(nm, v, f) if nm != 'renamed' else ''
+            parts.append('%s=%s%s' % (nm, txt, ' (%s)' % n if n else ''))
         if parts:
             print('  %-15s %s' % (title + ':', '  '.join(parts)))
     rest = ['%s=%s' % (k, v) for k, v in f.items() if k not in shown]
@@ -490,14 +475,15 @@ def print_boot(text, expect=None, raw=False):
         return None
     info = image_info(expect)
     want = info['header']
-    have = tuple(_int(f.get('marker_w%d' % i)) for i in range(3))
+    have = tuple(f.get('marker_w%d' % i) for i in range(3))
     print('  expected marker (header of %s): %s' % (
         os.path.basename(expect), ' '.join('0x%08X' % w for w in want) if want else 'n/a (bad file)'))
-    if want and have == want and f.get('marker') == 'VALID':
+    if want and have == tuple(want) and f.get('marker_valid') == 1:
         print('installed OK: the loader marker is the header of %s' % expect)
         return True
     print('NOT the expected image: marker %s %s' % (
-        ' '.join(f.get('marker_w%d' % i, '?') for i in range(3)), f.get('marker', '?')))
+        ' '.join('0x%08X' % f['marker_w%d' % i] if isinstance(f.get('marker_w%d' % i), int) else '?' for i in range(3)),
+        'VALID' if f.get('marker_valid') == 1 else 'INVALID'))
     return False
 
 
@@ -663,10 +649,10 @@ def main():
     p.add_argument('file')
     sub.add_parser('release')
     sub.add_parser('reset')
-    sub.add_parser('recover', description=RECOVER_HELP,
-                   formatter_class=argparse.RawDescriptionHelpFormatter,
-                   help='zero the app marker + reset '
-                        '-> vendor update screen (DESTRUCTIVE)')
+    for n in ('loader', 'recover'):
+        sub.add_parser(n, description=RECOVER_HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
+                       help='NATIVE: DBG:LOADER, reset into the vendor update screen through PA2 '
+                            '(marker kept)')
     a = ap.parse_args()
 
     if a.cmd == 'image':
@@ -712,7 +698,10 @@ def main():
         img.save(a.out)
         print('saved %s in %.1f s' % (a.out, time.time() - t0))
     elif a.cmd == 'diag':
-        print(ln.block('DBG:DIAG?').hex(' '))
+        d = ln.block('DBG:DIAG?')
+        print(d.hex(' '))
+        if len(d) > 61:  # power.rs pins(): the charge status pins, USB state
+            print('PB10=%d PB11=%d usb_configured=%d' % (d[61] & 1, d[61] >> 1 & 1, d[61] >> 2 & 1))
     elif a.cmd == 'tap':
         ln.write('DBG:TAP %d,%d' % (a.x, a.y))
     elif a.cmd == 'drag':
@@ -738,11 +727,11 @@ def main():
         ln.write('DBG:RELEASE')
     elif a.cmd == 'reset':
         ln.write('DBG:RESET')
-    elif a.cmd == 'recover':
-        ln.write('DBG:RECOVER')
-        print('DBG:RECOVER sent. The app marker was zeroed; the device comes up\n'
-              'in the vendor update screen with its USB disk -- copy a dm40*.bin\n'
-              'there and press "update". See `dm40dbg.py recover -h`.')
+    elif a.cmd in ('loader', 'recover'):
+        ln.write('DBG:LOADER')
+        print('DBG:LOADER sent. The meter restarts into the vendor update screen with\n'
+              'its USB disk (28e9:028f): copy a dm40*.bin there and press "update", or\n'
+              'power-cycle it to boot opendm40 again. See `dm40dbg.py loader -h`.')
 
 
 if __name__ == '__main__':

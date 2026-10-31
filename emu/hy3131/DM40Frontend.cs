@@ -437,7 +437,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case "mvhold": MvHoldV = v; if(v <= 0) MvHeld = false; break;
                 case "mvholdpb1": MvHoldPb1Mv = v; break;
                 case "mvholdrows": MvHoldRows = (int)v; break;
-                case "noise": case "cal": case "beat": case "powmix": case "ad1mix": case "ohmexit": case "ohmexitlo": case "ohmexitrst": case "ohmtau": case "swtr": case "swtau": case "swhz": case "ctsettle": case "ctretain": case "ct0dead": case "powvg": case "powz": case "op1vos": case "ad2dcg":
+                case "noise": case "cal": case "beat": case "powmix": case "ad1mix": case "ohmexit": case "ohmexitlo": case "ohmexitrst": case "ohmtau": case "capda": case "capdatau": case "capasym": case "capcmpw": case "capvavg": case "swtr": case "swtau": case "swhz": case "ctsettle": case "ctretain": case "ct0dead": case "powvg": case "powz": case "op1vos": case "ad2dcg":
                 case "n7": case "n7g": case "n7a": case "ad1acg": case "ad3sh": case "hpftau": case "rmsfill": case "acarrive": case "acaoff": case "rmsbig": case "rmsbigp":
                 case "agndz": case "lpfcreep": case "creeptau": case "creepord": case "lpfn":
                 case "pb5drift": case "pb5tau": case "acastep": case "acastepms": case "acasteptau": case "ad1vos": case "ad1ug": case "ad1chopjit": case "r22part": case "r22off": case "r22n": case "r22win": case "chophalf": case "chopskew": case "vjblind": case "senseneg": case "sensetau":
