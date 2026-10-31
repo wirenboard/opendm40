@@ -164,9 +164,9 @@ const USB_VID_PID: UsbVidPid = UsbVidPid(0x1209, 0xD040);
 static mut EP_MEMORY: [u32; 64] = [0; 64];
 static mut MSC_IO: [u8; 512] = [0; 512];
 /// The MSC block buffer (was a 4 KiB field of `Msc` on the main stack).
-/// 512 bytes in TCM; the 4 KiB of the builds whose disk is the SPI flash
-/// (recovery-usb, no `vdisk`) go to SRAM (the TCM stack keeps its 42 KiB).
-#[cfg_attr(all(target_os = "none", any(feature = "recovery-usb", not(feature = "vdisk"))), link_section = ".sram_bss")]
+/// 512 bytes in TCM; the 4 KiB of the builds without `vdisk` (the SPI flash
+/// is the disk) go to SRAM (the TCM stack keeps its 42 KiB).
+#[cfg_attr(all(target_os = "none", not(feature = "vdisk")), link_section = ".sram_bss")]
 static mut MSC_BLK: [u8; msc::MAX_BLOCK] = [0; msc::MAX_BLOCK];
 /// Data-logger state (FR-38; its 16 KiB ring is `logger::RING`, shared with
 /// the AD2 stream ISR). In SRAM (.dmabuf, NOLOAD: `Logger::init_in_place` in
@@ -2481,5 +2481,4 @@ mod setfile;
 mod upload;
 mod native;
 mod uid;
-mod recovery;
 mod shim;

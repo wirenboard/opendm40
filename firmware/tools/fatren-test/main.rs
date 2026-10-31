@@ -3,7 +3,6 @@
 //! sectors, 2 FATs, 512 root entries, 16 MiB).
 //!   main <image> dry|live [marker-hex]  fatren::run (marker = the 12-byte
 //!                                       record at 0x08008000; none = invalid)
-//!   main <image> trigger                fatren::make_trigger
 //!   main <image> backup <dir>           calbackup::safe_copy (write-once safety copy)
 //!                                       of calbackup::FILES[..SAFE] read from
 //!                                       <dir>/CALIB.BIN, BOOTDATA.BIN, UID.BIN
@@ -1286,12 +1285,6 @@ fn main() {
     }
     if a[2] == "fatdir" {
         fatdir_cmd(&a, &mut img);
-        save(&a[1], &img.d);
-        return;
-    }
-    if a[2] == "trigger" {
-        let t = fatren::make_trigger(&mut img);
-        println!("trigger={:?}\n  changed blocks: {:?}", t, img.writes);
         save(&a[1], &img.d);
         return;
     }

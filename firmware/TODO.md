@@ -545,7 +545,9 @@ the scope full record.
   - [x] Recovery = program 12 zero bytes over the 0x08008000 marker + SYSRESETREQ (works on warm reset,
         no FAT/SPI/USB/LCD in the shim); DBG:UPDATE / DBG:RECOVER do the same (dev flow: copy a
         dm40*.bin onto opendm40's disk, DBG:UPDATE). Built (recovery ~490 B, test-recovery image
-        1712 B); DM40RCVR.BIN / own-USB variants kept behind recovery-file / recovery-usb.
+        1712 B); DM40RCVR.BIN / own-USB variants were kept behind recovery-file / recovery-usb (both removed
+        2026-10-31, with the shim's recovery mode on the request word; DBG:UPDATE keeps the marker
+        zeroing, DBG:RECOVER = DBG:LOADER the PA2 entry).
         (device-verified by T2 and the T3 way back)
   - [x] Test: power-on holding the power key ~5 s with no dm40*.bin -> stock booted. No vendor
         button entry; PA2 is not the power key. 2026-10-24 (owner, device): PA2 = the debug
@@ -2869,6 +2871,7 @@ Firmware:
             vdisk), fatren-dry-run and keep-screen with all build.sh checks into target/variants/ (build.sh
             DM40_TDIR / DM40_OUT; opendm40.bin untouched), ~2 min; part of the tools/*/run.sh suite.
             (24d49d7: all six ok; recovery-usb stack headroom 21 856, B 46 780, C 23 004 free.)
+            (2026-10-31: recovery-usb and recovery-file removed; build-variants builds the other ones.)
       - [x] Follow-ups (2026-10-22, src/vwrite.rs; docs/native-boot.md "Host writes"): the volume is
             writable (no WP bit; DBG:VDISK:RO 1 = the read-only volume as before). Every 512-byte WRITE is
             diffed against the generated sector: a LOGS / SCOPE / SHOTS delete (entry 0xE5 + chain freed ->

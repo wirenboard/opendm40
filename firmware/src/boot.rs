@@ -20,7 +20,6 @@
 //! Decision, in this order (docs/native-boot.md "Shim (reset path)"):
 //!   backup-SRAM request word == LOADER_MAGIC  -> PA2 entry (consumed; first
 //!     thing, before the clock or the watchdog are touched)
-//!   backup-SRAM request word == REQ_MAGIC     -> recovery (Requested; consumed)
 //!   key gesture confirmed (below)             -> request word LOADER_MAGIC,
 //!                                                SYSRESETREQ (-> PA2 entry)
 //!   key held to the cue, released in time     -> normal   (KeyHoldAborted)
@@ -29,15 +28,14 @@
 //!       clock failed, counter < CLOCK_RETRIES -> SYSRESETREQ, retry (ClockFail)
 //!       clock failed                          -> normal   (ClockFail)
 //!       else                                  -> normal   (WdtRetry)
-//!   FWDGTRSTF, previous boot was recovery     -> normal   (WdtAfterRecovery)
+//!   FWDGTRSTF, previous boot entered the loader -> normal (WdtAfterLoader)
 //!   FWDGTRSTF otherwise                       -> normal   (WdtStale)
 //!   otherwise                                 -> normal
 //! "Genuine" = FWDGTRSTF set and neither SWRSTF nor PORRSTF: the shim clears
 //! the flags on every native boot, so a hang during a native session shows
 //! FWDGT alone, while a loader install adds SW and a power-on adds POR (a
 //! stale FWDGT left over from a stock session then does not count). The crash
-//! counter is cleared by `mark_healthy` after 60 s of main loop and on entry
-//! to recovery.
+//! counter is cleared by `mark_healthy` after 60 s of main loop.
 //!
 //! Key gesture: the backlight comes on at once (instant feedback, so a normal
 //! power-on press is released early). Holding the power key HOLD_MS (4 s)
@@ -64,8 +62,6 @@ const RCU_AHB1EN: u32 = 0x4002_3830;
 const RCU_APB1EN: u32 = 0x4002_3840;
 const PMU_CTL: u32 = 0x4000_7000;
 const PMU_CS: u32 = 0x4000_7004;
-#[cfg_attr(not(any(feature = "recovery-file", feature = "recovery-usb")), allow(dead_code))]
-const GPIOC: u32 = 0x4002_0800;
 const GPIOA: u32 = 0x4002_0000;
 const GPIOD: u32 = 0x4002_0C00;
 const GPIOE: u32 = 0x4002_1000;
@@ -87,7 +83,7 @@ pub const CONFIRM_MS: u32 = 500;
 /// A release shorter than this is contact bounce, not a release.
 const RELEASE_DEBOUNCE_MS: u32 = 30;
 /// A clock failure retries the boot (SYSRESETREQ) while the crash counter is
-/// below this; then opendm40 runs on the clock it has (never recovery).
+/// below this; then opendm40 runs on the clock it has.
 pub const CLOCK_RETRIES: u32 = 2;
 /// Main-loop time after which `mark_healthy` clears the crash counter.
 // (60 s of RUNNING main loop since this boot, not 60 s between two resets)
@@ -100,36 +96,30 @@ pub const HEALTHY_MS: u64 = 60_000;
 /// Crash counter (`CRASH_TAG | n`).
 pub const BKP_CRASH: u32 = 0x4002_4FF0;
 const CRASH_TAG: u32 = 0x4352_0000; // "CR"
-/// Last loader entry (0x54520010 marker zeroed, 0x54520011 failed, 0x54520012
-/// PA2 entry, 0x54520013 PA2 entry without the GPIO lock;
-/// recovery-file: `0x5452_0000 | fatren::Trigger`).
+/// Last loader entry (0x54520012 PA2 entry, 0x54520013 PA2 entry without the
+/// GPIO lock).
 pub const BKP_TRIG: u32 = 0x4002_4FF4;
 pub const BKP_REQ: u32 = 0x4002_4FF8;
 pub const BKP_LAST: u32 = 0x4002_4FFC;
-pub const REQ_MAGIC: u32 = 0x5245_4356; // "VCER" LE: recovery requested
 /// BKP_REQ value for the PA2 entry into the loader (`loader_pa2`).
 pub const LOADER_MAGIC: u32 = 0x4C32_4150; // "PA2L" LE
 /// BKP_TRIG after the PA2 entry: GPIOA lock confirmed / not confirmed.
 pub const TRIG_PA2: u32 = 0x5452_0012;
 pub const TRIG_PA2_NOLOCK: u32 = 0x5452_0013;
 const LAST_NORMAL: u32 = 0x4C4D_524E; // "NRML"
-const LAST_RECOVERY: u32 = 0x5256_4352; // "RCVR"
+/// BKP_LAST after the PA2 entry into the loader.
+const LAST_LOADER: u32 = 0x5256_4352; // "RCVR"
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Recovery,
-}
-
+/// DBG:BOOT? field 1; the numbers are the reply's (5 was the removed
+/// "recovery requested").
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    None,
-    WdtAfterRecovery,
-    WdtStale,
-    WdtRetry,
-    KeyHoldAborted,
-    Requested,
-    ClockFail,
+    None = 0,
+    WdtAfterLoader = 1,
+    WdtStale = 2,
+    WdtRetry = 3,
+    KeyHoldAborted = 4,
+    ClockFail = 6,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,7 +134,6 @@ pub struct BootInfo {
     /// RCU_RSTSCK as found (before RSTFC), and as read back after clearing.
     pub rstsck: u32,
     pub rstsck_after: u32,
-    pub mode: Mode,
     pub reason: Reason,
     pub clock: ClockState,
     /// Previous boot's mode word (BKP_LAST) as found.
@@ -165,8 +154,7 @@ pub fn pd6_pressed() -> bool {
 /// PD6 input WITH pull-down, as the stock key init does
 /// (app_decompile.c:6482, gpio_mode_set(GPIOD, input, PUPD 2, 0x40)). After a
 /// reset the ROM/loader leave PD6 floating (PUPD 00); without the pull a
-/// floating 1 would read as a held key (recovery-usb reads the key without
-/// board::init). Then let the pull settle.
+/// floating 1 would read as a held key. Then let the pull settle.
 fn pd6_input() {
     unsafe {
         modify32(RCU_AHB1EN, 0, 1 << 3); // GPIOD
@@ -232,18 +220,6 @@ pub fn latch_on() {
         modify32(GPIOE + 0x08, 0, 3 << 4);
         modify32(GPIOE + 0x0C, 3 << 4, 0);
         modify32(GPIOE, 3 << 4, 1 << 4);
-    }
-}
-
-/// Power off exactly as app.rs power_off(): PE2 = 0, PC4 = 0. On battery the
-/// unit switches off once the power key is released; on USB power it may stay
-/// up (then nothing else happens; the caller keeps running).
-#[cfg_attr(not(any(feature = "recovery-file", feature = "recovery-usb")), allow(dead_code))]
-pub fn latch_off() {
-    unsafe {
-        modify32(RCU_AHB1EN, 0, (1 << 2) | (1 << 4));
-        w32(GPIOE + 0x18, 1 << (2 + 16));
-        w32(GPIOC + 0x18, 1 << (4 + 16));
     }
 }
 
@@ -369,11 +345,10 @@ pub fn fmc_last() -> u32 {
     unsafe { FMC_LAST }
 }
 
-/// DBG:UPDATE / DBG:RECOVER (native): forget the previous-mode word (so a
+/// DBG:UPDATE (native): forget the previous-mode word (so a
 /// later stale watchdog flag cannot count as our crash, review H3) and reset
 /// the crash counter (so a count left from this session cannot survive the
-/// stock interlude and turn the first hang after the reinstall into recovery,
-/// review N2), then zero the marker. The caller resets (deferred SYSRESETREQ)
+/// stock interlude and count as a crash after the reinstall, review N2), then zero the marker. The caller resets (deferred SYSRESETREQ)
 /// into the loader's update screen. Returns the read-back result.
 pub fn enter_loader_update() -> bool {
     bkp_enable();
@@ -383,15 +358,6 @@ pub fn enter_loader_update() -> bool {
     }
     zero_marker()
 }
-
-/// Recovery: remember what fatren::make_trigger did (shown by DBG:BOOT?).
-pub fn record_trigger(code: u32) {
-    bkp_enable();
-    unsafe { w32(BKP_TRIG, 0x5452_0000 | code) };
-}
-
-// (BKP_REQ = REQ_MAGIC before a reset asks the shim for recovery. No caller
-// sets it now; kept as the in-app recovery request for later.)
 
 /// DBG:LOADER / DBG:RECOVER: ask the next shim pass for the PA2 entry
 /// (`loader_pa2`); the caller resets (deferred SYSRESETREQ). The marker is
@@ -439,7 +405,7 @@ fn loader_pa2() -> ! {
         // Consumed: a reset from here on (the loader's install, the FWDGT
         // after its power-off on USB power) boots normally.
         w32(BKP_REQ, 0);
-        w32(BKP_LAST, LAST_RECOVERY);
+        w32(BKP_LAST, LAST_LOADER);
         modify32(RCU_AHB1EN, 0, 1 << 0); // GPIOA
         w32(GPIOA + 0x18, 1 << (2 + 16)); // PA2 = 0 before the mode
         modify32(GPIOA + 0x04, 1 << 2, 0); // push-pull
@@ -590,15 +556,11 @@ pub fn shim() -> BootInfo {
         modify32(DEMCR, 0, 1 << 24); // TRCENA
         modify32(DWT_CTRL, 0, 1); // CYCCNTENA
     }
-    // (e) request word (consumed), previous mode, crash counter, key hold.
-    let req = unsafe { r32(BKP_REQ) } == REQ_MAGIC;
-    if req {
-        unsafe { w32(BKP_REQ, 0) };
-    }
+    // (e) previous mode, crash counter, key hold.
     let last = unsafe { r32(BKP_LAST) };
     let crash = unsafe { r32(BKP_CRASH) };
     let crash = if crash & 0xFFFF_0000 == CRASH_TAG { crash & 0xFF } else { 0 };
-    let (hold_ms, confirmed) = if req { (0, false) } else { key_gesture(cyc_per_ms) };
+    let (hold_ms, confirmed) = key_gesture(cyc_per_ms);
     if confirmed {
         // The PA2 entry runs on the next pass, from the ROM's state.
         unsafe { w32(BKP_REQ, LOADER_MAGIC) };
@@ -610,10 +572,8 @@ pub fn shim() -> BootInfo {
     // native normal boot. Stale stock flags or an install never count.
     let genuine = wdt && rstsck & (SWRSTF | PORRSTF) == 0 && last == LAST_NORMAL;
     let failed = clock == ClockState::Failed;
-    let (mode, reason) = if req {
-        (Mode::Recovery, Reason::Requested)
-    } else if hold_ms >= HOLD_MS {
-        (Mode::Normal, Reason::KeyHoldAborted)
+    let reason = if hold_ms >= HOLD_MS {
+        Reason::KeyHoldAborted
     } else if failed || genuine {
         // Counted for DBG:BOOT? only: a hang reboots opendm40, every time.
         let n = (crash + 1).min(0xFF);
@@ -624,22 +584,17 @@ pub fn shim() -> BootInfo {
             unsafe { w32(BKP_LAST, LAST_NORMAL) };
             sysreset()
         }
-        (Mode::Normal, if failed { Reason::ClockFail } else { Reason::WdtRetry })
-    } else if wdt && last == LAST_RECOVERY {
-        (Mode::Normal, Reason::WdtAfterRecovery)
+        if failed { Reason::ClockFail } else { Reason::WdtRetry }
+    } else if wdt && last == LAST_LOADER {
+        Reason::WdtAfterLoader
     } else if wdt {
-        (Mode::Normal, Reason::WdtStale)
+        Reason::WdtStale
     } else {
-        (Mode::Normal, Reason::None)
+        Reason::None
     };
-    unsafe {
-        if mode == Mode::Recovery {
-            w32(BKP_CRASH, CRASH_TAG); // a fresh start after the reinstall
-        }
-        w32(BKP_LAST, if mode == Mode::Recovery { LAST_RECOVERY } else { LAST_NORMAL });
-    }
+    unsafe { w32(BKP_LAST, LAST_NORMAL) };
     feed();
-    BootInfo { rstsck, rstsck_after, mode, reason, clock, last }
+    BootInfo { rstsck, rstsck_after, reason, clock, last }
 }
 
 // --- After RAM init: boot info for DBG:BOOT? --------------------------------
@@ -679,7 +634,7 @@ pub fn mark_healthy(now_ms: u64) {
 /// blanks if none). One formatter for every field: names, enum orders and
 /// meanings in docs/manual/scpi-reference.md ("DBG:BOOT?") and
 /// tools/dm40dbg.py `BOOT_FIELDS` (`dm40dbg.py boot` decodes it).
-///   0 mode (0 normal, 1 recovery)  1 reason (`Reason` order)  2 clock
+///   0 mode (always 0; 1 was the removed recovery)  1 reason (`Reason`)  2 clock
 ///   (`ClockState` order)  3 rstsck  4 rstsck_after  5 last  6 last_trigger
 ///   (BKP_TRIG)  7..9 loader marker words  10 marker valid (1 / 0)
 ///   11 crash word  12 healthy (1 / 0)  13 fmc_last  14..17 FSMC BCR1 /
@@ -698,15 +653,14 @@ pub fn put_info(s: &mut crate::scpi::Scpi) {
     let r = crate::fatren::result();
     let m = marker();
     let head = [
-        i.mode as u32,
+        0, // mode: always normal
         i.reason as u32,
         i.clock as u32,
         i.rstsck,
         i.rstsck_after,
         i.last,
-        // Last loader entry: 0x54520010 marker zeroed, 0x54520011 zeroing
-        // failed, 0x54520012 PA2 entry, 0x54520013 PA2 entry, lock not
-        // confirmed; recovery-file: 0x5452000n (0 / other = none recorded).
+        // Last loader entry: 0x54520012 PA2 entry, 0x54520013 PA2 entry,
+        // lock not confirmed (0 / other = none recorded).
         unsafe { r32(BKP_TRIG) },
         m[0],
         m[1],

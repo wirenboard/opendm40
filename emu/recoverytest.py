@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opendm40 boot decisions on the native image (src/boot.rs shim, src/recovery.rs)
+"""opendm40 boot decisions on the native image (src/boot.rs shim)
 through the whole boot chain: ROM -> FS-loader -> opendm40, the real vendor
 FS-loader included (run.py chain mode).
 
@@ -24,7 +24,7 @@ lock until a machine reset (peripherals/GD32_GPIO.cs); a power cycle is a
 `machine Reset` (the flash and the backup SRAM keep their content).
 
 Cases (virtual times; opendm40 is entered ~0.69 s after power-on):
-  normal      no key: one boot, no recovery, marker valid
+  normal      no key: one boot, marker valid
   key-short   key pressed at power-on, released at 0.9 s (a normal power-on)
   key-abort   key held to the beep (shim + 4 s), released in the 0.5 s
               confirm window: normal boot
@@ -35,20 +35,20 @@ Cases (virtual times; opendm40 is entered ~0.69 s after power-on):
               as key-hold
   wdt-one     one hang: watchdog reset, opendm40 boots again (crash count 1)
   wdt-two     a second hang ~10 s after the first watchdog reboot: a reboot
-              again (crash count 2), no recovery
+              again (crash count 2)
   wdt-three   three hangs ~10 s after each reboot: opendm40 keeps restarting
-              (crash count 3), no recovery
+              (crash count 3)
   wdt-healthy the second hang after > 60 s of main loop: the crash counter
               was cleared at 60 s (crash count 1 again)
-  request     the backup-SRAM request word (0x52454356) set, then a hang:
-              recovery = loader marker zeroed, SYSRESETREQ, ROM -> FS-loader
-              update screen, opendm40 not entered
+  old-request the request word of the removed recovery (0x52454356) set,
+              then a hang: ignored, opendm40 boots again (crash count 1),
+              marker valid
   release     DBG:RELEASE over USB twice in a row: WDT_RETRY twice (crash
-              count 1, then 2), no recovery
+              count 1, then 2)
   usb-loader  DBG:LOADER over USB: as `loader`, from the real command
 
-Checks per case: entries of the ROM / FS-loader / opendm40 reset handlers and of
-recovery::run (cheap per-address hooks), then at the end the loader marker
+Checks per case: entries of the ROM / FS-loader / opendm40 reset handlers, of
+native::start and the PA2 entry (cheap per-address hooks), then at the end the loader marker
 (0x08008000), the backup-SRAM boot words (BKP_CRASH / BKP_TRIG / BKP_LAST)
 and where the CPU is. Exit status 0 = PASS. Per-process names, private disk
 copies; cases run in parallel (--jobs).
@@ -73,7 +73,7 @@ import run  # noqa: E402
 import bootinfo  # noqa: E402
 
 CASES = ['normal', 'key-short', 'key-abort', 'key-hold', 'loader', 'wdt-one', 'wdt-two', 'wdt-three', 'wdt-healthy',
-         'request']
+         'old-request']
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument('--app', required=True, help='opendm40 native ELF (symbols needed)')
@@ -84,13 +84,12 @@ A = ap.parse_args()
 
 BKP_CRASH, BKP_TRIG, BKP_REQ, BKP_LAST = 0x40024FF0, 0x40024FF4, 0x40024FF8, 0x40024FFC
 NRML, RCVR = 0x4C4D524E, 0x52564352
-REQ_MAGIC = 0x52454356
+OLD_REQ_MAGIC = 0x52454356  # the removed recovery's request word
 LOADER_MAGIC = 0x4C324150
 TRIG_PA2 = 0x54520012
 GPIOA_IDR, GPIOA_LCKR = 0x40020010, 0x4002001C
 AIRCR = 0xE000ED0C
 CRASH0, CRASH1, CRASH2, CRASH3 = 0x43520000, 0x43520001, 0x43520002, 0x43520003
-TRIG_ZEROED = 0x54520010
 MARKER = run.MARKER
 LOADER_LO, LOADER_HI = 0x080A0000, 0x080C0000
 APP_LO = 0x08004000
@@ -118,7 +117,6 @@ def word(path, off):
 
 SYMS = nm(A.app)
 HANG = SYMS['opendm40::wait_for_watchdog']
-RECOVERY = SYMS['opendm40::recovery::run']
 START = SYMS['opendm40::native::start']  # after the shim's decision
 HELD_FOR = SYMS['opendm40::boot::held_for']  # the shim's key-hold windows (4 s, then 0.5 s)
 PA2 = SYMS['opendm40::boot::loader_pa2']
@@ -126,7 +124,7 @@ with open(A.app, 'rb') as f:
     ELF_ENTRY = struct.unpack_from('<I', f.read(0x40), 0x18)[0] & ~1
 ROM_RESET = word(run.DUMP, 4) & ~1
 LOADER_RESET = word(run.DUMP, 0xA0004) & ~1
-HOOKS = [('rom', ROM_RESET), ('loader', LOADER_RESET), ('app', ELF_ENTRY), ('recovery', RECOVERY), ('start', START),
+HOOKS = [('rom', ROM_RESET), ('loader', LOADER_RESET), ('app', ELF_ENTRY), ('start', START),
          ('held_for', HELD_FOR), ('pa2', PA2)]
 PRINT_LOCK = threading.Lock()
 
@@ -225,11 +223,10 @@ class Case:
         return None not in m and m != [0, 0, 0] and m != [0xFFFFFFFF] * 3
 
     def expect_normal(self, boots, crash):
-        """opendm40 running after `boots` entries, no recovery."""
+        """opendm40 running after `boots` entries."""
         if not self.v:
             return
         self.check(len(self.times('app')) == boots, 'opendm40 entered %d time(s) (%s)' % (boots, self.fmt_ev()))
-        self.check(not self.times('recovery'), 'recovery::run not entered')
         self.check(self.marker_valid(), 'loader marker valid')
         self.check(self.v['last'] == NRML, 'BKP_LAST = NRML (0x%08X)' % self.v['last'])
         self.check(self.v['crash'] in crash, 'BKP_CRASH 0x%08X in %s' % (self.v['crash'], ['0x%08X' % c for c in crash]))
@@ -239,27 +236,6 @@ class Case:
         scr = self.update_screen()
         if scr is not None:
             self.check(not scr, 'no FS-loader update screen')
-
-    def expect_recovery(self, t_lo, t_hi):
-        """recovery::run in [t_lo, t_hi], then ROM -> FS-loader with the
-        marker zeroed, opendm40 not entered again."""
-        if not self.v:
-            return
-        rec = self.times('recovery')
-        self.check(len(rec) == 1 and t_lo <= rec[0] <= t_hi,
-                   'recovery::run once, in %.1f..%.1f s (%s)' % (t_lo, t_hi, self.fmt_ev()))
-        if rec:
-            after = [(n, t) for n, t in self.ev if t >= rec[0] and n != 'recovery']
-            self.check([n for n, _ in after] == ['rom', 'loader'],
-                       'after it: ROM -> FS-loader only (%s)' % after)
-        self.check([self.v['marker%d' % i] for i in range(3)] == [0, 0, 0], 'loader marker zeroed')
-        self.check(self.v['trig'] == TRIG_ZEROED, 'BKP_TRIG = 0x%08X (marker zeroed)' % self.v['trig'])
-        self.check(self.v['last'] == RCVR, 'BKP_LAST = RCVR (0x%08X)' % self.v['last'])
-        self.check(self.v['crash'] == CRASH0, 'BKP_CRASH cleared on recovery (0x%08X)' % self.v['crash'])
-        self.check(LOADER_LO <= self.v['pc'] < LOADER_HI, 'CPU in the FS-loader at the end (PC 0x%08X)' % self.v['pc'])
-        scr = self.update_screen()
-        if scr is not None:
-            self.check(scr, 'FS-loader update screen ("Update" button) in %s' % os.path.relpath(self.png, ROOT))
 
     def expect_pa2_loader(self, t_lo, t_hi, png, t_end, pre='a_'):
         """PA2 entry in [t_lo, t_hi]: opendm40's shim -> loader_pa2 -> ROM ->
@@ -273,7 +249,6 @@ class Case:
             after = [n for n, t in self.ev if pa2[0] <= t < t_end and n != 'pa2']
             self.check(after[:2] == ['rom', 'loader'] and 'app' not in after,
                        'after it: ROM -> FS-loader, opendm40 not entered (%s)' % after)
-        self.check(not self.times('recovery'), 'recovery::run not entered')
         self.check(self.marker_valid(pre), 'loader marker still valid')
         self.check(self.v[pre + 'trig'] == TRIG_PA2, 'BKP_TRIG = 0x%08X (PA2 entry, lock confirmed)' % self.v[pre + 'trig'])
         self.check(self.v[pre + 'last'] == RCVR, 'BKP_LAST = RCVR (0x%08X)' % self.v[pre + 'last'])
@@ -430,15 +405,13 @@ def case_wdt_three():
     return c
 
 
-def case_request():
-    c = Case('request')
-    c.at(6.0, 'sysbus WriteDoubleWord 0x%08X 0x%08X' % (BKP_REQ, REQ_MAGIC))
-    c.hang(6.1)          # reset ~26 s: the shim consumes the request word
+def case_old_request():
+    c = Case('old-request')
+    c.at(6.0, 'sysbus WriteDoubleWord 0x%08X 0x%08X' % (BKP_REQ, OLD_REQ_MAGIC))
+    c.hang(6.1)          # reset ~26 s: the shim ignores the word
     c.end_reads(32.0)
     c.run(32.2)
-    c.expect_recovery(25.5, 27.5)
-    if c.v:
-        c.check(c.v['crash'] == CRASH0, 'request: crash counter not counted (0x%08X)' % c.v['crash'])
+    c.expect_normal(2, (CRASH1,))
     return c
 
 
@@ -458,7 +431,7 @@ def case_wdt_healthy():
 
 def case_release():
     """DBG:RELEASE over USBTMC (USB/IP), twice: 1st -> WDT_RETRY, crash 1;
-    2nd (within 60 s of main loop) -> WDT_RETRY again, crash 2, no recovery."""
+    2nd (within 60 s of main loop) -> WDT_RETRY again, crash 2."""
     import usbip_client as uc
     c = Case('release')
     port = run.free_port()
@@ -590,7 +563,7 @@ def case_usb_loader():
 FUNCS = {'normal': case_normal, 'key-short': case_key_short, 'key-abort': case_key_abort,
          'key-hold': case_key_hold, 'loader': case_loader, 'usb-loader': case_usb_loader,
          'wdt-one': case_wdt_one, 'wdt-two': case_wdt_two, 'wdt-three': case_wdt_three,
-         'wdt-healthy': case_wdt_healthy, 'request': case_request, 'release': case_release}
+         'wdt-healthy': case_wdt_healthy, 'old-request': case_old_request, 'release': case_release}
 
 
 def one(name):
@@ -617,8 +590,8 @@ def main():
     for n in names:
         if n not in FUNCS:
             sys.exit('unknown case %s' % n)
-    print('app %s: entry 0x%08X, wait_for_watchdog 0x%08X, recovery::run 0x%08X; ROM 0x%08X, FS-loader 0x%08X'
-          % (os.path.relpath(A.app), ELF_ENTRY, HANG, RECOVERY, ROM_RESET, LOADER_RESET), flush=True)
+    print('app %s: entry 0x%08X, wait_for_watchdog 0x%08X; ROM 0x%08X, FS-loader 0x%08X'
+          % (os.path.relpath(A.app), ELF_ENTRY, HANG, ROM_RESET, LOADER_RESET), flush=True)
     with ThreadPoolExecutor(max_workers=max(1, A.jobs)) as ex:
         res = list(ex.map(one, names))
     bad = [c.name for c in res if c.fails]

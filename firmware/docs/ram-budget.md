@@ -178,7 +178,7 @@ re-run to refresh). TCM = 0x1000xxxx (shared with the stack), SRAM = 0x200xxxxx.
 
 | static | size (B) | live when | live at the same time | overlay / shrink? |
 |---|---|---|---|---|
-| scope::BUF (SRAM) | 53 248 | always: the scope acquires in the background in every view (measurements, SCPI); the stored record while stopped | everything | Lent to inrush (`Scope::lend_buf`) while the inrush page is open. Keep. |
+| scope::BUF (SRAM) | 90 112 (CAP 44 K since 2026-10-31) | always: the scope acquires in the background in every view (measurements, SCPI); the stored record while stopped | everything | Lent to inrush (`Scope::lend_buf`) while the inrush page is open. Keep. |
 | logger::RING (SRAM) | 16 540 | LOG:STAT ON sessions (AD1 / AD2 stream), the Wave view, inrush, fast-log sessions | csvlog is refused by the Wave view, inrush and `fastlog::begin`, but not by an SCPI LOG:STAT ON session | Idle in plain DMM / scope use. An overlay with the csvlog buffers would need csvlog and LOG:STAT ON to refuse each other, plus an owner token. Not done. |
 | diskbuf::ARENA (SRAM) | 12 288 | any disk job (table above) + the FFT | see above | Already shared with the FFT. |
 | scope_ui::GRAPH (SRAM) | 9 956 | the scope pages (Scope, combined view, Wave view): trace / persistence / math rows and their on-screen diff copies | the scope record, the FFT | The combined view rules out an overlay with anything scope-side. The math rows (`ma`, `d_ma`) could go when math is off. Not done. |

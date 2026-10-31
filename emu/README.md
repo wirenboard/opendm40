@@ -256,6 +256,7 @@ recorded.
 | [`dragperf.py`](dragperf.py) | trigger-level drag: main-loop period and touch-to-pixel latency (prints figures) | | free |
 | [`triglevtest.py`](triglevtest.py) | `TRIG:LEV` keeps the level as given (V/div steps, off screen); Normal triggers on it | ~2 min | free |
 | [`stopzoomtest.py`](stopzoomtest.py) | stopped scope: each timebase change re-renders the stored record, also right after a screen read-back | ~2 min | free |
+| [`stoptest.py`](stoptest.py) | RUN / STOP in a loop at 10 us .. 1 ms/div, untriggered and triggered: every STOP leaves a record (`WAV:PRE?` points > 0) and `WAV:DATA?` is the input square | ~15 min | free |
 
 ### Logger and the AD2 stream
 
@@ -282,7 +283,7 @@ recorded.
 | [`settingstest.py`](settingstest.py) | settings survive a power-off | | 63900-63999 |
 | [`idletest.py`](idletest.py) | USB, Bluetooth and disk traffic hold off the automatic power-off | | free, BT free |
 | [`chargetest.py`](chargetest.py) | the battery blinks green while PB10 / PB11 read "charging" (driven from the monitor), "USB" while a host is attached | | free |
-| [`recoverytest.py`](recoverytest.py) | boot decisions through the whole boot chain: repeated hangs boot opendm40 again; the power-key hold and the PA2 request word open the loader with PA2 low and locked (the GPIO model enforces GPIOx_LOCK until a reset), a power cycle then boots opendm40; the recovery request word zeroes the marker; `release` (DBG:RELEASE) and `usb-loader` (DBG:LOADER) on request | ~8 min (10 cases, `--jobs 8`) | free |
+| [`recoverytest.py`](recoverytest.py) | boot decisions through the whole boot chain: repeated hangs boot opendm40 again; the power-key hold and the PA2 request word open the loader with PA2 low and locked (the GPIO model enforces GPIOx_LOCK until a reset), a power cycle then boots opendm40; the removed recovery's request word is ignored; `release` (DBG:RELEASE) and `usb-loader` (DBG:LOADER) on request | ~8 min (10 cases, `--jobs 8`) | free |
 
 ### Bluetooth, keys, touch and UI
 

@@ -771,7 +771,7 @@ pixel diff (tools/ui-render/stock-diff.sh: the stock page draws no badge,
 * The DMM reading pauses while the view is open (decision #3: exclusive
   bus); the last reading is not shown on the scope page (the stock page has
   no DMM either).
-* Roll above ~20 s/div: STOP keeps the newest 26 624 samples (22 s at 1200
+* Roll above ~20 s/div: STOP keeps the newest 45 056 samples (37.5 s at 1200
   S/s) as the stored record (zoom / CSV), not the whole screen.
 * The probe glyph of the V/div badge shows x1 (no probe on the DMM jacks).
 * The Vrms of signals with fast edges reads low at the slow bands (3.2).

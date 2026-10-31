@@ -51,13 +51,27 @@ pub const COLS: usize = 400;
 /// around the comparator estimate (hwtrig path only).
 const WIN: usize = 800;
 /// Highest sample rate searched continuously in software (stream_poll): the
-/// ring (CAP samples = 21 ms at 1.25 MS/s) must outlast the main-loop gap
+/// ring (CAP samples = 36 ms at 1.25 MS/s) must outlast the main-loop gap
 /// between two polls with the pre-trigger part still in it.
 const STREAM_FS: u32 = 1_250_000;
 /// Longest busy-wait inside a poll for the post-trigger samples (us).
 const STREAM_SPIN_US: u64 = 1000;
-/// Record buffer (samples) in SRAM0.
-pub const CAP: usize = 26 * 1024;
+/// Record buffer (samples) in SRAM0: the raw u16 ring every acquisition
+/// mode writes (88 KB, the SRAM budget: docs/native-boot.md "Memory
+/// budget"). Debug builds with RAM-hungry features (dbg-touch 1.9 KB,
+/// acdc-trace 1.8 KB) give up 1 K samples each to stay above the 8 KiB
+/// SRAM floor.
+pub const CAP: usize = (44 - cfg!(feature = "dbg-touch") as usize - cfg!(feature = "acdc-trace") as usize) * 1024;
+/// The part of BUF lent to the inrush capture (its ring length, as before
+/// the record grew).
+pub const INRUSH_LEN: usize = 26 * 1024;
+/// Linear record length at sample rate `fs`: the whole CAP, but no longer
+/// in time than max(26 K samples, 0.1 s), so a slow timebase's pulse / runt
+/// frame (one complete linear record each) does not wait longer than
+/// before the record grew.
+fn lin_len(fs: u32) -> usize {
+    (fs as usize / 10).clamp(INRUSH_LEN, CAP)
+}
 
 #[link_section = ".dmabuf"]
 static mut BUF: [u16; CAP] = [0; CAP];
@@ -119,7 +133,8 @@ const TB: [(u32, u32, u32, u32); 30] = [
     (50_000_000, 25, 1, 1),
     (50_000_000, 125, 2, 1),
     // From 100 us/div: fs halved, 2500 samples/div (stock Normal table), so
-    // a screen + trigger window fits the 26 K record.
+    // a screen + trigger window fits the shortest linear record (26 K,
+    // `lin_len`).
     (25_000_000, 125, 2, 1),
     (12_500_000, 125, 2, 1),
     (5_000_000, 125, 2, 1),
@@ -327,6 +342,10 @@ pub struct Scope {
     stored_range: usize,
     /// Stored record came from roll mode: newest sample at the right edge.
     stored_roll: bool,
+    /// The stored record is the frame on screen; false: a complete linear
+    /// record poll() did not show (no trigger in it), kept for a STOP
+    /// before the next acquisition starts (`finish`, `freeze`).
+    stored_drawn: bool,
     /// Emit one re-render of the stored record on the next poll (set on any
     /// settings change while stopped and by `refresh`); no periodic re-render.
     zoom_pending: bool,
@@ -714,6 +733,7 @@ impl Scope {
             stored_tb: 0,
             stored_range: 0,
             stored_roll: false,
+            stored_drawn: false,
             zoom_pending: false,
             hw: HwTrig::new(),
             hw_mode: false,
@@ -748,7 +768,7 @@ impl Scope {
         unsafe { core::ptr::addr_of_mut!(WAVE).write(Wave::NEW) };
         sc.hw.init();
         // Comparator trigger on by default (the stock always uses it): the
-        // software search of a linear record only covers CAP - screen = 1624
+        // software search of a linear record only covered CAP - screen = 1624
         // samples from 100 us/div up (65 us .. 0.65 ms at 100 us .. 1 ms/div),
         // so a slow signal triggered only now and then (device 2026-10-14:
         // 100 Hz square, 1/5 .. 4/5 frames T'D at 100 us .. 1 ms/div; with
@@ -1107,7 +1127,7 @@ impl Scope {
         // positions that keep a full screen around it (finish), CAP - screen
         // of them instead of the 800-sample refinement window, and Single keeps
         // the full record for the stored-record zoom (stock Single = 65520).
-        self.rec = CAP;
+        self.rec = lin_len(TB[s.tb].0);
         self.deadline = 0;
     }
 
@@ -1131,8 +1151,12 @@ impl Scope {
     /// User STOP: keep the frame the user is looking at, and always leave a
     /// stored record for Save CSV / the stopped zoom when samples exist.
     ///  * Roll: the roll display is the newest data in BUF, so linearise it.
-    ///  * Nothing in flight: the stored record is the last frame poll() showed
-    ///    (or nothing, if poll() discarded the last record).
+    ///  * Nothing in flight: the stored record is the last frame poll() showed,
+    ///    or the complete record it did not show (`finish`: no trigger in it;
+    ///    the screen stays frozen as drawn, as below). Before this, a STOP
+    ///    between such a record and the next start left no record (device,
+    ///    100 us/div, a 1 kHz square: the 0.8 ms trigger window misses the
+    ///    edge in about 1 record of 5; WAV:PRE? 0 points about 1 STOP in 8).
     ///  * A complete linear record in flight: treated exactly as poll() would
     ///    (trigger search and the Auto/Normal/Single show rule); a frame
     ///    poll() would have shown becomes the stored record and is drawn.
@@ -1156,7 +1180,7 @@ impl Scope {
         let was_stream = self.stream;
         self.halt();
         if !was_busy {
-            return true;
+            return self.stored_drawn;
         }
         // Read after the stop: the DMA was still running before it.
         let ndtr = unsafe { r32(S4 + 0x04) } as usize;
@@ -1177,10 +1201,8 @@ impl Scope {
             let wrapped = unsafe { r32(DMA1 + 0x04) } & (1 << 5) != 0;
             self.hw_linearise(wr, wrapped)
         } else if ndtr == 0 {
-            if self.finish(now).is_some() {
-                return true;
-            }
-            self.rec
+            // Shown: drawn now; else kept untriggered (`finish`).
+            return self.finish(now).is_some();
         } else {
             self.rec - ndtr.min(self.rec)
         };
@@ -1205,6 +1227,7 @@ impl Scope {
         self.stored_range = self.s.range;
         self.stored_pos = self.s.pos;
         self.stored_roll = roll;
+        self.stored_drawn = true;
         self.stored_anchor = anchor.min(len - 1);
         self.stored_trig = trig;
         self.stored_ab = (wv().sc.a, wv().sc.b);
@@ -1221,9 +1244,12 @@ impl Scope {
     /// A complete linear record (NDTR = 0, hardware halted): trigger search and
     /// the stock show rule. Returns the start of the visible window and the
     /// trigger when the frame is to be shown, and makes it the stored record
-    /// (anchored on the on-screen centre); a discarded record (Normal / Single
-    /// without trigger, Auto before its timeout) invalidates the stored record,
-    /// since its samples have replaced the frame that was shown before.
+    /// (anchored on the on-screen centre). A record not shown (Normal / Single
+    /// without trigger, Auto before its timeout) has replaced the frame shown
+    /// before in BUF: it stays the stored record, untriggered and anchored on
+    /// its newest screen as a partial one in `freeze`, but not drawn
+    /// (`stored_drawn`), so a STOP before the next start keeps it; the next
+    /// start drops it.
     fn finish(&mut self, now: u64) -> Option<(usize, Option<usize>)> {
         let n = self.rec;
         // Pre-trigger samples: the trigger point lands on column hpos. Every
@@ -1249,7 +1275,8 @@ impl Scope {
             (None, _) => false,
         };
         if !show {
-            self.stored_valid = false;
+            self.stored_anchor = n - self.screen / 2;
+            self.stored_drawn = false;
             return None;
         }
         let start = trig.map(|t| t - pre).unwrap_or(win / 2);
@@ -1263,7 +1290,7 @@ impl Scope {
     /// Roll record: linearise the circular buffer so the stored record runs
     /// oldest -> newest, anchored at the newest sample (the right edge the user
     /// was watching). Matches the stock 65520-sample roll record (§3), capped at
-    /// the opendm40 26 K capacity.
+    /// CAP.
     fn snapshot_roll(&mut self) {
         let wr = (CAP - unsafe { r32(S4 + 0x04) } as usize % (CAP + 1)) % CAP;
         let d = (wr + CAP - self.roll_last_wr) % CAP;
@@ -2220,7 +2247,7 @@ impl Scope {
     pub fn lent_buf(&self) -> Option<&'static mut [u16]> {
         // SAFETY: main loop only; while lent nothing else in scope.rs
         // touches BUF (poll_frame returns at once, no DMA runs).
-        self.lent.then(|| unsafe { &mut (&mut *core::ptr::addr_of_mut!(BUF))[..] })
+        self.lent.then(|| unsafe { &mut (&mut *core::ptr::addr_of_mut!(BUF))[..INRUSH_LEN] })
     }
 
     /// BUF back to the scope: the next poll starts an acquisition.

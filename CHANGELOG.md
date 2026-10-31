@@ -71,6 +71,8 @@ section named after the tag as the release notes; how to cut a release:
 - Power meter AC+DC: with no current PF reads "--" (SCPI `+9.91E37`), not 0.
 - Generator: the square wave's preview follows the duty cycle; it always showed 50 %
   ([#81](https://github.com/opendm40/opendm40/issues/81)).
+- Scope: STOP at fast timebases (100 us/div and faster) sometimes kept no record (`WAV:PRE?` 0 points,
+  an empty `WAV:DATA?`, Save CSV wrote nothing); it now keeps the last complete record.
 - Scope Save CSV after a timebase change while stopped: the file header names the timebase the record was
   taken at, not the one shown.
 - Scope: a setting changed over SCPI while a popup is open shows at once in the top bar, the right

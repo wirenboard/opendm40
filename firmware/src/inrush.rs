@@ -11,8 +11,8 @@
 //! drains the ring (`logger::wave::drain`) every pass and feeds `push`.
 //! Each sample is kept as a 16-bit code `(raw + 4) >> 3` (3.8 mA per code;
 //! the AD2 noise is ~32 raw codes = 4 of these, so nothing is lost) in the
-//! scope's record buffer (scope::BUF, 26 624 slots, lent while the inrush
-//! page is open: `Scope::lend_buf`), used as a ring until the capture is
+//! scope's record buffer (scope::BUF, its first INRUSH_LEN = 26 624 slots,
+//! lent while the inrush page is open: `Scope::lend_buf`), used as a ring until the capture is
 //! complete, then rotated so the trace runs PRE samples before the trigger
 //! to POST samples after it.
 //!

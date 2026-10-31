@@ -18,7 +18,7 @@
 //! the loader resets with SYSRESETREQ, not a power-on).
 //!
 //! When: native normal boot, before USB exists (the host cannot have the
-//! volume mounted). Never in recovery (the user is about to copy a file).
+//! volume mounted).
 //!
 //! Observed on the device (T3): the FS-loader itself deletes the installed
 //! file, so normally there is nothing to rename. calbackup (runs after this)
@@ -62,21 +62,15 @@ const MAX_LFN: usize = 20;
 const MAX_HITS: usize = 8;
 /// The backup's 8.3 name (name + extension, space padded).
 pub const BACKUP: [u8; 11] = *b"_DM40PRVBIN";
-/// Recovery trigger file (see `make_trigger`): a dm40*.bin that fails the
-/// loader's header check, so the next cold boot enters the loader's update
-/// mode (its own USB disk) instead of launching the app. The loader shows the
-/// name on screen ("dm40rcvr.bin update error").
+/// The recovery trigger file an earlier build wrote (0 bytes): a dm40*.bin
+/// that fails the loader's header check, so a boot through the loader enters
+/// its update mode instead of launching the app ("dm40rcvr.bin update
+/// error"). A normal boot deletes a leftover one (`run`, step 0).
 pub const FAKE: [u8; 11] = *b"DM40RCVRBIN";
-/// Size of the trigger file. 0 = directory entry only, first cluster 0, the
-/// FAT is not touched (proven on the device: a 0-byte dm40*.bin is enough).
-/// Non-zero = that many 0x00 bytes in one freshly allocated cluster (code kept
-/// and host-tested, not used).
-#[cfg(feature = "recovery-file")]
-pub const FAKE_LEN: u32 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
-    /// Not run (warm boot, recovery, or a build without the call).
+    /// Not run (warm boot, or a build without the call).
     NotRun,
     /// No SPI flash / medium.
     NoMedium,
@@ -108,7 +102,7 @@ pub struct Result {
     pub others: u8,
     /// Matches whose header differs from the marker: staged, not installed.
     pub staged: u8,
-    /// A DM40RCVR.BIN recovery trigger was present and deleted first.
+    /// A leftover DM40RCVR.BIN recovery trigger was present and deleted first.
     pub fake_deleted: bool,
 }
 
@@ -674,8 +668,8 @@ fn run_inner(dev: &mut dyn BlockDevice, dry: bool, marker: Option<[u8; 12]>) -> 
         }
     }
     res.staged = s.found - equal;
-    // 0. A leftover recovery trigger (we are booting normally, so the loader
-    //    did install a valid image since): delete it, or it would put the
+    // 0. A leftover recovery trigger (written by an earlier build; we are
+    //    booting normally, so the loader did install a valid image since): delete it, or it would put the
     //    loader back into update mode on the next cold boot.
     if let Some(f) = s.fake {
         if dry {
@@ -723,139 +717,4 @@ fn run_inner(dev: &mut dyn BlockDevice, dry: bool, marker: Option<[u8; 12]>) -> 
         _ => {}
     }
     res
-}
-
-// --- Recovery trigger ------------------------------------------------------
-//
-// Proven on the device (2026-10-13): a dm40*.bin that fails the FS-loader's
-// header check + a COLD power-on => the loader reports "<name> update error"
-// and then exposes its own working USB mass-storage disk on every boot (it
-// does not launch the app) until a valid image is installed through it. Its
-// header is validated before any erase, so a bad file never touches flash.
-// Recovery therefore only has to create such a file and power the unit off.
-
-#[cfg(feature = "recovery-file")]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Trigger {
-    /// DM40RCVR.BIN written and verified.
-    Created,
-    /// A dm40*.bin (the trigger or any other) is already in the root: the
-    /// loader will act on it, nothing written.
-    AlreadyThere,
-    NoMedium,
-    BadBpb,
-    /// Root directory full or no free cluster.
-    NoSpace,
-    /// A read, write or verify failed.
-    Error,
-}
-
-#[cfg(feature = "recovery-file")]
-/// First free cluster (FAT 1 entry == 0), bounded by the cluster count.
-fn find_free(dev: &mut dyn BlockDevice, v: &Vol, buf: &mut [u8; BLK]) -> Option<Option<u32>> {
-    let per = (BLK / 2) as u32;
-    let max = v.clusters + 1;
-    let mut cur = u32::MAX;
-    for c in 2..=max {
-        let fb = c / per;
-        if fb != cur {
-            if !dev.read_block(v.fat_start + fb, buf) {
-                return None;
-            }
-            cur = fb;
-        }
-        if le16(buf, ((c % per) * 2) as usize) == 0 {
-            return Some(Some(c));
-        }
-    }
-    Some(None)
-}
-
-#[cfg(feature = "recovery-file")]
-/// Set FAT entry `c` to `val` in every FAT copy (read, modify, write, verify).
-fn set_fat(dev: &mut dyn BlockDevice, v: &Vol, c: u32, val: u16, buf: &mut [u8; BLK], tmp: &mut [u8; BLK]) -> bool {
-    let per = (BLK / 2) as u32;
-    for k in 0..v.nfats {
-        let lba = v.fat_start + k * v.fat_blocks + c / per;
-        if !dev.read_block(lba, buf) {
-            return false;
-        }
-        let o = ((c % per) * 2) as usize;
-        buf[o..o + 2].copy_from_slice(&val.to_le_bytes());
-        if !(dev.write_block(lba, buf) && verify(dev, lba, buf, tmp)) {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(feature = "recovery-file")]
-/// Create DM40RCVR.BIN (FAKE_LEN = 0: one 32-byte root entry, attribute
-/// archive, cluster 0, size 0, no LFN) in the first free root slot, unless a
-/// dm40*.bin (8.3 or long name) is already there. Only the one 4 KiB root
-/// block holding the slot is rewritten (read, modify, write, read back). With
-/// FAKE_LEN > 0 the order would be: data cluster, FAT chain (EOC in all
-/// copies), directory entry last.
-pub fn make_trigger(dev: &mut dyn BlockDevice) -> Trigger {
-    if !dev.present() || dev.block_size() as usize != BLK {
-        return Trigger::NoMedium;
-    }
-    let mut buf = [0u8; BLK];
-    let mut tmp = [0u8; BLK];
-    if !dev.read_block(0, &mut buf) {
-        return Trigger::Error;
-    }
-    let Some(v) = parse_bpb(&buf, dev.block_count()) else {
-        return Trigger::BadBpb;
-    };
-    let Some(s) = scan(dev, &v, &mut buf) else {
-        return Trigger::Error;
-    };
-    if s.fake.is_some() || s.found > 0 {
-        return Trigger::AlreadyThere;
-    }
-    let Some(slot) = s.free_slot else {
-        return Trigger::NoSpace;
-    };
-    let mut start = 0u32;
-    if FAKE_LEN > 0 {
-        let c = match find_free(dev, &v, &mut buf) {
-            None => return Trigger::Error,
-            Some(None) => return Trigger::NoSpace,
-            Some(Some(c)) => c,
-        };
-        // Whole first block of the cluster = 0x00 (the file is its first
-        // FAKE_LEN bytes).
-        let lba = v.data_start + (c - 2) * v.spc;
-        buf = [0u8; BLK];
-        if !(dev.write_block(lba, &buf) && verify(dev, lba, &buf, &mut tmp)) {
-            return Trigger::Error;
-        }
-        if !set_fat(dev, &v, c, 0xFFFF, &mut buf, &mut tmp) {
-            return Trigger::Error;
-        }
-        start = c;
-    }
-    let per = (BLK / 32) as u32;
-    let lba = v.root_start + slot / per;
-    if !dev.read_block(lba, &mut buf) {
-        return Trigger::Error;
-    }
-    let o = ((slot % per) * 32) as usize;
-    let e = &mut buf[o..o + 32];
-    e.fill(0);
-    e[..11].copy_from_slice(&FAKE);
-    e[11] = 0x20; // archive
-    for d in [0x10, 0x12, 0x18] {
-        e[d] = 0x21; // date 1980-01-01 (creation, access, write)
-    }
-    e[0x1A..0x1C].copy_from_slice(&(start as u16).to_le_bytes());
-    e[0x1C..0x20].copy_from_slice(&FAKE_LEN.to_le_bytes());
-    if !(dev.write_block(lba, &buf) && verify(dev, lba, &buf, &mut tmp)) {
-        return Trigger::Error;
-    }
-    match scan(dev, &v, &mut buf) {
-        Some(again) if again.fake.map(|f| f.sfn == slot && f.start == start).unwrap_or(false) => Trigger::Created,
-        _ => Trigger::Error,
-    }
 }

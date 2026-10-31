@@ -1,9 +1,6 @@
 #!/bin/bash
 # Build check of the non-default Cargo feature sets (Cargo.toml), so none of
-# them rots unnoticed (the recovery-usb build did: recovery.rs kept calling a
-# 3-argument Msc::new for weeks):
-#   recovery-usb      our own USB mass-storage recovery disk (src/recovery.rs)
-#   recovery-file     DM40RCVR.BIN + power off (src/recovery.rs, fatren.rs)
+# them rots unnoticed:
 #   no-ad2-isr        --no-default-features --features vdisk (no interrupt)
 #   spi-disk          --no-default-features --features ad2-isr (the writable
 #                     SPI disk as the USB LUN, no generated volume)
@@ -31,8 +28,6 @@ run() { # name, build.sh args...
         fail=1
     fi
 }
-run recovery-usb --features recovery-usb
-run recovery-file --features recovery-file
 run no-ad2-isr --no-default-features --features vdisk
 run spi-disk --no-default-features --features ad2-isr
 run fatren-dry-run --features fatren-dry-run

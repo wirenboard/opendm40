@@ -34,7 +34,7 @@ pub fn kick_if_feeding() {
 
 /// End of app.rs power_off() once the rails are dropped. Still powered means
 /// USB power, so do not let the FWDGT turn this into a
-/// "hang" (-> recovery): backlight off, keep feeding, and a new press of the
+/// "hang" (a watchdog reset): backlight off, keep feeding, and a new press of the
 /// power key (after the off-press is released) restarts opendm40 normally.
 #[inline(always)]
 pub fn powered_off() -> ! {

@@ -175,7 +175,7 @@ pub fn load() -> Option<Record> {
 /// firmware ago (seen: the first native boot came up in AC+DC from an old
 /// session although the user had been measuring DC V on the stock firmware).
 /// The boot shim records every normal opendm40 boot in BKP_LAST
-/// (boot.rs; DBG:UPDATE / DBG:RECOVER clear it, a recovery leaves "RCVR"), so
+/// (boot.rs; DBG:UPDATE clears it, the PA2 entry leaves "RCVR"), so
 /// only a previous boot that was a normal opendm40 one continues the mode.
 #[cfg(target_os = "none")]
 pub fn same_session() -> bool {

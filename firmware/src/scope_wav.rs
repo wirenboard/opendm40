@@ -12,7 +12,7 @@
 //!     yorig.
 //!
 //! The record lives in the scope buffer (scope::BUF, up to scope::CAP
-//! samples = 53 KB as words) and is only consistent while the scope is
+//! samples = 88 KB as words) and is only consistent while the scope is
 //! stopped: STOP, a Single sweep after its trigger, or DIGitize. Reading
 //! it while running is refused ("Settings conflict", an empty block). A
 //! reply longer than the transport's in-place buffer is streamed over

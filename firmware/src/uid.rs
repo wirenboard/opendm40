@@ -2,7 +2,7 @@
 //! 12 bytes) as 24 uppercase hex digits, bytes in memory order (word 0 low
 //! byte first): the same digits as `xxd -p -u INFO/UID.BIN` on the USB volume.
 //!
-//! Used for the USB iSerial (normal and recovery-usb), the SCSI unit serial
+//! Used for the USB iSerial, the SCSI unit serial
 //! number (INQUIRY VPD page 0x80, msc.rs) and the serial field of *IDN?
 //! (scpi.rs; not in the SYST:IDN:EMUL 34401A identity). Before 2026-10-23
 //! every unit said "0001" (USB) / "0" (*IDN?): udisks merges disks with the
@@ -12,7 +12,7 @@
 //!
 //! The UID is in system memory (0x1FFF7A10..0x1FFF7A1B), not in the main
 //! flash's slow bank (0x08080000..), but it is still read once: `init` in
-//! native::start, before the recovery / normal decision is acted on, into a
+//! native::start, before the normal boot, into a
 //! TCM static. Privacy: docs/native-boot.md "USB serial number".
 
 /// The 96-bit unique ID (GD32F4xx system memory).
