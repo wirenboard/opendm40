@@ -10,7 +10,7 @@
 //! `reset` (asm, region A at the start of the image, no RAM used):
 //!   cpsid i; CONTROL = 0; TCM clock on; FPU on (CPACR CP10/CP11); MSP = TCM top;
 //!   VTOR = 0x08004000; then the Rust shim (src/boot.rs `shim`), which uses
-//!   stack only, then native::start (.data/.bss init, recovery or main).
+//!   stack only, then native::start (.data/.bss init, main).
 //! Exceptions all go to `default_handler` (`b .`): a fault hangs, the FWDGT
 //! (started by the shim) resets, and the shim boots opendm40 again. The table runs
 //! to IRQ 55 (TIMER6 = STM32 TIM7), the AD2 stream ISR of the `ad2-isr`

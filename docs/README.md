@@ -28,7 +28,7 @@ All documentation of opendm40, by reader. Start at the
 ### Reference
 
 - [native-boot.md](../firmware/docs/native-boot.md): the boot chain, the
-  update format, the flash map, the shim, recovery, the USB disk, the serial
+  update format, the flash map, the shim, the loader entries, the USB disk, the serial
   number.
 - [ram-budget.md](../firmware/docs/ram-budget.md): the RAM users and when each
   is live.

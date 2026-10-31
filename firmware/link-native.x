@@ -122,11 +122,6 @@ SECTIONS
         *(.text.*8opendm403dmm10rec_crc_ok*);
         *(.text.*8opendm406native*);
         *(.text.*8opendm403uid4init*);
-        /* recovery::run only: the rest of recovery.rs (the recovery-usb /
-         * recovery-file variants' own code, ~1 KB) goes to region B, which
-         * those variants have room in, and keeps their region C above its
-         * 4 KiB floor; the default image has only `run`. */
-        *(.text.*8opendm408recovery3run*);
         *(.text.*8opendm407gallery*);
         *(.text.*8opendm4010screenshot*);
         *(.text.*8opendm404dlog*);

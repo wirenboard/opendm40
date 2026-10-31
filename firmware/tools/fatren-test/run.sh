@@ -15,8 +15,8 @@
 #   3. cold boot with a staged stock file only (H1 scenario): not renamed, the
 #      backup survives;
 #   4. a long name with leading spaces ("  dm40 lfn only.bin") is renamed.
-#   5. recovery trigger: one 0-byte DM40RCVR.BIN root entry, FAT untouched,
-#      not written when a dm40*.bin exists; a normal run removes it.
+#   5. a leftover 0-byte DM40RCVR.BIN (the recovery trigger of an earlier
+#      build): a normal run removes it.
 #   (A long name matching while its 8.3 name does not is handled by
 #   lfn_matches() but not exercised here: mtools derives the 8.3 name from it.)
 # calbackup (write-once safety copy of CALIB.BIN, BOOTDATA.BIN, UID.BIN):
@@ -123,7 +123,7 @@ RUSTUP_HOME="$(cd ../../../toolchain/rustup && pwd)"; CARGO_HOME="$(cd ../../../
 W=$(mktemp -d)
 # KEEP=<dir>: keep the work directory there (debugging).
 trap '[ -n "$KEEP" ] && rm -rf "$KEEP" && cp -r "$W" "$KEEP"; rm -rf "$W"' EXIT
-rustc --edition 2021 -O --cfg 'feature="recovery-file"' --cfg 'feature="vdisk"' main.rs -o "$W/t"
+rustc --edition 2021 -O --cfg 'feature="vdisk"' main.rs -o "$W/t"
 export MTOOLS_SKIP_CHECK=1
 echo "=== MMEM names: a directory prefix must be the file's own (csvlog::parse_path)"
 "$W/t" names | grep -v "^ok" || true
@@ -195,28 +195,17 @@ mdir -i $IMG2 :: | grep -i lfn
 "$W/t" $IMG2 live $MB | tee $W/r4
 grep -q "status=Renamed" $W/r4 && echo "ok: long-name file renamed" || { echo "FAIL at line $LINENO"; exit 1; }
 fsck.fat -n $IMG2 | tail -1
-echo "--- recovery trigger"
+echo "--- leftover recovery trigger (a 0-byte DM40RCVR.BIN an earlier build wrote)"
 IMG3=$W/disk3.img
 mkimg $IMG3
 mcopy -i $IMG3 $W/keep.bin ::CONFIG.BIN
-mcopy -i $IMG3 $W/keep.bin ::DEL.TXT
-mdel -i $IMG3 ::DEL.TXT                   # leaves a 0xE5 slot before the end
-cp $IMG3 $W/pre.img
-"$W/t" $IMG3 trigger | tee $W/r5
-grep -q "trigger=Created" $W/r5 && grep -q "changed blocks: \[5\]" $W/r5 && echo "ok: trigger created, only root block 5 written" || { echo "FAIL at line $LINENO"; exit 1; }
-mdir -i $IMG3 :: | grep -E "BIN"
-fsck.fat -n $IMG3 | tail -1
-[ "$(mdir -i $IMG3 :: | grep DM40RCVR | awk '{print $3}')" = 0 ] && echo "ok: DM40RCVR.BIN is 0 bytes" || { echo "FAIL at line $LINENO"; exit 1; }
-cmp -s <(dd if=$W/pre.img bs=4096 skip=1 count=4 status=none) <(dd if=$IMG3 bs=4096 skip=1 count=4 status=none) && echo "ok: FAT tables untouched" || { echo "FAIL at line $LINENO"; exit 1; }
-"$W/t" $IMG3 trigger | grep -q "trigger=AlreadyThere" && echo "ok: second trigger = AlreadyThere" || { echo "FAIL at line $LINENO"; exit 1; }
-IMG4=$W/disk4.img
-mkimg $IMG4
-mcopy -i $IMG4 $W/b.bin ::dm40_staged.bin
-"$W/t" $IMG4 trigger | grep -q "trigger=AlreadyThere" && echo "ok: no trigger written when a dm40*.bin is already staged" || { echo "FAIL at line $LINENO"; exit 1; }
+mcopy -i $IMG3 /dev/null ::DM40RCVR.BIN
+[ "$(mdir -i $IMG3 :: | grep DM40RCVR | awk '{print $3}')" = 0 ] || { echo "FAIL at line $LINENO"; exit 1; }
 mcopy -i $IMG3 $W/b.bin ::dm40_v_2_6.bin
 "$W/t" $IMG3 live $MB | tee $W/r6
 grep -q "status=Renamed" $W/r6 && grep -q "fake_deleted=true" $W/r6 && echo "ok: normal boot removes DM40RCVR.BIN and renames the image" || { echo "FAIL at line $LINENO"; exit 1; }
 mdir -i $IMG3 :: | grep -E "BIN"
+! mdir -i $IMG3 :: | grep -q DM40RCVR && echo "ok: DM40RCVR.BIN gone" || { echo "FAIL at line $LINENO"; exit 1; }
 fsck.fat -n $IMG3 | tail -1
 
 echo "=== calbackup (write-once safety copy: CALIB.BIN, BOOTDATA.BIN, UID.BIN)"

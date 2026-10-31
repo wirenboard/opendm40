@@ -103,7 +103,7 @@ const _: () = assert!(N <= 16, "written / conflict / differs are u16 bit masks")
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
-    /// Not run (recovery).
+    /// Not run (yet).
     NotRun,
     NoMedium,
     /// Boot sector is not the expected FAT16 volume; untouched.

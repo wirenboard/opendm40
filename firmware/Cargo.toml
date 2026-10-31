@@ -40,13 +40,6 @@ vdisk = []
 # SPI FAT to _DM40PRV.BIN; its exact condition is owned by fatren.rs) only
 # reports what it would do.
 fatren-dry-run = []
-# Recovery alternatives for tests (default recovery = zero the 12-byte loader
-# marker at 0x08008000 + reset -> vendor loader update screen + USB disk):
-#   recovery-file: 0-byte DM40RCVR.BIN on the SPI FAT + power off (needs a cold
-#     boot with the key held long enough to reach the loader);
-#   recovery-usb: our own minimal USB mass-storage disk (no LCD).
-recovery-file = []
-recovery-usb = []
 # DBG:HYSPI:SELF? / WR?, the HY3131 bus self-test and write experiment
 # (src/hyspi.rs; emu/hy3131/ad2streamtest.py). Off by default: ~2.3 KB of
 # region C (docs/native-boot.md "Region B audit #9"); without it the two

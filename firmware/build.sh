@@ -10,7 +10,7 @@
 # staged on the device). tools/reload.sh passes its arguments here.
 # DM40_TDIR / DM40_OUT (environment) build elsewhere than target/native /
 # opendm40.bin, with every check (tools/build-variants/run.sh builds
-# the recovery-usb / recovery-file / no-ad2-isr variants this way, so a test
+# the non-default feature sets this way, so a test
 # build never replaces the image reload.sh installs).
 set -e
 cd "$(dirname "$0")"

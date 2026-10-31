@@ -2574,7 +2574,7 @@ impl Scpi {
                         b"FAST" if query => Dbg::Fast,
                         b"RELEASE" => Dbg::Release,
                         b"RESET" => Dbg::Reset,
-                        // DBG:UPDATE = DBG:RECOVER: zero the 12-byte loader
+                        // DBG:UPDATE: zero the 12-byte loader
                         // marker at 0x08008000, then the deferred SYSRESETREQ ->
                         // vendor update screen + its USB disk (docs/native-boot.md).
                         // DBG:BOOT? = boot info.
