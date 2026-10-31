@@ -7,7 +7,7 @@
 //!
 //! The file is the compact binary form (dlog.rs kind 2, docs/
 //! compact-log-format.md): the CSV header text, the code -> volts map and
-//! the sample time, then the raw 10-bit codes as u16: 53 KB for the full
+//! the sample time, then the raw 10-bit codes as u16: 53 KB for a
 //! 26624-sample record instead of the CSV's 692 KB. The CSV exists on read
 //! (SCOP%03u.CSV on the read-only LUN 1, MMEM:DATA?, tools/dlog.py), byte
 //! for byte what this module wrote as text before:
@@ -33,7 +33,7 @@
 pub const ROW: usize = crate::dlog::SCOPE_ROW;
 const HDR_MAX: usize = 512;
 /// Largest record (scope::CAP, asserted in scope_page.rs) and file.
-pub const REC_MAX: usize = 26 * 1024;
+pub const REC_MAX: usize = 64 * 1024;
 pub const MAX_LEN: u32 = (crate::dlog::FHDR + HDR_MAX + crate::dlog::SCOPE_PAR + 8 * crate::dlog::SBLK_MAX + 4
     + REC_MAX.div_ceil(crate::dlog::SBLK) * crate::dlog::SBLK_RAW) as u32;
 const _: () = assert!(REC_MAX <= crate::dlog::SBLK * crate::dlog::SBLK_MAX);

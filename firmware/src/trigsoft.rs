@@ -3,16 +3,17 @@
 //! stream search only know edges). Pure, host-tested by tools/trig-test.
 //!
 //! Limits (by construction, stated in the Trigger tab notes and the TODO):
-//!  * not a hardware trigger: each record (scope::CAP = 26624 samples) is
-//!    searched after it is complete, so an event in the dead time between
+//!  * not a hardware trigger: each record (scope.rs `lin_len`: 26624
+//!    samples or up to 0.1 s, at most scope::CAP) is searched after it is
+//!    complete, so an event in the dead time between
 //!    two records (search + drawing + restart) is missed; a rare glitch is
 //!    caught with probability ~ record time / (record time + dead time);
 //!  * only events that lie wholly inside one record and leave a full screen
 //!    around the trigger point (the trigger position) count;
 //!  * width resolution = one sample (1 / sample rate of the timebase), the
 //!    10-bit codes with +-2 codes of hysteresis around each level;
-//!  * slow timebases need the whole record per frame (26624 samples: 0.5 ms
-//!    at 50 MS/s, 0.2 s at 125 kS/s, 10.6 s at 1 s/div);
+//!  * slow timebases need the whole record per frame (26624 samples: 0.2 s
+//!    at 125 kS/s, 10.6 s at 1 s/div; 45056 = 0.9 ms at 50 MS/s);
 //!  * roll mode has no trigger (as the edge trigger).
 
 /// Trigger types (Settings::ttype).

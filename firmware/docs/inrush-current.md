@@ -42,7 +42,7 @@ scenario).
   (`logger::wave::drain`, 2048 samples = 213 ms of slack) into the detector
   and into a ring of 16-bit codes `(raw + 4) >> 3` (3.8 mA per code; the AD2
   noise is ~32 raw codes = 4 of these) in the **scope's record buffer**
-  (`scope::BUF`, `CAP` = 26 624 slots). `Scope::lend_buf` stops the MCX
+  (the first `scope::INRUSH_LEN` = 26 624 slots of `scope::BUF`). `Scope::lend_buf` stops the MCX
   acquisition (its DMA writes BUF) and drops the stored scope record while
   the page is open (a scope CSV in progress refuses the page);
   `return_buf` gives it back. The capture needs no SRAM of its own.

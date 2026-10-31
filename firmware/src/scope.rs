@@ -51,13 +51,27 @@ pub const COLS: usize = 400;
 /// around the comparator estimate (hwtrig path only).
 const WIN: usize = 800;
 /// Highest sample rate searched continuously in software (stream_poll): the
-/// ring (CAP samples = 21 ms at 1.25 MS/s) must outlast the main-loop gap
+/// ring (CAP samples = 36 ms at 1.25 MS/s) must outlast the main-loop gap
 /// between two polls with the pre-trigger part still in it.
 const STREAM_FS: u32 = 1_250_000;
 /// Longest busy-wait inside a poll for the post-trigger samples (us).
 const STREAM_SPIN_US: u64 = 1000;
-/// Record buffer (samples) in SRAM0.
-pub const CAP: usize = 26 * 1024;
+/// Record buffer (samples) in SRAM0: the raw u16 ring every acquisition
+/// mode writes (88 KB, the SRAM budget: docs/native-boot.md "Memory
+/// budget"). Debug builds with RAM-hungry features (dbg-touch 1.9 KB,
+/// acdc-trace 1.8 KB) give up 1 K samples each to stay above the 8 KiB
+/// SRAM floor.
+pub const CAP: usize = (44 - cfg!(feature = "dbg-touch") as usize - cfg!(feature = "acdc-trace") as usize) * 1024;
+/// The part of BUF lent to the inrush capture (its ring length, as before
+/// the record grew).
+pub const INRUSH_LEN: usize = 26 * 1024;
+/// Linear record length at sample rate `fs`: the whole CAP, but no longer
+/// in time than max(26 K samples, 0.1 s), so a slow timebase's pulse / runt
+/// frame (one complete linear record each) does not wait longer than
+/// before the record grew.
+fn lin_len(fs: u32) -> usize {
+    (fs as usize / 10).clamp(INRUSH_LEN, CAP)
+}
 
 #[link_section = ".dmabuf"]
 static mut BUF: [u16; CAP] = [0; CAP];
@@ -119,7 +133,8 @@ const TB: [(u32, u32, u32, u32); 30] = [
     (50_000_000, 25, 1, 1),
     (50_000_000, 125, 2, 1),
     // From 100 us/div: fs halved, 2500 samples/div (stock Normal table), so
-    // a screen + trigger window fits the 26 K record.
+    // a screen + trigger window fits the shortest linear record (26 K,
+    // `lin_len`).
     (25_000_000, 125, 2, 1),
     (12_500_000, 125, 2, 1),
     (5_000_000, 125, 2, 1),
@@ -748,7 +763,7 @@ impl Scope {
         unsafe { core::ptr::addr_of_mut!(WAVE).write(Wave::NEW) };
         sc.hw.init();
         // Comparator trigger on by default (the stock always uses it): the
-        // software search of a linear record only covers CAP - screen = 1624
+        // software search of a linear record only covered CAP - screen = 1624
         // samples from 100 us/div up (65 us .. 0.65 ms at 100 us .. 1 ms/div),
         // so a slow signal triggered only now and then (device 2026-10-14:
         // 100 Hz square, 1/5 .. 4/5 frames T'D at 100 us .. 1 ms/div; with
@@ -1107,7 +1122,7 @@ impl Scope {
         // positions that keep a full screen around it (finish), CAP - screen
         // of them instead of the 800-sample refinement window, and Single keeps
         // the full record for the stored-record zoom (stock Single = 65520).
-        self.rec = CAP;
+        self.rec = lin_len(TB[s.tb].0);
         self.deadline = 0;
     }
 
@@ -1263,7 +1278,7 @@ impl Scope {
     /// Roll record: linearise the circular buffer so the stored record runs
     /// oldest -> newest, anchored at the newest sample (the right edge the user
     /// was watching). Matches the stock 65520-sample roll record (§3), capped at
-    /// the opendm40 26 K capacity.
+    /// CAP.
     fn snapshot_roll(&mut self) {
         let wr = (CAP - unsafe { r32(S4 + 0x04) } as usize % (CAP + 1)) % CAP;
         let d = (wr + CAP - self.roll_last_wr) % CAP;
@@ -2220,7 +2235,7 @@ impl Scope {
     pub fn lent_buf(&self) -> Option<&'static mut [u16]> {
         // SAFETY: main loop only; while lent nothing else in scope.rs
         // touches BUF (poll_frame returns at once, no DMA runs).
-        self.lent.then(|| unsafe { &mut (&mut *core::ptr::addr_of_mut!(BUF))[..] })
+        self.lent.then(|| unsafe { &mut (&mut *core::ptr::addr_of_mut!(BUF))[..INRUSH_LEN] })
     }
 
     /// BUF back to the scope: the next poll starts an acquisition.

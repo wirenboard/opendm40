@@ -361,7 +361,7 @@ lightning from 100 V). opendm40 adds:
 | Cursors | Through the Measure tab | One tap on **CUR** |
 | FFT readouts | No scale | [Scale, centre frequency and peak readout](#fft) |
 | FFT windows | — | Also Flat-top |
-| Capture length | 65 520 samples | 26 624 samples |
+| Capture length | 65 520 samples | up to 45 056 samples |
 
 ![The touchable top bar](img/new-scope-topbar.png)
 
@@ -1486,8 +1486,8 @@ over the trace; tap the button again while its popup is open to turn it off.
 
 ### Stop, zoom and pan
 
-Press **RUN** (or tap the run state) to stop. The last capture (26 624
-samples) stays in memory:
+Press **RUN** (or tap the run state) to stop. The last capture (up to
+45 056 samples) stays in memory:
 
 - change the timebase to zoom in or out of the stored capture;
 - change the V/div to scale it;
@@ -1531,7 +1531,7 @@ is on, the edge trigger does not use the trigger hardware.
 
 **MF > Settings**:
 
-- **Save CSV**: saves the whole stored capture (up to 26 624 samples, not
+- **Save CSV**: saves the whole stored capture (up to 45 056 samples, not
   only the screen). Stop the scope first (**Please stop sample**
   otherwise). The meter shows **Saved SCOP004.DLG**; the USB disk shows it
   as `SCOPE/SCOP004.CSV`.
